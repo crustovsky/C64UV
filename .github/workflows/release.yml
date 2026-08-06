@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-static:
+    # oldest supported LTS runner = broadest glibc compatibility
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config \
+            libwayland-dev libxkbcommon-dev wayland-protocols \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libgl-dev libegl-dev libdrm-dev \
+            libgbm-dev libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libdbus-1-dev libudev-dev libusb-1.0-0-dev
+
+      - name: Build static SDL3
+        run: |
+          git clone --depth 1 --branch release-3.4.14 \
+            https://github.com/libsdl-org/SDL sdl3-src
+          cmake -S sdl3-src -B sdl3-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=OFF -DSDL_STATIC=ON \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/staticlibs"
+          cmake --build sdl3-build -j"$(nproc)"
+          cmake --install sdl3-build
+
+      - name: Build static libcurl (HTTP only)
+        run: |
+          curl -sLO https://curl.se/download/curl-8.11.1.tar.gz
+          tar xzf curl-8.11.1.tar.gz
+          cd curl-8.11.1
+          ./configure --disable-shared --enable-static --without-ssl \
+            --without-libpsl --without-zlib --without-brotli --without-zstd \
+            --without-nghttp2 --without-libidn2 --disable-ldap --disable-ldaps \
+            --disable-rtsp --disable-dict --disable-telnet --disable-tftp \
+            --disable-pop3 --disable-imap --disable-smb --disable-smtp \
+            --disable-gopher --disable-mqtt --disable-ftp --disable-file \
+            --disable-docs --disable-manual --prefix="$GITHUB_WORKSPACE/staticlibs"
+          make -j"$(nproc)"
+          make install
+
+      - name: Build c64uv (static SDL3/curl)
+        run: |
+          PKG_CONFIG_PATH="$PWD/staticlibs/lib/pkgconfig:$PWD/staticlibs/lib64/pkgconfig" \
+            make STATIC=1
+          ldd c64uv
+          ./c64uv 2>&1 | head -2 || true
+
+      - name: Smoke test (mock stream, headless)
+        run: |
+          python3 tools/mockstream.py 127.0.0.1 11000 8 >/dev/null &
+          sleep 0.5
+          timeout 10 ./c64uv --no-start --dump /tmp/frame.ppm
+          head -c 20 /tmp/frame.ppm | grep -q "P6" && echo "frame OK"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp c64uv dist/
+          strip dist/c64uv
+          tar -C dist -czf "c64uv-${GITHUB_REF_NAME:-dev}-linux-x86_64.tar.gz" c64uv
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" \
+            "c64uv-$GITHUB_REF_NAME-linux-x86_64.tar.gz" --clobber
+
+      - name: Upload artifact (non-tag runs)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: c64uv-linux-x86_64
+          path: c64uv-*-linux-x86_64.tar.gz
