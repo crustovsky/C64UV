@@ -6,6 +6,8 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
+#include "term.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -40,8 +42,26 @@ struct config {
     bool no_audio;
     bool no_keyb;
     const char *dump_path;  // write first complete frame as PPM and exit
+    bool term_test;         // headless telnet check: dump menu grid, exit
     bool verbose;
 };
+
+// Lazy TCP connection with rate-limited reconnect (used for ports 64 and 23).
+static int tcp_connect_to(const char *host, Uint16 port, int timeout_s)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    struct timeval tv = {.tv_sec = timeout_s};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(port)};
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1 ||
+        connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
 
 struct frame_buf {
     Uint32 px[MAX_W * MAX_H]; // palette-expanded
@@ -202,7 +222,7 @@ static bool detect_local_ip(const char *host, char *out, size_t outlen)
 struct keyb {
     int fd; // -1 when disconnected
     bool enabled;
-    struct sockaddr_in addr;
+    const char *host;
     Uint64 last_try;
 };
 
@@ -212,15 +232,9 @@ static void keyb_try_connect(struct keyb *k)
         (k->last_try != 0 && SDL_GetTicks() - k->last_try < 3000))
         return;
     k->last_try = SDL_GetTicks();
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct timeval tv = {.tv_sec = 1};
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    if (connect(fd, (struct sockaddr *)&k->addr, sizeof k->addr) == 0) {
-        k->fd = fd;
+    k->fd = tcp_connect_to(k->host, 64, 1);
+    if (k->fd >= 0)
         SDL_Log("keyboard channel connected (port 64)");
-    } else {
-        close(fd);
-    }
 }
 
 static void keyb_raw(struct keyb *k, Uint16 cmd, const Uint8 *data, int n)
@@ -297,6 +311,40 @@ static int special_to_petscii(SDL_Keycode key, SDL_Keymod mod)
     case SDLK_F8: return 0x8C;
     }
     return -1;
+}
+
+// ------------------------------------------------------ telnet menu terminal
+//
+// Port 23 mirrors the Ultimate's menu as a VT100 session (src/term.c). The
+// menu overlay is not part of the VIC video stream, so this is the only way
+// to see it remotely.
+
+// Headless verification: connect, read for a bit, print the parsed grid.
+static int run_term_test(const char *host)
+{
+    int fd = tcp_connect_to(host, 23, 3);
+    if (fd < 0) {
+        fprintf(stderr, "cannot connect to %s:23\n", host);
+        return 1;
+    }
+    struct term *t = malloc(sizeof *t);
+    term_init(t);
+    Uint8 buf[4096];
+    Uint64 t0 = SDL_GetTicks();
+    while (SDL_GetTicks() - t0 < 2500) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        if (poll(&pfd, 1, 200) > 0) {
+            ssize_t n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+            if (n <= 0)
+                break;
+            term_feed(t, buf, (int)n);
+        }
+    }
+    close(fd);
+    for (int r = 0; r < TERM_ROWS; r++)
+        printf("%.*s\n", TERM_COLS, t->ch[r]);
+    free(t);
+    return 0;
 }
 
 // ---------------------------------------------------------------- video path
@@ -394,6 +442,8 @@ int main(int argc, char **argv)
             cfg.no_keyb = true;
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc)
             cfg.dump_path = argv[++i];
+        else if (!strcmp(argv[i], "--term-test"))
+            cfg.term_test = true;
         else if (!strcmp(argv[i], "--verbose"))
             cfg.verbose = true;
         else {
@@ -401,6 +451,9 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+
+    if (cfg.term_test)
+        return run_term_test(cfg.host);
 
     if (cfg.dump_path)
         cfg.no_audio = true; // headless frame grab needs no sound
@@ -509,15 +562,21 @@ int main(int argc, char **argv)
         }
     }
 
-    struct keyb kb = {.fd = -1};
+    struct keyb kb = {.fd = -1, .host = cfg.host};
     if (windowed && !cfg.no_keyb && !cfg.no_start) {
         kb.enabled = true;
-        kb.addr = (struct sockaddr_in){.sin_family = AF_INET,
-                                       .sin_port = htons(64)};
-        inet_pton(AF_INET, cfg.host, &kb.addr.sin_addr);
         SDL_StartTextInput(win);
         keyb_try_connect(&kb);
     }
+
+    // Ultimate menu terminal (F9). Connected lazily on first toggle.
+    struct term *trm = calloc(1, sizeof *trm);
+    term_init(trm);
+    bool term_active = false, term_present = false;
+    int tfd = -1;
+    Uint64 tfd_last_try = 0;
+    SDL_Texture *term_tex = NULL;
+    Uint32 *term_px = calloc(TERM_PX_W * TERM_PX_H, sizeof(Uint32));
 
     struct frame_buf *fb = calloc(1, sizeof *fb);
     fb->frame_no = 0xFFFF;
@@ -548,6 +607,28 @@ int main(int argc, char **argv)
                 } else if (ev.type == SDL_EVENT_KEY_DOWN) {
                     if ((ev.key.mod & SDL_KMOD_CTRL) && ev.key.key == SDLK_Q) {
                         atomic_store(&g_quit, true);
+                    } else if (ev.key.key == SDLK_F9 && !cfg.no_start) {
+                        term_active = !term_active;
+                        term_present = true; // repaint whichever view we enter
+                        if (term_active && tfd < 0 &&
+                            (tfd_last_try == 0 ||
+                             SDL_GetTicks() - tfd_last_try > 3000)) {
+                            tfd_last_try = SDL_GetTicks();
+                            tfd = tcp_connect_to(cfg.host, 23, 1);
+                            if (tfd >= 0) {
+                                term_init(trm);
+                                SDL_Log("menu terminal connected (port 23)");
+                            } else
+                                SDL_Log("menu terminal: connect failed");
+                        }
+                    } else if (term_active) {
+                        Uint8 seq[8];
+                        int n = term_encode_key(ev.key.key, ev.key.mod, seq);
+                        if (n > 0 && tfd >= 0 &&
+                            send(tfd, seq, (size_t)n, MSG_NOSIGNAL) < 0) {
+                            close(tfd);
+                            tfd = -1;
+                        }
                     } else if (kb.enabled) {
                         if (ev.key.key == SDLK_ESCAPE) {
                             keyb_stop(&kb); // Esc = RUN/STOP
@@ -557,19 +638,38 @@ int main(int argc, char **argv)
                                 keyb_type(&kb, (Uint8)c);
                         }
                     }
-                } else if (ev.type == SDL_EVENT_TEXT_INPUT && kb.enabled) {
+                } else if (ev.type == SDL_EVENT_TEXT_INPUT) {
                     for (const char *p = ev.text.text; *p; p++) {
-                        int c = ascii_to_petscii((unsigned char)*p);
-                        if (c >= 0)
-                            keyb_type(&kb, (Uint8)c);
+                        if (term_active) {
+                            if ((unsigned char)*p < 128 && tfd >= 0 &&
+                                send(tfd, p, 1, MSG_NOSIGNAL) < 0) {
+                                close(tfd);
+                                tfd = -1;
+                            }
+                        } else if (kb.enabled) {
+                            int c = ascii_to_petscii((unsigned char)*p);
+                            if (c >= 0)
+                                keyb_type(&kb, (Uint8)c);
+                        }
                     }
                 }
             }
         }
 
-        struct pollfd pfd[2] = {{.fd = sock, .events = POLLIN},
-                                {.fd = asock, .events = POLLIN}};
-        poll(pfd, asock >= 0 ? 2 : 1, 5);
+        struct pollfd pfd[3] = {{.fd = sock, .events = POLLIN},
+                                {.fd = asock, .events = POLLIN},
+                                {.fd = tfd, .events = POLLIN}};
+        poll(pfd, 3, 5); // negative fds are ignored by poll
+
+        if (tfd >= 0) { // keep the menu session current even when hidden
+            ssize_t n;
+            while ((n = recv(tfd, pkt, sizeof pkt, MSG_DONTWAIT)) > 0)
+                term_feed(trm, pkt, (int)n);
+            if (n == 0) { // server closed
+                close(tfd);
+                tfd = -1;
+            }
+        }
 
         if (asock >= 0) {
             ssize_t n;
@@ -608,6 +708,26 @@ int main(int argc, char **argv)
             frame_done = handle_packet(pkt, n, fb);
         }
 
+        if (windowed && term_active && (trm->dirty || term_present)) {
+            if (!term_tex) {
+                term_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                             SDL_TEXTUREACCESS_STREAMING,
+                                             TERM_PX_W, TERM_PX_H);
+                SDL_SetTextureScaleMode(term_tex, SDL_SCALEMODE_NEAREST);
+            }
+            term_render(trm, term_px, TERM_PX_W);
+            trm->dirty = false;
+            term_present = false;
+            SDL_UpdateTexture(term_tex, NULL, term_px,
+                              TERM_PX_W * (int)sizeof(Uint32));
+            // 2x vertical stretch: 8x8 glyphs read as 8x16 cells
+            SDL_SetRenderLogicalPresentation(ren, TERM_PX_W, TERM_PX_H * 2,
+                                             SDL_LOGICAL_PRESENTATION_LETTERBOX);
+            SDL_RenderClear(ren);
+            SDL_RenderTexture(ren, term_tex, NULL, NULL);
+            SDL_RenderPresent(ren);
+        }
+
         if (frame_done) {
             frames++;
             if (!got_any) {
@@ -636,15 +756,17 @@ int main(int argc, char **argv)
                                         SDL_TEXTUREACCESS_STREAMING, fb->width,
                                         fb->height);
                 SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+                tex_h = fb->height;
+            }
+            if (!term_active) {
+                SDL_UpdateTexture(tex, NULL, fb->px, MAX_W * sizeof(Uint32));
                 SDL_SetRenderLogicalPresentation(
                     ren, fb->width, fb->height,
                     SDL_LOGICAL_PRESENTATION_INTEGER_SCALE);
-                tex_h = fb->height;
+                SDL_RenderClear(ren);
+                SDL_RenderTexture(ren, tex, NULL, NULL);
+                SDL_RenderPresent(ren);
             }
-            SDL_UpdateTexture(tex, NULL, fb->px, MAX_W * sizeof(Uint32));
-            SDL_RenderClear(ren);
-            SDL_RenderTexture(ren, tex, NULL, NULL);
-            SDL_RenderPresent(ren);
         }
 
         if (cfg.verbose && SDL_GetTicks() - last_stat >= 5000) {
@@ -665,6 +787,12 @@ int main(int argc, char **argv)
     curl_global_cleanup();
     if (kb.fd >= 0)
         close(kb.fd);
+    if (tfd >= 0)
+        close(tfd);
+    if (term_tex)
+        SDL_DestroyTexture(term_tex);
+    free(term_px);
+    free(trm);
     if (astream)
         SDL_DestroyAudioStream(astream);
     if (asock >= 0)
