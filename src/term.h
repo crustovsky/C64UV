@@ -1,6 +1,6 @@
 // Minimal VT100 terminal for the Ultimate's telnet remote menu (port 23).
 // Implements exactly the sequence repertoire of the firmware's
-// screen_vt100.cc / keyboard_vt100.cc — not a general-purpose terminal.
+// screen_vt100.cc / keyboard_vt100.cc - not a general-purpose terminal.
 #ifndef TERM_H
 #define TERM_H
 

@@ -3,7 +3,7 @@
 
 #include <string.h>
 
-// VIC-II palette (Pepto), ARGB8888 — the menu should look like a C64, not a
+// VIC-II palette (Pepto), ARGB8888 - the menu should look like a C64, not a
 // generic terminal.
 static const uint32_t vic_palette[16] = {
     0xFF000000, 0xFFFFFFFF, 0xFF813338, 0xFF75CEC8, 0xFF8E3C97, 0xFF56AC4D,
@@ -136,7 +136,7 @@ static void csi_dispatch(struct term *t, char final)
     case 'A': t->cy -= p0 ? p0 : 1; if (t->cy < 0) t->cy = 0; break;
     case 'B': t->cy += p0 ? p0 : 1; if (t->cy >= TERM_ROWS) t->cy = TERM_ROWS - 1; break;
     case 'D': t->cx -= p0 ? p0 : 1; if (t->cx < 0) t->cx = 0; break;
-    case 'r': // scroll region — menu resets it; we don't implement regions
+    case 'r': // scroll region - menu resets it; we don't implement regions
         break;
     }
 }

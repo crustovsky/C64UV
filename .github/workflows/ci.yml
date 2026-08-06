@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain and dependencies
+        run: pacman -Syu --noconfirm gcc make pkgconf sdl3 curl python
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Unit tests
+        run: make test
+      - name: Integration test (mock stream)
+        run: bash tests/integration.sh

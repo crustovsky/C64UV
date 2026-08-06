@@ -1,12 +1,14 @@
-// c64uv — Commodore 64 Ultimate video viewer
+// c64uv - Commodore 64 Ultimate Viewer
 //
-// Receives the Ultimate's raw VIC UDP stream (4bpp color indices) and shows it
-// in an SDL3 window. Stream format: docs/data_streams in CLAUDE.md.
+// Streams the Ultimate's video/audio into an SDL3 window, forwards keystrokes,
+// and shows the Ultimate menu over telnet. Protocol notes live in CLAUDE.md.
 
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
+#include "keys.h"
 #include "term.h"
+#include "video.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -21,17 +23,6 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-#define MAX_W 384
-#define MAX_H 312 // safety headroom; PAL uses 272, NTSC 240
-#define HDR_LEN 12
-
-// Pepto/colodore-style VIC-II palette, ARGB8888.
-static const Uint32 vic_palette[16] = {
-    0xFF000000, 0xFFFFFFFF, 0xFF813338, 0xFF75CEC8, 0xFF8E3C97, 0xFF56AC4D,
-    0xFF2E2C9B, 0xFFEDF171, 0xFF8E5029, 0xFF553800, 0xFFC46C71, 0xFF4A4A4A,
-    0xFF7B7B7B, 0xFFA9FF9F, 0xFF706DEB, 0xFFB2B2B2,
-};
 
 struct config {
     const char *host;       // Ultimate hostname/IP for REST
@@ -62,15 +53,6 @@ static int tcp_connect_to(const char *host, Uint16 port, int timeout_s)
     }
     return fd;
 }
-
-struct frame_buf {
-    Uint32 px[MAX_W * MAX_H]; // palette-expanded
-    int width, height;        // known once a last-flagged packet arrives
-    Uint16 frame_no;
-    int lines_got;
-    bool ready;    // saw the last-packet flag for frame_no
-    bool complete; // every line of the frame arrived
-};
 
 static atomic_bool g_quit;
 
@@ -125,7 +107,7 @@ static int keepalive_thread(void *arg)
     while (!atomic_load(&g_quit)) {
         // The Ultimate refuses to start a stream toward an address missing
         // from its ARP table ("Network Host Resolve Error") and never ARPs on
-        // demand, so make it hear from us first — and keep refreshing its
+        // demand, so make it hear from us first - and keep refreshing its
         // entry every cycle. A plain sendto can leave through the wrong
         // interface when policy routing claims the LAN (Tailscale
         // accept-routes does), so prefer ping -I on the subnet's interface,
@@ -215,7 +197,7 @@ static bool detect_local_ip(const char *host, char *out, size_t outlen)
 //
 // TCP port 64, firmware "socket DMA" protocol: little-endian command word,
 // u16 payload length, payload. KEYB (0xFF03) drops chars into the KERNAL
-// keyboard buffer ($0277/$C6) — works for BASIC and anything else that reads
+// keyboard buffer ($0277/$C6) - works for BASIC and anything else that reads
 // input the normal way; games polling the matrix won't see it (needs the
 // machine:input firmware feature, not shipped yet).
 
@@ -261,56 +243,12 @@ static void keyb_type(struct keyb *k, Uint8 petscii)
 
 // RUN/STOP isn't a buffer character: BASIC checks the stop flag at $91.
 // Write it a few times (DMAWRITE) to win the race against the KERNAL's own
-// keyboard scan restoring it — same trick the Ultimate's web UI uses.
+// keyboard scan restoring it - same trick the Ultimate's web UI uses.
 static void keyb_stop(struct keyb *k)
 {
     const Uint8 poke[] = {0x91, 0x00, 0x7F};
     for (int i = 0; i < 3; i++)
         keyb_raw(k, 0xFF06, poke, sizeof poke);
-}
-
-// ASCII → PETSCII for the default uppercase/graphics charset: lowercase
-// letters are the unshifted keys, uppercase are shifted (graphics symbols).
-static int ascii_to_petscii(unsigned char a)
-{
-    if (a >= 'a' && a <= 'z')
-        return a - 'a' + 0x41;
-    if (a >= 'A' && a <= 'Z')
-        return a - 'A' + 0xC1;
-    if (a >= ' ' && a <= '@') // space, punctuation, digits
-        return a;
-    switch (a) {
-    case '[': return 0x5B;
-    case ']': return 0x5D;
-    case '^': return 0x5E; // up-arrow
-    case '_': return 0xA4;
-    }
-    return -1; // no such key on a C64
-}
-
-static int special_to_petscii(SDL_Keycode key, SDL_Keymod mod)
-{
-    switch (key) {
-    case SDLK_RETURN:
-    case SDLK_KP_ENTER: return 0x0D;
-    case SDLK_BACKSPACE:
-    case SDLK_DELETE: return 0x14;
-    case SDLK_INSERT: return 0x94;
-    case SDLK_UP: return 0x91;
-    case SDLK_DOWN: return 0x11;
-    case SDLK_LEFT: return 0x9D;
-    case SDLK_RIGHT: return 0x1D;
-    case SDLK_HOME: return (mod & SDL_KMOD_SHIFT) ? 0x93 /*CLR*/ : 0x13;
-    case SDLK_F1: return 0x85;
-    case SDLK_F2: return 0x89;
-    case SDLK_F3: return 0x86;
-    case SDLK_F4: return 0x8A;
-    case SDLK_F5: return 0x87;
-    case SDLK_F6: return 0x8B;
-    case SDLK_F7: return 0x88;
-    case SDLK_F8: return 0x8C;
-    }
-    return -1;
 }
 
 // ------------------------------------------------------ telnet menu terminal
@@ -345,65 +283,6 @@ static int run_term_test(const char *host)
         printf("%.*s\n", TERM_COLS, t->ch[r]);
     free(t);
     return 0;
-}
-
-// ---------------------------------------------------------------- video path
-
-static bool handle_packet(const Uint8 *d, ssize_t len, struct frame_buf *fb)
-{
-    if (len < HDR_LEN)
-        return false;
-    Uint16 frame = (Uint16)(d[2] | d[3] << 8);
-    Uint16 rawline = (Uint16)(d[4] | d[5] << 8);
-    int line = rawline & 0x7FFF;
-    bool last = rawline & 0x8000;
-    int ppl = d[6] | d[7] << 8;
-    int lpp = d[8];
-    int bpp = d[9];
-    int enc = d[10] | d[11] << 8;
-
-    if (bpp != 4 || enc != 0 || ppl <= 0 || ppl > MAX_W || lpp <= 0 ||
-        line + lpp > MAX_H || len < HDR_LEN + (ssize_t)(ppl / 2 * lpp))
-        return false; // not a stream layout we understand
-
-    if (frame != fb->frame_no) { // new frame begins; keep old pixels as filler
-        fb->frame_no = frame;
-        fb->lines_got = 0;
-        fb->ready = false;
-    }
-    const Uint8 *src = d + HDR_LEN;
-    for (int l = 0; l < lpp; l++) {
-        Uint32 *dst = fb->px + (size_t)(line + l) * MAX_W;
-        for (int x = 0; x < ppl; x += 2) {
-            Uint8 b = *src++;
-            dst[x] = vic_palette[b & 0x0F]; // low nibble = left pixel
-            dst[x + 1] = vic_palette[b >> 4];
-        }
-    }
-    fb->lines_got += lpp;
-    fb->width = ppl;
-    if (last) {
-        fb->height = line + lpp;
-        fb->ready = true;
-        fb->complete = fb->lines_got >= fb->height;
-    }
-    return fb->ready;
-}
-
-static bool dump_ppm(const char *path, const struct frame_buf *fb)
-{
-    FILE *f = fopen(path, "wb");
-    if (!f)
-        return false;
-    fprintf(f, "P6\n%d %d\n255\n", fb->width, fb->height);
-    for (int y = 0; y < fb->height; y++)
-        for (int x = 0; x < fb->width; x++) {
-            Uint32 p = fb->px[(size_t)y * MAX_W + x];
-            fputc(p >> 16 & 0xFF, f);
-            fputc(p >> 8 & 0xFF, f);
-            fputc(p & 0xFF, f);
-        }
-    return fclose(f) == 0;
 }
 
 // ---------------------------------------------------------------- main
@@ -555,15 +434,15 @@ int main(int argc, char **argv)
             fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
             return 1;
         }
-        if (!SDL_CreateWindowAndRenderer("c64uv — waiting for stream…",
-                                         MAX_W * cfg.scale, 272 * cfg.scale,
+        if (!SDL_CreateWindowAndRenderer("c64uv - waiting for stream…",
+                                         VIDEO_MAX_W * cfg.scale, 272 * cfg.scale,
                                          SDL_WINDOW_RESIZABLE, &win, &ren)) {
             fprintf(stderr, "SDL window: %s\n", SDL_GetError());
             return 1;
         }
         if (asock >= 0) {
             // Ultimate PAL audio clock; SDL resamples to whatever the
-            // device wants. (NTSC is ~47940 — 0.09% off, inaudible.)
+            // device wants. (NTSC is ~47940 - 0.09% off, inaudible.)
             SDL_AudioSpec aspec = {SDL_AUDIO_S16LE, 2, 47983};
             astream = SDL_OpenAudioDeviceStream(
                 SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &aspec, NULL, NULL);
@@ -591,9 +470,7 @@ int main(int argc, char **argv)
     Uint32 *term_px = calloc(TERM_PX_W * TERM_PX_H, sizeof(Uint32));
 
     struct frame_buf *fb = calloc(1, sizeof *fb);
-    fb->frame_no = 0xFFFF;
-    fb->width = MAX_W;
-    fb->height = 272;
+    video_init(fb);
     int tex_h = 0;
     Uint8 pkt[2048];
     Uint64 last_stat = SDL_GetTicks();
@@ -717,7 +594,7 @@ int main(int argc, char **argv)
             if (n < 0)
                 break;
             packets++;
-            frame_done = handle_packet(pkt, n, fb);
+            frame_done = video_handle_packet(pkt, n, fb);
         }
 
         if (windowed && term_active && (trm->dirty || term_present)) {
@@ -748,13 +625,13 @@ int main(int argc, char **argv)
                 if (windowed)
                     SDL_SetWindowTitle(
                         win, kb.enabled
-                                 ? "c64uv — Esc = RUN/STOP, Ctrl+Q = quit"
+                                 ? "c64uv - Esc = RUN/STOP, Ctrl+Q = quit"
                                  : "c64uv");
             }
             if (cfg.dump_path) {
                 if (!fb->complete)
                     continue; // wait for a frame with no lost packets
-                if (!dump_ppm(cfg.dump_path, fb)) {
+                if (!video_dump_ppm(cfg.dump_path, fb)) {
                     perror("dump");
                     return 1;
                 }
@@ -771,7 +648,7 @@ int main(int argc, char **argv)
                 tex_h = fb->height;
             }
             if (!term_active) {
-                SDL_UpdateTexture(tex, NULL, fb->px, MAX_W * sizeof(Uint32));
+                SDL_UpdateTexture(tex, NULL, fb->px, VIDEO_MAX_W * sizeof(Uint32));
                 SDL_SetRenderLogicalPresentation(
                     ren, fb->width, fb->height,
                     SDL_LOGICAL_PRESENTATION_INTEGER_SCALE);
