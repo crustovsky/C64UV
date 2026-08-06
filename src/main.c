@@ -411,20 +411,23 @@ static bool dump_ppm(const char *path, const struct frame_buf *fb)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s [--host IP] [--dest IP[:PORT]] [--port N] [--scale N]\n"
+            "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
             "          [--no-start] [--no-audio] [--no-keyb] [--dump FILE.ppm]\n"
-            "          [--verbose]\n"
-            "  --host    Ultimate address (default 192.168.8.236)\n"
+            "          [--term-test] [--verbose]\n"
+            "  --host    C64 Ultimate address (or set C64U_HOST)\n"
             "  --dest    where the Ultimate should send the streams (default: auto)\n"
             "  --port    local UDP video port; audio uses port+1 (default 11000)\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
-            "  --dump    write first complete frame as PPM, then exit\n",
+            "  --dump    write first complete frame as PPM, then exit\n"
+            "  --term-test  print the telnet menu screen as text, then exit\n",
             argv0);
 }
 
 int main(int argc, char **argv)
 {
-    struct config cfg = {.host = "192.168.8.236", .listen_port = 11000, .scale = 2};
+    struct config cfg = {.host = getenv("C64U_HOST"),
+                         .listen_port = 11000,
+                         .scale = 2};
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--host") && i + 1 < argc)
             cfg.host = argv[++i];
@@ -451,6 +454,15 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    if (!cfg.host && !cfg.no_start) {
+        fprintf(stderr,
+                "no Ultimate address: pass --host <ip> or set C64U_HOST\n"
+                "(find it on the machine: F5 menu on the Ultimate shows its "
+                "IP, or check your router)\n");
+        return 2;
+    }
+    if (!cfg.host)
+        cfg.host = ""; // --no-start mock mode needs no device
 
     if (cfg.term_test)
         return run_term_test(cfg.host);

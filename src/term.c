@@ -3,11 +3,21 @@
 
 #include <string.h>
 
-// xterm-ish 16-color palette, ARGB8888
-static const uint32_t ansi_palette[16] = {
-    0xFF000000, 0xFFCD0000, 0xFF00CD00, 0xFFCDCD00, 0xFF3465CD, 0xFFCD00CD,
-    0xFF00CDCD, 0xFFE5E5E5, 0xFF7F7F7F, 0xFFFF0000, 0xFF00FF00, 0xFFFFFF00,
-    0xFF5C5CFF, 0xFFFF00FF, 0xFF00FFFF, 0xFFFFFFFF,
+// VIC-II palette (Pepto), ARGB8888 — the menu should look like a C64, not a
+// generic terminal.
+static const uint32_t vic_palette[16] = {
+    0xFF000000, 0xFFFFFFFF, 0xFF813338, 0xFF75CEC8, 0xFF8E3C97, 0xFF56AC4D,
+    0xFF2E2C9B, 0xFFEDF171, 0xFF8E5029, 0xFF553800, 0xFFC46C71, 0xFF4A4A4A,
+    0xFF7B7B7B, 0xFFA9FF9F, 0xFF706DEB, 0xFFB2B2B2,
+};
+#define TERM_BG vic_palette[6] // C64 blue
+
+// The firmware maps VIC colors to ANSI (screen_vt100.cc set_color); this is
+// that table inverted: [intensity][ansi base 30-37] -> VIC color.
+static const uint8_t vic_from_ansi[3][8] = {
+    {0, 2, 5, 7, 6, 4, 3, 15},  // normal
+    {0, 10, 13, 7, 14, 4, 3, 1}, // ;1 bright
+    {0, 9, 5, 8, 6, 4, 3, 15},  // ;2 dim
 };
 
 // DEC special graphics (ESC(0): map the glyphs the firmware uses to
@@ -29,7 +39,8 @@ static char dec_graphics(char c)
 void term_init(struct term *t)
 {
     memset(t, 0, sizeof *t);
-    t->cur_fg = 7;
+    t->cur_fg = 15; // light grey, the firmware's default
+    t->ansi_base = 7;
     memset(t->ch, ' ', sizeof t->ch);
     t->dirty = true;
 }
@@ -66,32 +77,28 @@ static void clear_screen(struct term *t)
 }
 
 // SGR: the firmware only emits 0;3X with optional ;1 (bright) ;2 (dim),
-// plus 7/27 for reverse. "Dim" maps to the dark half of the palette.
+// plus standalone 7/27 for reverse. Tracked as base+intensity so the
+// sequence can be mapped back to the VIC color it stands for.
 static void apply_sgr(struct term *t)
 {
-    int color = -1;
-    bool bright = false;
     for (int i = 0; i < t->nparams; i++) {
         int p = t->params[i];
         if (p == 0) {
-            t->cur_fg = 7;
+            t->ansi_base = 7;
+            t->ansi_int = 0;
             t->cur_rv = false;
-            bright = false;
         } else if (p == 1)
-            bright = true;
+            t->ansi_int = 1;
         else if (p == 2)
-            bright = false;
+            t->ansi_int = 2;
         else if (p == 7)
             t->cur_rv = true;
         else if (p == 27)
             t->cur_rv = false;
         else if (p >= 30 && p <= 37)
-            color = p - 30;
+            t->ansi_base = p - 30;
     }
-    if (color >= 0)
-        t->cur_fg = (uint8_t)(color + (bright ? 8 : 0));
-    else if (bright && t->cur_fg < 8)
-        t->cur_fg += 8;
+    t->cur_fg = vic_from_ansi[t->ansi_int][t->ansi_base];
 }
 
 static void csi_dispatch(struct term *t, char final)
@@ -176,7 +183,9 @@ void term_feed(struct term *t, const uint8_t *data, int n)
                 t->state = 3;
             } else if (b == 'c') { // RIS: full reset
                 clear_screen(t);
-                t->cur_fg = 7;
+                t->cur_fg = 15;
+                t->ansi_base = 7;
+                t->ansi_int = 0;
                 t->state = 0;
             } else {
                 t->state = 0;
@@ -215,8 +224,8 @@ void term_render(const struct term *t, uint32_t *px, int pitch_px)
             const char *glyph = font8x8_basic[(int)(unsigned char)t->ch[row][col] & 0x7F];
             bool cursor = (row == t->cy && col == t->cx);
             bool rv = t->rv[row][col] ^ cursor;
-            uint32_t fgc = ansi_palette[t->fg[row][col]];
-            uint32_t bgc = 0xFF000000;
+            uint32_t fgc = vic_palette[t->fg[row][col]];
+            uint32_t bgc = TERM_BG;
             if (rv) { uint32_t tmp = fgc; fgc = bgc; bgc = tmp; }
             for (int y = 0; y < 8; y++) {
                 uint32_t *out = px + (row * 8 + y) * pitch_px + col * 8;

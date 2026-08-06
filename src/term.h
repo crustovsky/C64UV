@@ -8,17 +8,20 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define TERM_COLS 80
-#define TERM_ROWS 25
+// The firmware's remote screen is fixed 60x24 (screen_vt100.h get_size_x/y).
+#define TERM_COLS 60
+#define TERM_ROWS 24
 #define TERM_PX_W (TERM_COLS * 8)
 #define TERM_PX_H (TERM_ROWS * 8)
 
 struct term {
     char ch[TERM_ROWS][TERM_COLS];
-    uint8_t fg[TERM_ROWS][TERM_COLS]; // ANSI color index 0-15
+    uint8_t fg[TERM_ROWS][TERM_COLS]; // VIC color index 0-15
     uint8_t rv[TERM_ROWS][TERM_COLS]; // reverse video flag
     int cx, cy;
-    uint8_t cur_fg;
+    uint8_t cur_fg;   // VIC color
+    int ansi_base;    // last SGR base color 0-7
+    int ansi_int;     // 0 normal, 1 bright, 2 dim
     bool cur_rv;
     bool draw_charset; // ESC(0 line drawing active
     bool dirty;

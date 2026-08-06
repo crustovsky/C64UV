@@ -1,136 +1,82 @@
-# C64UV — C64 Ultimate Viewer
+# CLAUDE.md — Commodore 64 Ultimate Viewer
 
-Linux desktop viewer for the Commodore 64 Ultimate: streams the machine's video
-(and later audio) into a window and will eventually pass keyboard input back, so
-the machine can be used without a second monitor. Broader context: the machine
-is used to teach BASIC to a 6-year-old on real hardware; this tool is for lesson
-prep on the laptop. Later possible additions: disk image mounting, running PRGs,
-reset/menu buttons — all available via the same REST API.
+Linux SDL3 viewer for the C64 Ultimate / Ultimate 64: streams the machine's
+video and audio into a window, forwards keystrokes, and shows the Ultimate's
+menu over telnet. User-facing docs live in README.md; this file holds what a
+developer (or Claude) needs beyond that.
 
-## Device
+## Architecture
 
-- C64 Ultimate (Commodore-branded). **Wired: `192.168.8.236`** (use this — it's
-  the streaming interface and the viewer's default host); WiFi: `192.168.8.173`.
-  Both DHCP, so they can move.
-- Firmware **1.1.0**, FPGA 122, core 1.49 (checked 2026-08-06 via `GET /v1/info`)
-- Drive A: 1541, bus 8, enabled. Drive B and SoftIEC disabled.
-
-## Hard-won findings (keep updated)
-
-- **Streams only work over the Ultimate's wired Ethernet port.** With the device
-  on WiFi, `PUT /v1/streams/video:start` returns HTTP 500
-  `"No Operational Network Interface"`. The VIC/audio streams are generated in
-  the FPGA and go out the Ethernet MAC directly. → Plug in a cable to stream.
-- **No `machine:input` endpoint in firmware 1.1.0** (returns 404). That endpoint
-  (CIA1-level key/joystick injection, ~13 ms latency) exists only in Gideon's
-  upstream 3.15 beta for Ultimate 64 and hasn't landed in the Commodore firmware
-  yet. Until it does, keyboard passthrough must use the KERNAL keyboard buffer:
-  `PUT /v1/machine:writemem` to `$0277` (buffer) + `$C6` (count). Works for
-  BASIC/KERNAL input only — not games, not the Ultimate menu. Re-probe
-  `machine:input` after each firmware update.
-- **This laptop's routing quirk:** Tailscale (`table 52`) claims
-  `192.168.8.0/24`, so `ip route get 192.168.8.173` says `tailscale0` even
-  though eth0 (`192.168.8.197`) and wlan0 (`192.168.8.124`) are on that LAN
-  directly. Incoming stream UDP is unaffected (`rp_filter` is loose: eth0=2).
-  Use `192.168.8.197` as the stream destination.
-- **`streams/*:start` fails with HTTP 404 `"Network Host Resolve Error"` if the
-  destination IP is not in the Ultimate's ARP table.** It doesn't ARP on
-  demand. A plain UDP poke from the viewer does NOT fix it on this laptop,
-  because Tailscale's `table 52` (rule 5270, before main) routes the whole
-  home LAN through the tunnel — someone on the tailnet advertises
-  `192.168.8.0/24` and this machine runs accept-routes. The packet then
-  reaches the Ultimate from the router, not from eth0's MAC. Working fix
-  (implemented): `ping -n -q -c1 -W1 -I eth0 <ultimate>` — `ping` may force
-  the egress interface without root — run before every keepalive start, which
-  also keeps the Ultimate's ARP entry fresh. The `ip=<addr>:<port>` combined
-  syntax works fine; there is no separate `port` parameter.
-- **Audio queue needs active latency control.** Input and output rates match
-  exactly, so whatever queue builds during startup (~170 ms observed) persists
-  forever. The viewer runs a servo on `SDL_SetAudioStreamFrequencyRatio`
-  (±2 % max, adjusted 1×/s) steering toward a 60 ms target.
-- Default stream destinations in device config are multicast
-  (`239.0.1.64:11000` video, `239.0.1.65:11001` audio); we override per-start
-  with a unicast `ip[:port]` query param instead.
-- Firewall status on this laptop unverified (nft list needs sudo). If packets
-  don't arrive once Ethernet is plugged in, check nftables first.
-- **Input paths, surveyed 2026-08-06** (all services enabled on device; ports
-  21/23/64/80 open):
-  - `writemem $0277` + count at `$C6`: what both c64u AND the Ultimate's own
-    web UI use (its "Run" button types `RUN\r` this way; STOP = `$91 ← $7F`).
-    KERNAL-read input only.
-  - TCP port 64 socket command `KEYB` (0xFF03, LE word + u16 len + chars):
-    same keyboard-buffer mechanism, but firmware-side and one TCP write per
-    batch — cheaper than two HTTP calls per keypress. Untested so far.
-  - **Telnet port 23 = full Ultimate menu as a VT100 session** (verified:
-    banner "*** C64 Ultimate (V1.49) 1.1.0 *** Remote ***"). Solves menu
-    control completely — file browsing, mounting, config. `telnet
-    192.168.8.236` works today. Note: the Ultimate menu overlay is NOT in the
-    VIC video stream, so telnet is the only way to see it remotely.
-  - `machine:input` (CIA1-level, works for games): future firmware only.
-  - Bonus: `GET /v1/machine:readmem?address=0400&length=1000` reads screen RAM
-    → closed-loop testing of typed input without looking at the video.
-
-## Protocol reference
-
-REST API docs: <https://1541u-documentation.readthedocs.io/en/latest/api/api_calls.html>
-Stream format: <https://1541u-documentation.readthedocs.io/en/latest/data_streams.html>
-
-- Start/stop: `PUT /v1/streams/video:start?ip=<dest>[:port]`, `...:stop`.
-  Idempotent — re-send start every ~5 s as keepalive (survives resets).
-- **Video** UDP :11000 — 780-byte datagrams: 12-byte header, all LE:
-  seq u16, frame u16, line u16 (bit 15 = last packet of frame), pixels-per-line
-  u16 (384), lines-per-packet u8 (4), bits-per-pixel u8 (4), encoding u16 (0).
-  Payload: 4 lines × 384 px × 4 bpp = 768 bytes. **Low nibble = leftmost
-  pixel** (verified in c64stream source). PAL 384×272 @ 50 Hz (68 pkts/frame),
-  NTSC 384×240 @ 60 Hz. Values are VIC color indices 0–15.
-- **Audio** UDP :11001 — 2-byte seq + 192 stereo s16le frames (770 bytes).
-  ~47983 Hz PAL / ~47940 Hz NTSC.
-
-## Stack & architecture
-
-C + SDL3 (video/audio/input) + libcurl (REST). Arch packages: `sdl3`, `curl`.
+Single binary, three source files, two dependencies (SDL3, libcurl):
 
 ```
-UDP :11000 → frame assembler → palette LUT → SDL streaming texture → window
-UDP :11001 → SDL_AudioStream (resample + latency servo → 60 ms) → device
-SDL text/key events → PETSCII → TCP :64 KEYB (0xFF03); Esc → DMAWRITE $91=$7F
-keepalive thread → ARP prime (ping -I) + PUT streams/{video,audio}:start every 5 s
+src/main.c   event loop, UDP receive, frame assembly, audio, REST keepalive,
+             keyboard (TCP :64), telnet plumbing
+src/term.c   minimal VT100 emulator matched to the firmware's remote screen
+src/font8x8.h  public-domain 8x8 bitmap font (rendering for term.c)
 ```
 
-Keyboard notes: Esc = RUN/STOP, Ctrl+Q = quit, F1–F8/cursors/Home/Del mapped;
-lowercase types letters, uppercase (shift) types PETSCII graphics — correct for
-the default charset. KEYB frame: `03 FF <len16 LE> <chars>`, ≤10 chars per
-batch (KERNAL buffer size; firmware does not chunk). Switch to `machine:input`
-for game-compatible input when Commodore ships it.
+```
+UDP :11000 → frame assembler → VIC palette LUT → SDL streaming texture
+UDP :11001 → SDL_AudioStream (resample + latency servo → 60 ms target)
+SDL events → PETSCII → TCP :64 KEYB   |   F9 view: VT100 keys → TCP :23
+keepalive thread → ARP prime (ping -I) + PUT streams/{video,audio}:start / 5 s
+```
 
-- `src/main.c` — everything so far. `Makefile` — `make` then `./c64uv`.
-- `tools/mockstream.py` — sends synthetic PAL frames in the exact wire format
-  to 127.0.0.1:11000; use with `./c64uv --no-start` to test without hardware.
-- `./c64uv --dump frame.ppm` exits after writing the first complete frame —
-  headless end-to-end test.
+Deliberate choice: no further file splitting while the whole program is
+~1k lines — the section banners in main.c are the module boundaries.
 
-## Status log
+## Protocol facts (hard-won, verified on real hardware)
 
-- **2026-08-06** Stack chosen; device probed; video viewer written and verified
-  end-to-end against `tools/mockstream.py` (correct palette per test bar).
-- **2026-08-06 (later)** Ethernet plugged in (wired IP `192.168.8.236`). Live
-  video confirmed: BASIC boot screen decoded pixel-perfect, ~50 fps, no packet
-  loss to eth0 (`192.168.8.197`). Discovered + fixed the ARP-priming
-  requirement (see findings). Video milestone done.
-- **2026-08-06 (evening)** Audio milestone done: second UDP stream into
-  SDL_AudioStream, latency servo converges to ~60 ms, zero packet gaps.
-  Root-caused the Tailscale hairpin (see findings) — auto-detection now picks
-  the LAN interface by subnet match (wired preferred) and primes ARP via
-  `ping -I`, so plain `./c64uv` works with no flags. Repo:
-  github.com/crustovsky/C64UV (private).
-- **2026-08-06 (night)** Keyboard milestone: port-64 KEYB verified live
-  (typed `PRINT 2+2` remotely, read `4` back from screen RAM), then wired
-  into the viewer with full PETSCII mapping and RUN/STOP via `$91` poke.
+- Stream wire formats are in README.md. Pixel packing: **low nibble =
+  leftmost pixel**. The `ip=<addr>:<port>` form works on `streams/*:start`;
+  there is no separate `port` parameter.
+- **Streams only leave the Ultimate's wired Ethernet port** (FPGA-generated).
+  On WiFi-only, start fails with HTTP 500 "No Operational Network Interface".
+- **The firmware never ARPs on demand**: `streams/*:start` returns HTTP 404
+  "Network Host Resolve Error" unless the destination is already in its ARP
+  table. Hence the `ping -I <iface>` prime before every keepalive start — a
+  plain UDP send is not enough when policy routing (e.g. a VPN with
+  accept-routes covering the local subnet) sends LAN traffic through a
+  tunnel, making packets arrive from the wrong MAC. Interface selection is
+  by subnet match (getifaddrs), preferring wired over `wl*`.
+- **Audio queue needs a servo, not a buffer**: input and output rates match,
+  so startup fill (~170 ms observed) persists forever unless actively
+  drained. `SDL_SetAudioStreamFrequencyRatio` nudges (±2 %, 1×/s) hold the
+  queue at the 60 ms target.
+- **Keyboard**: TCP :64 `KEYB` (0xFF03, frame `03 FF <len16 LE> <chars>`)
+  DMA-writes into the KERNAL buffer `$0277` + count `$C6`. The firmware does
+  NOT chunk — keep batches ≤ 10 chars (buffer size). RUN/STOP is not a buffer
+  char: poke `$91 = $7F` via `DMAWRITE` (0xFF06), repeated to win the race
+  against the KERNAL restoring it (the vendor web UI does the same). The
+  vendor web UI itself types via `writemem $0277`, so this is the sanctioned
+  mechanism. Works only for KERNAL-read input, not matrix-scanning games —
+  upgrade to `machine:input` (CIA1-level, in upstream 3.15 beta) once the
+  official firmware ships it; probe `PUT /v1/machine:input` after firmware
+  updates.
+- **Telnet menu (TCP :23)**: firmware `screen_vt100.cc` emits exactly: `ESC c`
+  (RIS), `ESC[y;xH`, a fixed SGR set (`0;3X` + `;1`/`;2`, `7`/`27`), `ESC(0`
+  / `ESC(B` charset switches, `ESC[2J`, `ESC[r`. Screen is fixed **60×24**.
+  Colors are C64 colors round-tripped through ANSI — term.c inverts the
+  firmware's `set_color` table back to VIC colors. Input parsing
+  (`keyboard_vt100.cc`) wants xterm-style: `ESC[A-D`, `ESC[N~` (old-style
+  F-keys: 11-15 = F1-F5, 17-19 = F6-F8), bare `ESC` = back. The menu overlay
+  is not in the VIC stream; telnet is the only remote view of it.
+- Screen RAM is remotely readable: `GET /v1/machine:readmem?address=0400&
+  length=1000` — used to close the loop when testing typed input.
+
+## Dev workflow (no hardware needed)
+
+- `tools/mockstream.py [ip] [port] [secs]` sends synthetic video (color bars
+  + sweep line) and audio (440 Hz tone) in the exact wire format.
+- `./c64uv --no-start` = listen-only viewer against the mock.
+- `./c64uv --dump f.ppm` (headless single-frame grab) and `--term-test`
+  (headless menu-screen dump) are the two self-verification modes.
+- `--verbose` logs fps / packet counts / gaps / audio queue depth every 5 s.
 
 ## Roadmap
 
-1. ✅ Video viewer
-2. ✅ Audio
-3. ✅ Keyboard (TCP :64 KEYB; `machine:input` upgrade when firmware ships it)
-4. Ultimate menu: embed/spawn the port-23 telnet VT100 session (next)
-5. Convenience: mount .d64 / run .prg / reset / menu_button hotkeys
+1. Tests + CI (next): term.c parser fed captured session bytes, PETSCII
+   mapping table, frame assembler against mockstream packets.
+2. `machine:input` keyboard upgrade when official firmware ships it.
+3. Convenience hotkeys: mount .d64, run .prg, reset, menu button.
