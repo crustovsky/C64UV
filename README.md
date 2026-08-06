@@ -68,6 +68,11 @@ refuses to start a stream toward an address missing from its ARP table.
 | **F9** | toggle the Ultimate menu view |
 | Ctrl+Q | quit |
 
+The menu view is its own remote session on the firmware side: after you launch
+something from it (Run Disk, Run Program), the menu stays where it was and the
+viewer does not switch on its own - press F9 to flip back to the C64 screen
+and watch it boot.
+
 Useful flags: `--no-audio`, `--no-keyb`, `--scale N` (window size),
 `--verbose` (fps/packet/latency stats), `--dump f.ppm` (grab one frame
 headless), `--term-test` (print the menu screen as text and exit),
