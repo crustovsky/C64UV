@@ -53,6 +53,22 @@ reset/menu buttons — all available via the same REST API.
   with a unicast `ip[:port]` query param instead.
 - Firewall status on this laptop unverified (nft list needs sudo). If packets
   don't arrive once Ethernet is plugged in, check nftables first.
+- **Input paths, surveyed 2026-08-06** (all services enabled on device; ports
+  21/23/64/80 open):
+  - `writemem $0277` + count at `$C6`: what both c64u AND the Ultimate's own
+    web UI use (its "Run" button types `RUN\r` this way; STOP = `$91 ← $7F`).
+    KERNAL-read input only.
+  - TCP port 64 socket command `KEYB` (0xFF03, LE word + u16 len + chars):
+    same keyboard-buffer mechanism, but firmware-side and one TCP write per
+    batch — cheaper than two HTTP calls per keypress. Untested so far.
+  - **Telnet port 23 = full Ultimate menu as a VT100 session** (verified:
+    banner "*** C64 Ultimate (V1.49) 1.1.0 *** Remote ***"). Solves menu
+    control completely — file browsing, mounting, config. `telnet
+    192.168.8.236` works today. Note: the Ultimate menu overlay is NOT in the
+    VIC video stream, so telnet is the only way to see it remotely.
+  - `machine:input` (CIA1-level, works for games): future firmware only.
+  - Bonus: `GET /v1/machine:readmem?address=0400&length=1000` reads screen RAM
+    → closed-loop testing of typed input without looking at the video.
 
 ## Protocol reference
 
