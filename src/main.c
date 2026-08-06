@@ -38,6 +38,7 @@ struct config {
     int scale;
     bool no_start;          // don't touch REST (mock/local testing)
     bool no_audio;
+    bool no_keyb;
     const char *dump_path;  // write first complete frame as PPM and exit
     bool verbose;
 };
@@ -190,6 +191,114 @@ static bool detect_local_ip(const char *host, char *out, size_t outlen)
     return ok;
 }
 
+// ------------------------------------------------------- keyboard passthrough
+//
+// TCP port 64, firmware "socket DMA" protocol: little-endian command word,
+// u16 payload length, payload. KEYB (0xFF03) drops chars into the KERNAL
+// keyboard buffer ($0277/$C6) — works for BASIC and anything else that reads
+// input the normal way; games polling the matrix won't see it (needs the
+// machine:input firmware feature, not shipped yet).
+
+struct keyb {
+    int fd; // -1 when disconnected
+    bool enabled;
+    struct sockaddr_in addr;
+    Uint64 last_try;
+};
+
+static void keyb_try_connect(struct keyb *k)
+{
+    if (!k->enabled || k->fd >= 0 ||
+        (k->last_try != 0 && SDL_GetTicks() - k->last_try < 3000))
+        return;
+    k->last_try = SDL_GetTicks();
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval tv = {.tv_sec = 1};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    if (connect(fd, (struct sockaddr *)&k->addr, sizeof k->addr) == 0) {
+        k->fd = fd;
+        SDL_Log("keyboard channel connected (port 64)");
+    } else {
+        close(fd);
+    }
+}
+
+static void keyb_raw(struct keyb *k, Uint16 cmd, const Uint8 *data, int n)
+{
+    keyb_try_connect(k);
+    if (k->fd < 0)
+        return;
+    Uint8 frame[4 + 16];
+    frame[0] = cmd & 0xFF;
+    frame[1] = cmd >> 8;
+    frame[2] = (Uint8)n;
+    frame[3] = 0;
+    memcpy(frame + 4, data, (size_t)n);
+    if (send(k->fd, frame, 4 + (size_t)n, MSG_NOSIGNAL) < 0) {
+        close(k->fd);
+        k->fd = -1; // reconnect on next keypress
+    }
+}
+
+static void keyb_type(struct keyb *k, Uint8 petscii)
+{
+    keyb_raw(k, 0xFF03, &petscii, 1);
+}
+
+// RUN/STOP isn't a buffer character: BASIC checks the stop flag at $91.
+// Write it a few times (DMAWRITE) to win the race against the KERNAL's own
+// keyboard scan restoring it — same trick the Ultimate's web UI uses.
+static void keyb_stop(struct keyb *k)
+{
+    const Uint8 poke[] = {0x91, 0x00, 0x7F};
+    for (int i = 0; i < 3; i++)
+        keyb_raw(k, 0xFF06, poke, sizeof poke);
+}
+
+// ASCII → PETSCII for the default uppercase/graphics charset: lowercase
+// letters are the unshifted keys, uppercase are shifted (graphics symbols).
+static int ascii_to_petscii(unsigned char a)
+{
+    if (a >= 'a' && a <= 'z')
+        return a - 'a' + 0x41;
+    if (a >= 'A' && a <= 'Z')
+        return a - 'A' + 0xC1;
+    if (a >= ' ' && a <= '@') // space, punctuation, digits
+        return a;
+    switch (a) {
+    case '[': return 0x5B;
+    case ']': return 0x5D;
+    case '^': return 0x5E; // up-arrow
+    case '_': return 0xA4;
+    }
+    return -1; // no such key on a C64
+}
+
+static int special_to_petscii(SDL_Keycode key, SDL_Keymod mod)
+{
+    switch (key) {
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER: return 0x0D;
+    case SDLK_BACKSPACE:
+    case SDLK_DELETE: return 0x14;
+    case SDLK_INSERT: return 0x94;
+    case SDLK_UP: return 0x91;
+    case SDLK_DOWN: return 0x11;
+    case SDLK_LEFT: return 0x9D;
+    case SDLK_RIGHT: return 0x1D;
+    case SDLK_HOME: return (mod & SDL_KMOD_SHIFT) ? 0x93 /*CLR*/ : 0x13;
+    case SDLK_F1: return 0x85;
+    case SDLK_F2: return 0x89;
+    case SDLK_F3: return 0x86;
+    case SDLK_F4: return 0x8A;
+    case SDLK_F5: return 0x87;
+    case SDLK_F6: return 0x8B;
+    case SDLK_F7: return 0x88;
+    case SDLK_F8: return 0x8C;
+    }
+    return -1;
+}
+
 // ---------------------------------------------------------------- video path
 
 static bool handle_packet(const Uint8 *d, ssize_t len, struct frame_buf *fb)
@@ -255,7 +364,8 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--host IP] [--dest IP[:PORT]] [--port N] [--scale N]\n"
-            "          [--no-start] [--no-audio] [--dump FILE.ppm] [--verbose]\n"
+            "          [--no-start] [--no-audio] [--no-keyb] [--dump FILE.ppm]\n"
+            "          [--verbose]\n"
             "  --host    Ultimate address (default 192.168.8.236)\n"
             "  --dest    where the Ultimate should send the streams (default: auto)\n"
             "  --port    local UDP video port; audio uses port+1 (default 11000)\n"
@@ -280,6 +390,8 @@ int main(int argc, char **argv)
             cfg.no_start = true;
         else if (!strcmp(argv[i], "--no-audio"))
             cfg.no_audio = true;
+        else if (!strcmp(argv[i], "--no-keyb"))
+            cfg.no_keyb = true;
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc)
             cfg.dump_path = argv[++i];
         else if (!strcmp(argv[i], "--verbose"))
@@ -385,8 +497,8 @@ int main(int argc, char **argv)
             return 1;
         }
         if (asock >= 0) {
-            // Ultimate PAL audio clock; SDL resamples to whatever the device
-            // wants. (NTSC is ~47940 — the 0.09% difference is inaudible.)
+            // Ultimate PAL audio clock; SDL resamples to whatever the
+            // device wants. (NTSC is ~47940 — 0.09% off, inaudible.)
             SDL_AudioSpec aspec = {SDL_AUDIO_S16LE, 2, 47983};
             astream = SDL_OpenAudioDeviceStream(
                 SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &aspec, NULL, NULL);
@@ -395,6 +507,16 @@ int main(int argc, char **argv)
             else
                 SDL_Log("audio device unavailable: %s", SDL_GetError());
         }
+    }
+
+    struct keyb kb = {.fd = -1};
+    if (windowed && !cfg.no_keyb && !cfg.no_start) {
+        kb.enabled = true;
+        kb.addr = (struct sockaddr_in){.sin_family = AF_INET,
+                                       .sin_port = htons(64)};
+        inet_pton(AF_INET, cfg.host, &kb.addr.sin_addr);
+        SDL_StartTextInput(win);
+        keyb_try_connect(&kb);
     }
 
     struct frame_buf *fb = calloc(1, sizeof *fb);
@@ -420,10 +542,29 @@ int main(int argc, char **argv)
     while (!atomic_load(&g_quit)) {
         if (windowed) {
             SDL_Event ev;
-            while (SDL_PollEvent(&ev))
-                if (ev.type == SDL_EVENT_QUIT ||
-                    (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE))
+            while (SDL_PollEvent(&ev)) {
+                if (ev.type == SDL_EVENT_QUIT) {
                     atomic_store(&g_quit, true);
+                } else if (ev.type == SDL_EVENT_KEY_DOWN) {
+                    if ((ev.key.mod & SDL_KMOD_CTRL) && ev.key.key == SDLK_Q) {
+                        atomic_store(&g_quit, true);
+                    } else if (kb.enabled) {
+                        if (ev.key.key == SDLK_ESCAPE) {
+                            keyb_stop(&kb); // Esc = RUN/STOP
+                        } else {
+                            int c = special_to_petscii(ev.key.key, ev.key.mod);
+                            if (c >= 0)
+                                keyb_type(&kb, (Uint8)c);
+                        }
+                    }
+                } else if (ev.type == SDL_EVENT_TEXT_INPUT && kb.enabled) {
+                    for (const char *p = ev.text.text; *p; p++) {
+                        int c = ascii_to_petscii((unsigned char)*p);
+                        if (c >= 0)
+                            keyb_type(&kb, (Uint8)c);
+                    }
+                }
+            }
         }
 
         struct pollfd pfd[2] = {{.fd = sock, .events = POLLIN},
@@ -473,7 +614,10 @@ int main(int argc, char **argv)
                 got_any = true;
                 SDL_Log("receiving: %dx%d", fb->width, fb->height);
                 if (windowed)
-                    SDL_SetWindowTitle(win, "c64uv");
+                    SDL_SetWindowTitle(
+                        win, kb.enabled
+                                 ? "c64uv — Esc = RUN/STOP, Ctrl+Q = quit"
+                                 : "c64uv");
             }
             if (cfg.dump_path) {
                 if (!fb->complete)
@@ -519,6 +663,8 @@ int main(int argc, char **argv)
     if (ka)
         SDL_WaitThread(ka, NULL);
     curl_global_cleanup();
+    if (kb.fd >= 0)
+        close(kb.fd);
     if (astream)
         SDL_DestroyAudioStream(astream);
     if (asock >= 0)

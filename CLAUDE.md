@@ -93,9 +93,15 @@ C + SDL3 (video/audio/input) + libcurl (REST). Arch packages: `sdl3`, `curl`.
 ```
 UDP :11000 → frame assembler → palette LUT → SDL streaming texture → window
 UDP :11001 → SDL_AudioStream (resample + latency servo → 60 ms) → device
-SDL key events → C64 matrix map → writemem $0277 (machine:input later) [not yet]
+SDL text/key events → PETSCII → TCP :64 KEYB (0xFF03); Esc → DMAWRITE $91=$7F
 keepalive thread → ARP prime (ping -I) + PUT streams/{video,audio}:start every 5 s
 ```
+
+Keyboard notes: Esc = RUN/STOP, Ctrl+Q = quit, F1–F8/cursors/Home/Del mapped;
+lowercase types letters, uppercase (shift) types PETSCII graphics — correct for
+the default charset. KEYB frame: `03 FF <len16 LE> <chars>`, ≤10 chars per
+batch (KERNAL buffer size; firmware does not chunk). Switch to `machine:input`
+for game-compatible input when Commodore ships it.
 
 - `src/main.c` — everything so far. `Makefile` — `make` then `./c64uv`.
 - `tools/mockstream.py` — sends synthetic PAL frames in the exact wire format
@@ -117,10 +123,14 @@ keepalive thread → ARP prime (ping -I) + PUT streams/{video,audio}:start every
   the LAN interface by subnet match (wired preferred) and primes ARP via
   `ping -I`, so plain `./c64uv` works with no flags. Repo:
   github.com/crustovsky/C64UV (private).
+- **2026-08-06 (night)** Keyboard milestone: port-64 KEYB verified live
+  (typed `PRINT 2+2` remotely, read `4` back from screen RAM), then wired
+  into the viewer with full PETSCII mapping and RUN/STOP via `$91` poke.
 
 ## Roadmap
 
 1. ✅ Video viewer
 2. ✅ Audio
-3. Keyboard via `writemem` $0277; switch to `machine:input` when firmware ships it
-4. Convenience: mount .d64 / run .prg / reset / menu_button hotkeys
+3. ✅ Keyboard (TCP :64 KEYB; `machine:input` upgrade when firmware ships it)
+4. Ultimate menu: embed/spawn the port-23 telnet VT100 session (next)
+5. Convenience: mount .d64 / run .prg / reset / menu_button hotkeys
