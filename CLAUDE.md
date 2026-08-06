@@ -35,10 +35,19 @@ reset/menu buttons — all available via the same REST API.
   Use `192.168.8.197` as the stream destination.
 - **`streams/*:start` fails with HTTP 404 `"Network Host Resolve Error"` if the
   destination IP is not in the Ultimate's ARP table.** It doesn't ARP on
-  demand. Fix (implemented in the viewer): send any UDP datagram from the
-  listen socket to the Ultimate right before each start request. The
-  `ip=<addr>:<port>` combined syntax works fine; there is no separate `port`
-  parameter ("Function start does not have parameter port").
+  demand. A plain UDP poke from the viewer does NOT fix it on this laptop,
+  because Tailscale's `table 52` (rule 5270, before main) routes the whole
+  home LAN through the tunnel — someone on the tailnet advertises
+  `192.168.8.0/24` and this machine runs accept-routes. The packet then
+  reaches the Ultimate from the router, not from eth0's MAC. Working fix
+  (implemented): `ping -n -q -c1 -W1 -I eth0 <ultimate>` — `ping` may force
+  the egress interface without root — run before every keepalive start, which
+  also keeps the Ultimate's ARP entry fresh. The `ip=<addr>:<port>` combined
+  syntax works fine; there is no separate `port` parameter.
+- **Audio queue needs active latency control.** Input and output rates match
+  exactly, so whatever queue builds during startup (~170 ms observed) persists
+  forever. The viewer runs a servo on `SDL_SetAudioStreamFrequencyRatio`
+  (±2 % max, adjusted 1×/s) steering toward a 60 ms target.
 - Default stream destinations in device config are multicast
   (`239.0.1.64:11000` video, `239.0.1.65:11001` audio); we override per-start
   with a unicast `ip[:port]` query param instead.
@@ -67,9 +76,9 @@ C + SDL3 (video/audio/input) + libcurl (REST). Arch packages: `sdl3`, `curl`.
 
 ```
 UDP :11000 → frame assembler → palette LUT → SDL streaming texture → window
-UDP :11001 → jitter buffer → SDL_AudioStream (resamples) → device   [not yet]
+UDP :11001 → SDL_AudioStream (resample + latency servo → 60 ms) → device
 SDL key events → C64 matrix map → writemem $0277 (machine:input later) [not yet]
-keepalive thread → PUT streams/video:start every 5 s
+keepalive thread → ARP prime (ping -I) + PUT streams/{video,audio}:start every 5 s
 ```
 
 - `src/main.c` — everything so far. `Makefile` — `make` then `./c64uv`.
@@ -86,10 +95,16 @@ keepalive thread → PUT streams/video:start every 5 s
   video confirmed: BASIC boot screen decoded pixel-perfect, ~50 fps, no packet
   loss to eth0 (`192.168.8.197`). Discovered + fixed the ARP-priming
   requirement (see findings). Video milestone done.
+- **2026-08-06 (evening)** Audio milestone done: second UDP stream into
+  SDL_AudioStream, latency servo converges to ~60 ms, zero packet gaps.
+  Root-caused the Tailscale hairpin (see findings) — auto-detection now picks
+  the LAN interface by subnet match (wired preferred) and primes ARP via
+  `ping -I`, so plain `./c64uv` works with no flags. Repo:
+  github.com/crustovsky/C64UV (private).
 
 ## Roadmap
 
-1. ✅ Video viewer (this milestone)
-2. Audio (SDL_AudioStream, drift/jitter handling à la c64stream "gap compensation")
+1. ✅ Video viewer
+2. ✅ Audio
 3. Keyboard via `writemem` $0277; switch to `machine:input` when firmware ships it
 4. Convenience: mount .d64 / run .prg / reset / menu_button hotkeys

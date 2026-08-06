@@ -1,3 +1,4 @@
 c64uv
 *.ppm
 *.o
+.claude/settings.local.json*

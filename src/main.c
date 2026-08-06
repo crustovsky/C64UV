@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdatomic.h>
@@ -33,9 +34,10 @@ static const Uint32 vic_palette[16] = {
 struct config {
     const char *host;       // Ultimate hostname/IP for REST
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
-    int listen_port;
+    int listen_port;        // video; audio uses listen_port + 1
     int scale;
     bool no_start;          // don't touch REST (mock/local testing)
+    bool no_audio;
     const char *dump_path;  // write first complete frame as PPM and exit
     bool verbose;
 };
@@ -54,10 +56,12 @@ static atomic_bool g_quit;
 // ---------------------------------------------------------------- REST control
 
 struct rest_ctx {
-    char start_url[256];
-    char stop_url[256];
+    char start_url[2][256]; // [0] video, [1] audio
+    char stop_url[2][256];
+    int nstreams;
     int sock;                    // our UDP socket, for the ARP-priming packet
     struct sockaddr_in ult_addr; // Ultimate's address
+    char prime_cmd[160];         // ping command forcing the LAN iface, or ""
 };
 
 static size_t curl_sink(char *data, size_t size, size_t nmemb, void *userp)
@@ -96,38 +100,78 @@ static int keepalive_thread(void *arg)
     struct rest_ctx *rc = arg;
     CURL *curl = curl_easy_init();
     char resp[512];
-    long last_code = -2;
+    long last_code[2] = {-2, -2};
     while (!atomic_load(&g_quit)) {
         // The Ultimate refuses to start a stream toward an address missing
-        // from its ARP table ("Network Host Resolve Error"), so poke it with
-        // a throwaway datagram from our source address first.
-        sendto(rc->sock, "", 1, 0, (struct sockaddr *)&rc->ult_addr,
-               sizeof rc->ult_addr);
-        long code = rest_put(curl, rc->start_url, resp);
-        if (code != last_code) { // log only on state change
-            if (code == 200)
-                SDL_Log("stream start OK (%s)", rc->start_url);
-            else if (code == -1)
-                SDL_Log("stream start: no response from Ultimate");
-            else
-                SDL_Log("stream start HTTP %ld: %s%s", code, resp,
-                        strstr(resp, "No Operational Network Interface")
-                            ? " -> plug the Ultimate into wired Ethernet; "
-                              "streams don't work over its WiFi"
-                            : "");
-            last_code = code;
+        // from its ARP table ("Network Host Resolve Error") and never ARPs on
+        // demand, so make it hear from us first — and keep refreshing its
+        // entry every cycle. A plain sendto can leave through the wrong
+        // interface when policy routing claims the LAN (Tailscale
+        // accept-routes does), so prefer ping -I on the subnet's interface,
+        // which is allowed to force the egress device without privileges.
+        if (rc->prime_cmd[0])
+            (void)!system(rc->prime_cmd);
+        else
+            sendto(rc->sock, "", 1, 0, (struct sockaddr *)&rc->ult_addr,
+                   sizeof rc->ult_addr);
+        for (int i = 0; i < rc->nstreams; i++) {
+            long code = rest_put(curl, rc->start_url[i], resp);
+            if (code != last_code[i]) { // log only on state change
+                if (code == 200)
+                    SDL_Log("stream start OK (%s)", rc->start_url[i]);
+                else if (code == -1)
+                    SDL_Log("stream start: no response from Ultimate");
+                else
+                    SDL_Log("stream start HTTP %ld: %s%s", code, resp,
+                            strstr(resp, "No Operational Network Interface")
+                                ? " -> plug the Ultimate into wired Ethernet; "
+                                  "streams don't work over its WiFi"
+                                : "");
+                last_code[i] = code;
+            }
         }
         for (int i = 0; i < 50 && !atomic_load(&g_quit); i++)
             SDL_Delay(100);
     }
-    rest_put(curl, rc->stop_url, resp);
+    for (int i = 0; i < rc->nstreams; i++)
+        rest_put(curl, rc->stop_url[i], resp);
     curl_easy_cleanup(curl);
     return 0;
 }
 
-// Local IP the Ultimate can reach us on: connect a UDP socket toward it and
-// read back the chosen source address. Beware: with policy routing (Tailscale)
-// this can pick the wrong interface — the --dest flag overrides.
+// Preferred detection: walk our interfaces and find the one whose subnet
+// contains the Ultimate. Immune to policy-routing detours (Tailscale
+// accept-routes) that make route-based lookups pick the wrong source.
+static bool find_lan_iface(const char *host, char *ip, size_t iplen,
+                           char *ifname, size_t iflen)
+{
+    struct in_addr target;
+    if (inet_pton(AF_INET, host, &target) != 1)
+        return false; // hostname given; caller falls back to route lookup
+    struct ifaddrs *ifs;
+    if (getifaddrs(&ifs) != 0)
+        return false;
+    bool found = false;
+    for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
+        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || !i->ifa_netmask)
+            continue;
+        struct in_addr a = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
+        struct in_addr m = ((struct sockaddr_in *)i->ifa_netmask)->sin_addr;
+        if (!m.s_addr || (a.s_addr & m.s_addr) != (target.s_addr & m.s_addr))
+            continue;
+        // wired and wireless can share the subnet; prefer wired for 22 Mbps
+        if (found && strncmp(ifname, "wl", 2) != 0)
+            continue;
+        inet_ntop(AF_INET, &a, ip, (socklen_t)iplen);
+        snprintf(ifname, iflen, "%s", i->ifa_name);
+        found = true;
+    }
+    freeifaddrs(ifs);
+    return found;
+}
+
+// Fallback: connect a UDP socket toward the Ultimate and read back the source
+// address the kernel picked.
 static bool detect_local_ip(const char *host, char *out, size_t outlen)
 {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -211,10 +255,10 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--host IP] [--dest IP[:PORT]] [--port N] [--scale N]\n"
-            "          [--no-start] [--dump FILE.ppm] [--verbose]\n"
-            "  --host    Ultimate address (default 192.168.8.173)\n"
-            "  --dest    where the Ultimate should send the stream (default: auto)\n"
-            "  --port    local UDP listen port (default 11000)\n"
+            "          [--no-start] [--no-audio] [--dump FILE.ppm] [--verbose]\n"
+            "  --host    Ultimate address (default 192.168.8.236)\n"
+            "  --dest    where the Ultimate should send the streams (default: auto)\n"
+            "  --port    local UDP video port; audio uses port+1 (default 11000)\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n",
             argv0);
@@ -234,6 +278,8 @@ int main(int argc, char **argv)
             cfg.scale = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-start"))
             cfg.no_start = true;
+        else if (!strcmp(argv[i], "--no-audio"))
+            cfg.no_audio = true;
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc)
             cfg.dump_path = argv[++i];
         else if (!strcmp(argv[i], "--verbose"))
@@ -243,6 +289,9 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+
+    if (cfg.dump_path)
+        cfg.no_audio = true; // headless frame grab needs no sound
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -258,31 +307,64 @@ int main(int argc, char **argv)
         perror("bind");
         return 1;
     }
+    int asock = -1;
+    if (!cfg.no_audio) {
+        asock = socket(AF_INET, SOCK_DGRAM, 0);
+        setsockopt(asock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+        struct sockaddr_in aaddr = bind_addr;
+        aaddr.sin_port = htons((Uint16)(cfg.listen_port + 1));
+        if (bind(asock, (struct sockaddr *)&aaddr, sizeof aaddr) < 0) {
+            perror("bind audio");
+            return 1;
+        }
+    }
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
     struct rest_ctx rc;
     SDL_Thread *ka = NULL;
     if (!cfg.no_start) {
-        char dest[64];
+        char ip[64], lan_ip[46], ifname[32] = "";
+        bool on_lan = find_lan_iface(cfg.host, lan_ip, sizeof lan_ip, ifname,
+                                     sizeof ifname);
         if (cfg.dest) {
-            snprintf(dest, sizeof dest, "%s", cfg.dest);
-        } else {
-            char ip[46];
-            if (!detect_local_ip(cfg.host, ip, sizeof ip)) {
-                fprintf(stderr, "cannot detect local IP; use --dest\n");
-                return 1;
+            snprintf(ip, sizeof ip, "%s", cfg.dest);
+            char *colon = strchr(ip, ':'); // legacy ip:port form
+            if (colon) {
+                cfg.listen_port = atoi(colon + 1);
+                *colon = '\0';
             }
-            snprintf(dest, sizeof dest, "%s:%d", ip, cfg.listen_port);
+        } else if (on_lan) {
+            snprintf(ip, sizeof ip, "%s", lan_ip);
+        } else if (!detect_local_ip(cfg.host, ip, sizeof ip)) {
+            fprintf(stderr, "cannot detect local IP; use --dest\n");
+            return 1;
         }
-        snprintf(rc.start_url, sizeof rc.start_url,
-                 "http://%s/v1/streams/video:start?ip=%s", cfg.host, dest);
-        snprintf(rc.stop_url, sizeof rc.stop_url,
+        if (on_lan)
+            snprintf(rc.prime_cmd, sizeof rc.prime_cmd,
+                     "ping -n -q -c 1 -W 1 -I '%s' '%s' >/dev/null 2>&1",
+                     ifname, cfg.host);
+        else
+            rc.prime_cmd[0] = '\0';
+        snprintf(rc.start_url[0], sizeof rc.start_url[0],
+                 "http://%s/v1/streams/video:start?ip=%s:%d", cfg.host, ip,
+                 cfg.listen_port);
+        snprintf(rc.stop_url[0], sizeof rc.stop_url[0],
                  "http://%s/v1/streams/video:stop", cfg.host);
+        rc.nstreams = 1;
+        if (asock >= 0) {
+            snprintf(rc.start_url[1], sizeof rc.start_url[1],
+                     "http://%s/v1/streams/audio:start?ip=%s:%d", cfg.host, ip,
+                     cfg.listen_port + 1);
+            snprintf(rc.stop_url[1], sizeof rc.stop_url[1],
+                     "http://%s/v1/streams/audio:stop", cfg.host);
+            rc.nstreams = 2;
+        }
         rc.sock = sock;
         rc.ult_addr = (struct sockaddr_in){.sin_family = AF_INET,
                                            .sin_port = htons(11000)};
         inet_pton(AF_INET, cfg.host, &rc.ult_addr.sin_addr);
-        SDL_Log("requesting video stream -> %s", dest);
+        SDL_Log("requesting %s -> %s:%d", asock >= 0 ? "video+audio" : "video",
+                ip, cfg.listen_port);
         ka = SDL_CreateThread(keepalive_thread, "keepalive", &rc);
     }
 
@@ -290,8 +372,9 @@ int main(int argc, char **argv)
     SDL_Window *win = NULL;
     SDL_Renderer *ren = NULL;
     SDL_Texture *tex = NULL;
+    SDL_AudioStream *astream = NULL;
     if (windowed) {
-        if (!SDL_Init(SDL_INIT_VIDEO)) {
+        if (!SDL_Init(SDL_INIT_VIDEO | (asock >= 0 ? SDL_INIT_AUDIO : 0))) {
             fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
             return 1;
         }
@@ -300,6 +383,17 @@ int main(int argc, char **argv)
                                          SDL_WINDOW_RESIZABLE, &win, &ren)) {
             fprintf(stderr, "SDL window: %s\n", SDL_GetError());
             return 1;
+        }
+        if (asock >= 0) {
+            // Ultimate PAL audio clock; SDL resamples to whatever the device
+            // wants. (NTSC is ~47940 — the 0.09% difference is inaudible.)
+            SDL_AudioSpec aspec = {SDL_AUDIO_S16LE, 2, 47983};
+            astream = SDL_OpenAudioDeviceStream(
+                SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &aspec, NULL, NULL);
+            if (astream)
+                SDL_ResumeAudioStreamDevice(astream);
+            else
+                SDL_Log("audio device unavailable: %s", SDL_GetError());
         }
     }
 
@@ -310,8 +404,18 @@ int main(int argc, char **argv)
     int tex_h = 0;
     Uint8 pkt[2048];
     Uint64 last_stat = SDL_GetTicks();
-    long frames = 0, packets = 0;
+    long frames = 0, packets = 0, apackets = 0, agaps = 0;
+    Uint16 aseq_prev = 0;
+    bool aseq_valid = false;
     bool got_any = false;
+    // Audio latency control: startup fill and jitter leave a standing queue
+    // that never drains on its own (input and output rates match). A servo on
+    // the resample ratio (±2%, inaudible) steers the queue toward ~60 ms;
+    // anything past 400 ms (pathological stall) is dropped outright.
+    const int abytes_per_sec = 47983 * 4;
+    const int aqueue_target = abytes_per_sec * 60 / 1000;
+    const int aqueue_max = abytes_per_sec * 400 / 1000;
+    Uint64 last_adj = 0;
 
     while (!atomic_load(&g_quit)) {
         if (windowed) {
@@ -322,8 +426,38 @@ int main(int argc, char **argv)
                     atomic_store(&g_quit, true);
         }
 
-        struct pollfd pfd = {.fd = sock, .events = POLLIN};
-        poll(&pfd, 1, 5);
+        struct pollfd pfd[2] = {{.fd = sock, .events = POLLIN},
+                                {.fd = asock, .events = POLLIN}};
+        poll(pfd, asock >= 0 ? 2 : 1, 5);
+
+        if (asock >= 0) {
+            ssize_t n;
+            while ((n = recv(asock, pkt, sizeof pkt, MSG_DONTWAIT)) > 0) {
+                if (n < 6)
+                    continue;
+                Uint16 aseq = (Uint16)(pkt[0] | pkt[1] << 8);
+                if (aseq_valid && (Uint16)(aseq - aseq_prev) != 1)
+                    agaps++;
+                aseq_prev = aseq;
+                aseq_valid = true;
+                apackets++;
+                if (astream)
+                    SDL_PutAudioStreamData(astream, pkt + 2, (int)n - 2);
+            }
+            if (astream) {
+                int q = SDL_GetAudioStreamQueued(astream);
+                if (q > aqueue_max) {
+                    SDL_ClearAudioStream(astream);
+                } else if (SDL_GetTicks() - last_adj >= 1000) {
+                    float err_s = (float)(q - aqueue_target) / abytes_per_sec;
+                    float ratio = 1.0f + err_s * 0.5f;
+                    ratio = ratio < 0.98f ? 0.98f : ratio > 1.02f ? 1.02f : ratio;
+                    SDL_SetAudioStreamFrequencyRatio(astream, ratio);
+                    last_adj = SDL_GetTicks();
+                }
+            }
+        }
+
         bool frame_done = false;
         while (!frame_done) { // drain socket, stop at a completed frame
             ssize_t n = recv(sock, pkt, sizeof pkt, MSG_DONTWAIT);
@@ -370,9 +504,13 @@ int main(int argc, char **argv)
         }
 
         if (cfg.verbose && SDL_GetTicks() - last_stat >= 5000) {
-            SDL_Log("%.1f fps, %ld pkts in last %llus", frames / 5.0, packets,
-                    (unsigned long long)(SDL_GetTicks() - last_stat) / 1000);
-            frames = packets = 0;
+            int qms = astream
+                          ? (int)(SDL_GetAudioStreamQueued(astream) * 1000LL /
+                                  (47983 * 4))
+                          : 0;
+            SDL_Log("%.1f fps, %ld vpkts, %ld apkts (%ld gaps, %d ms queued)",
+                    frames / 5.0, packets, apackets, agaps, qms);
+            frames = packets = apackets = 0;
             last_stat = SDL_GetTicks();
         }
     }
@@ -381,6 +519,10 @@ int main(int argc, char **argv)
     if (ka)
         SDL_WaitThread(ka, NULL);
     curl_global_cleanup();
+    if (astream)
+        SDL_DestroyAudioStream(astream);
+    if (asock >= 0)
+        close(asock);
     if (tex)
         SDL_DestroyTexture(tex);
     if (ren)

@@ -8,12 +8,14 @@ sweeping downward one line per frame. Usage:
 then:
     ./c64uv --no-start [--dump frame.ppm]
 """
+import math
 import socket
 import struct
 import sys
 import time
 
 W, H, LPP = 384, 272, 4
+ARATE, ACHUNK = 47983, 192  # audio: sample rate, stereo frames per packet
 DEST = (sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1",
         int(sys.argv[2]) if len(sys.argv) > 2 else 11000)
 SECONDS = float(sys.argv[3]) if len(sys.argv) > 3 else 10.0
@@ -36,9 +38,19 @@ def build_frame(sweep_y: int) -> list[bytes]:
     return lines
 
 
+def audio_packet(aseq: int, pos: int) -> bytes:
+    """192 stereo frames of a 440 Hz sine, packed like the Ultimate does."""
+    samples = bytearray()
+    for i in range(ACHUNK):
+        v = int(12000 * math.sin(2 * math.pi * 440 * (pos + i) / ARATE))
+        samples += struct.pack("<hh", v, v)
+    return struct.pack("<H", aseq & 0xFFFF) + samples
+
+
 def main() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    seq = frame = 0
+    adest = (DEST[0], DEST[1] + 1)
+    seq = frame = aseq = apos = 0
     t0 = time.monotonic()
     sent = 0
     while time.monotonic() - t0 < SECONDS:
@@ -49,6 +61,11 @@ def main() -> None:
                               line_field, W, LPP, 4, 0)
             sock.sendto(hdr + b"".join(lines[start:start + LPP]), DEST)
             seq += 1
+        # one video frame = 20 ms = ~960 audio frames = 5 packets
+        while apos < (frame + 1) * ARATE // 50:
+            sock.sendto(audio_packet(aseq, apos), adest)
+            aseq += 1
+            apos += ACHUNK
         frame += 1
         sent += 1
         # pace to 50 fps
