@@ -6,6 +6,8 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
+#define C64UV_VERSION "0.1.1"
+
 #include "keys.h"
 #include "term.h"
 #include "video.h"
@@ -292,7 +294,7 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
             "          [--no-start] [--no-audio] [--no-keyb] [--dump FILE.ppm]\n"
-            "          [--term-test] [--verbose]\n"
+            "          [--term-test] [--verbose] [--version]\n"
             "  --host    C64 Ultimate address (or set C64U_HOST)\n"
             "  --dest    where the Ultimate should send the streams (default: auto)\n"
             "  --port    local UDP video port; audio uses port+1 (default 11000)\n"
@@ -328,7 +330,10 @@ int main(int argc, char **argv)
             cfg.term_test = true;
         else if (!strcmp(argv[i], "--verbose"))
             cfg.verbose = true;
-        else {
+        else if (!strcmp(argv[i], "--version")) {
+            puts("c64uv " C64UV_VERSION);
+            return 0;
+        } else {
             usage(argv[0]);
             return 2;
         }
@@ -338,6 +343,16 @@ int main(int argc, char **argv)
                 "no Ultimate address: pass --host <ip> or set C64U_HOST\n"
                 "(find it on the machine: F5 menu on the Ultimate shows its "
                 "IP, or check your router)\n");
+        // Launched from a desktop entry there is no terminal to read stderr.
+        if (!isatty(STDERR_FILENO) &&
+            (getenv("DISPLAY") || getenv("WAYLAND_DISPLAY")))
+            SDL_ShowSimpleMessageBox(
+                SDL_MESSAGEBOX_ERROR, "Commodore 64 Ultimate Viewer",
+                "No Ultimate address configured.\n\n"
+                "Run from a terminal:  c64uv --host <ip>\n"
+                "or set C64U_HOST in your environment.\n"
+                "(F5 menu on the Ultimate shows its IP.)",
+                NULL);
         return 2;
     }
     if (!cfg.host)
@@ -430,6 +445,10 @@ int main(int argc, char **argv)
     SDL_Texture *tex = NULL;
     SDL_AudioStream *astream = NULL;
     if (windowed) {
+        // Identifier becomes the Wayland app_id / X11 WM_CLASS; it must match
+        // the c64uv.desktop basename so desktops pair the window with its icon.
+        SDL_SetAppMetadata("Commodore 64 Ultimate Viewer", C64UV_VERSION,
+                           "c64uv");
         if (!SDL_Init(SDL_INIT_VIDEO | (asock >= 0 ? SDL_INIT_AUDIO : 0))) {
             fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
             return 1;

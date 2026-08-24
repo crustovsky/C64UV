@@ -17,6 +17,14 @@ src/keys.c   PC key -> PETSCII mapping
 src/font8x8.h  public-domain 8x8 bitmap font (rendering for term.c)
 ```
 
+Packaging: `make install` (DESTDIR/PREFIX) installs the binary plus
+`assets/c64uv.desktop` and `assets/c64uv.svg` (icon; regenerate with
+`tools/genicon.py`, which rasterises font8x8.h - never hand-edit the SVG).
+`packaging/aur/PKGBUILD` builds from the GitHub tag tarball, so it can only
+reference tags that already contain the packaging files; bump `pkgver` and
+`sha256sums` on release. `SDL_SetAppMetadata` identifier and the desktop
+file basename must both stay `c64uv` or desktops lose the window icon.
+
 ```
 UDP :11000 -> frame assembler -> VIC palette LUT -> SDL streaming texture
 UDP :11001 -> SDL_AudioStream (resample + latency servo -> 60 ms target)

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Commodore 64 Ultimate Viewer
+GenericName=C64 Ultimate Stream Viewer
+Comment=View and control a C64 Ultimate or Ultimate 64 over the network
+Exec=c64uv
+Icon=c64uv
+Terminal=false
+Categories=System;Emulator;
+Keywords=commodore;c64;c64u;ultimate64;retro;
