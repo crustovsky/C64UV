@@ -24,6 +24,7 @@ test: tests/run
 	./tests/run
 
 PREFIX ?= /usr
+ICON_SIZES = 16 32 48 64 128 256
 
 install: c64uv
 	install -Dm755 c64uv $(DESTDIR)$(PREFIX)/bin/c64uv
@@ -31,6 +32,11 @@ install: c64uv
 		$(DESTDIR)$(PREFIX)/share/applications/c64uv.desktop
 	install -Dm644 assets/c64uv.svg \
 		$(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/c64uv.svg
+	for s in $(ICON_SIZES); do \
+		install -Dm644 assets/c64uv-$$s.png \
+			$(DESTDIR)$(PREFIX)/share/icons/hicolor/$${s}x$${s}/apps/c64uv.png \
+			|| exit 1; \
+	done
 
 clean:
 	rm -f c64uv tests/run

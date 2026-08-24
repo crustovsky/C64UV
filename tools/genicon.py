@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Generate assets/c64uv.svg, the app icon.
+"""Generate the app icon: assets/c64uv.svg plus PNG renditions.
 
 A miniature C64 boot screen: light blue border, blue screen, a big "64"
 over a READY. prompt with a block cursor. Text is rasterised from the
 same src/font8x8.h the viewer renders the menu with (LSB = leftmost
 pixel), so the icon is reproducible from the sources alone:
 
-    python3 tools/genicon.py > assets/c64uv.svg
+    python3 tools/genicon.py
+
+writes assets/c64uv.svg and assets/c64uv-<size>.png (via rsvg-convert;
+the PNGs exist because some launchers only pick up bitmap icon themes).
 """
 import pathlib
 import re
+import subprocess
+
+PNG_SIZES = [16, 32, 48, 64, 128, 256]
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 LIGHT = "#706DEB"  # VIC colour 14, light blue (Pepto palette, video.c)
@@ -49,7 +55,8 @@ def text_rects(font, s, x0, y0, scale):
 def main():
     font = load_font()
     parts = [
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">',
+        '<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" '
+        'viewBox="0 0 128 128">',
         f'<rect width="128" height="128" rx="12" fill="{LIGHT}"/>',
         f'<rect x="12" y="12" width="104" height="104" fill="{DARK}"/>',
     ]
@@ -57,7 +64,18 @@ def main():
     parts += text_rects(font, "READY.", x0=16, y0=74, scale=2)  # boot prompt
     parts.append(f'<rect x="16" y="92" width="16" height="16" fill="{LIGHT}"/>')  # cursor
     parts.append("</svg>")
-    print("\n".join(parts))
+
+    assets = ROOT / "assets"
+    svg = assets / "c64uv.svg"
+    svg.write_text("\n".join(parts) + "\n")
+    print(f"wrote {svg}")
+    for size in PNG_SIZES:
+        png = assets / f"c64uv-{size}.png"
+        subprocess.run(
+            ["rsvg-convert", "-w", str(size), "-h", str(size), str(svg), "-o", str(png)],
+            check=True,
+        )
+        print(f"wrote {png}")
 
 
 if __name__ == "__main__":
