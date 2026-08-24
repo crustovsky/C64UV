@@ -23,7 +23,16 @@ tests/run: tests/tests.c src/video.c src/term.c src/keys.c $(HDR)
 test: tests/run
 	./tests/run
 
+PREFIX ?= /usr
+
+install: c64uv
+	install -Dm755 c64uv $(DESTDIR)$(PREFIX)/bin/c64uv
+	install -Dm644 assets/c64uv.desktop \
+		$(DESTDIR)$(PREFIX)/share/applications/c64uv.desktop
+	install -Dm644 assets/c64uv.svg \
+		$(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/c64uv.svg
+
 clean:
 	rm -f c64uv tests/run
 
-.PHONY: test clean
+.PHONY: install test clean

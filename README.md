@@ -1,5 +1,7 @@
 # Commodore 64 Ultimate Viewer
 
+<img src="assets/c64uv.svg" align="right" width="96" alt="c64uv icon">
+
 Use your [Commodore 64 Ultimate](https://www.commodore.net/) (or Ultimate 64)
 from a Linux desktop over the network: live video and audio streamed into an
 SDL window, your keystrokes typed straight into BASIC, and the Ultimate's menu
@@ -78,6 +80,15 @@ Useful flags: `--no-audio`, `--no-keyb`, `--scale N` (window size),
 headless), `--term-test` (print the menu screen as text and exit),
 `--no-start` (listen only; pair with `tools/mockstream.py` to develop with no
 hardware).
+
+### Installing
+
+`make install` (respects `DESTDIR` and `PREFIX`, default `/usr`) installs the
+binary, a desktop entry, and the icon. Arch users can build a package from
+`packaging/aur/PKGBUILD`; prebuilt static binaries are on the
+[releases page](https://github.com/crustovsky/C64UV/releases). Set `C64U_HOST`
+in your environment if you launch it from the desktop menu rather than a
+terminal.
 
 ## Limitations
 
