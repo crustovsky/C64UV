@@ -6,7 +6,7 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.1.1"
+#define C64UV_VERSION "0.1.2"
 
 #include "keys.h"
 #include "term.h"
