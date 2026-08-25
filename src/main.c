@@ -8,7 +8,7 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.2.2"
+#define C64UV_VERSION "0.2.3"
 
 #include "discover.h"
 #include "keys.h"
@@ -775,14 +775,14 @@ static void help_text(struct term *t, int row, int col, uint8_t color,
 static void help_fill(struct term *t)
 {
     term_init(t);
-    help_text(t, 1, 22, 1, "c64uv " C64UV_VERSION " keys");
-    int row = 3;
-    for (int i = 0; i < viewer_bindings_count && row < TERM_ROWS - 2; i++) {
+    help_text(t, 2, 22, 1, "c64uv " C64UV_VERSION " keys");
+    int row = 4;
+    for (int i = 0; i < viewer_bindings_count && row < TERM_ROWS - 3; i++) {
         help_text(t, row, 3, 7, viewer_bindings[i].label);
         help_text(t, row, 25, 15, viewer_bindings[i].desc);
-        row++;
+        row += 1 + viewer_bindings[i].gap; // table gaps group the rows
     }
-    help_text(t, TERM_ROWS - 2, 3, 12, "F10 or Esc closes this help");
+    help_text(t, TERM_ROWS - 3, 3, 12, "F10 or Esc closes this help");
     t->cx = -1; // keep term_render's cursor cell off the grid
     t->dirty = true;
 }
@@ -837,8 +837,8 @@ static void usage(const char *argv0)
             argv0);
     fprintf(stderr, "keys in the viewer window (F10 shows this in-window):\n");
     for (int i = 0; i < viewer_bindings_count; i++)
-        fprintf(stderr, "  %-22s%s\n", viewer_bindings[i].label,
-                viewer_bindings[i].desc);
+        fprintf(stderr, "  %-22s%s\n%s", viewer_bindings[i].label,
+                viewer_bindings[i].desc, viewer_bindings[i].gap ? "\n" : "");
 }
 
 int main(int argc, char **argv)
