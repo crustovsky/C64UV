@@ -762,9 +762,11 @@ int main(int argc, char **argv)
         struct discovered found[DISCOVER_MAX];
         int n = discover_scan(found, DISCOVER_MAX, true);
         for (int i = 0; i < n; i++)
-            printf("%-15s  %s%s%s  firmware %s\n", found[i].ip,
+            printf("%-15s  %s%s%s  firmware %s%s\n", found[i].ip,
                    found[i].product, found[i].hostname[0] ? "  " : "",
-                   found[i].hostname, found[i].fw);
+                   found[i].hostname, found[i].fw,
+                   discover_ip_is_wired(found[i].ip, "/proc/net/arp")
+                       ? "  (wired)" : "");
         if (n == 0)
             fprintf(stderr, "no Ultimate found\n");
         return n > 0 ? 0 : 1;
@@ -794,11 +796,22 @@ int main(int argc, char **argv)
                     fprintf(stderr, "  %-15s  %s\n", found[i].ip,
                             found[i].hostname);
             }
-            snprintf(auto_host, sizeof auto_host, "%s", found[0].ip);
+            // Same machine on WiFi + wired: the wired (FPGA) address must
+            // win - only pings to it land in the ARP table the streams
+            // check, so the WiFi address can't start a stream cold.
+            int pick = 0;
+            for (int i = 0; i < n; i++)
+                if ((!found[i].uid[0] ||
+                     !strcmp(found[i].uid, found[0].uid)) &&
+                    discover_ip_is_wired(found[i].ip, "/proc/net/arp")) {
+                    pick = i;
+                    break;
+                }
+            snprintf(auto_host, sizeof auto_host, "%.45s", found[pick].ip);
             cfg.host = auto_host;
-            fprintf(stderr, "using %s (%s%s%s)\n", found[0].ip,
-                    found[0].product, found[0].hostname[0] ? ", " : "",
-                    found[0].hostname);
+            fprintf(stderr, "using %s (%s%s%s)\n", found[pick].ip,
+                    found[pick].product, found[pick].hostname[0] ? ", " : "",
+                    found[pick].hostname);
         }
     }
     if (!cfg.host && !cfg.no_start) {

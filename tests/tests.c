@@ -230,6 +230,24 @@ static void test_json(void)
           !strcmp(v, "x\"y"));
 }
 
+static void test_arp_wired(void)
+{
+    const char *path = "/tmp/c64uv-test-arp";
+    FILE *f = fopen(path, "w");
+    fputs("IP address       HW type     Flags       HW address            "
+          "Mask     Device\n"
+          "192.168.8.173    0x1         0x2         9c:13:9e:ef:14:d0     "
+          "*        eth0\n"
+          "192.168.8.236    0x1         0x2         02:15:41:79:9d:c6     "
+          "*        eth0\n", f);
+    fclose(f);
+    CHECK(discover_ip_is_wired("192.168.8.236", path));
+    CHECK(!discover_ip_is_wired("192.168.8.173", path)); // ESP32 WiFi side
+    CHECK(!discover_ip_is_wired("192.168.8.99", path));  // not in the table
+    CHECK(!discover_ip_is_wired("192.168.8.236", "/nonexistent"));
+    remove(path);
+}
+
 int main(void)
 {
     test_term_basics();
@@ -240,6 +258,7 @@ int main(void)
     test_matrix_keys();
     test_bindings();
     test_json();
+    test_arp_wired();
     if (failures) {
         fprintf(stderr, "%d check(s) FAILED\n", failures);
         return 1;

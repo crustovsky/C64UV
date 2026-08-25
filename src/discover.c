@@ -59,6 +59,23 @@ static bool is_ultimate_info(long code, const char *resp, struct discovered *d)
     return true;
 }
 
+bool discover_ip_is_wired(const char *ip, const char *arp_path)
+{
+    FILE *f = fopen(arp_path, "r");
+    if (!f)
+        return false;
+    char line[256];
+    bool wired = false;
+    while (!wired && fgets(line, sizeof line, f)) {
+        char a[46], hw[64];
+        // /proc/net/arp: IP  HWtype  Flags  HWaddress  Mask  Device
+        if (sscanf(line, "%45s %*s %*s %63s", a, hw) == 2 && !strcmp(a, ip))
+            wired = strncmp(hw, "02:15:41", 8) == 0;
+    }
+    fclose(f);
+    return wired;
+}
+
 struct probe {
     char url[64];
     char ip[46];
