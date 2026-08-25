@@ -8,7 +8,7 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.2.0"
+#define C64UV_VERSION "0.2.1"
 
 #include "discover.h"
 #include "keys.h"
@@ -280,6 +280,135 @@ static bool detect_local_ip(const char *host, char *out, size_t outlen)
     }
     close(s);
     return ok;
+}
+
+// Everything that needs the Ultimate's address: destination detection, ARP
+// prime command, REST URLs, and the keepalive thread. Callable at startup
+// (host given) or later, when background discovery finds the machine.
+static SDL_Thread *net_start(struct config *cfg, struct rest_ctx *rc,
+                             int sock, int asock, const char *mc_video,
+                             const char *mc_audio)
+{
+    char lan_ip[46], ifname[32] = "";
+    bool on_lan = find_lan_iface(cfg->host, lan_ip, sizeof lan_ip, ifname,
+                                 sizeof ifname);
+    if (on_lan && mc_video[0]) {
+        // Background discovery bound the sockets before the host was known,
+        // so the joins may sit on a routing-table-picked interface; join
+        // again on the right one (a duplicate join just returns EADDRINUSE).
+        (void)mcast_join(sock, mc_video, lan_ip);
+        if (asock >= 0 && mc_audio[0])
+            (void)mcast_join(asock, mc_audio, lan_ip);
+    }
+    char dstv[64], dsta[64];
+    if (mc_video[0]) {
+        snprintf(dstv, sizeof dstv, "%s", mc_video);
+        snprintf(dsta, sizeof dsta, "%s", mc_audio);
+    } else if (cfg->dest) {
+        snprintf(dstv, sizeof dstv, "%s", cfg->dest);
+        char *colon = strchr(dstv, ':'); // legacy ip:port form
+        if (colon) {
+            cfg->listen_port = atoi(colon + 1);
+            *colon = '\0';
+        }
+        snprintf(dsta, sizeof dsta, "%s", dstv);
+    } else if (on_lan) {
+        snprintf(dstv, sizeof dstv, "%s", lan_ip);
+        snprintf(dsta, sizeof dsta, "%s", lan_ip);
+    } else if (detect_local_ip(cfg->host, dstv, sizeof dstv)) {
+        snprintf(dsta, sizeof dsta, "%s", dstv);
+    } else {
+        SDL_Log("cannot detect local IP; use --dest");
+        return NULL;
+    }
+    if (on_lan)
+        snprintf(rc->prime_cmd, sizeof rc->prime_cmd,
+                 "ping -n -q -c 1 -W 1 -I '%s' '%s' >/dev/null 2>&1",
+                 ifname, cfg->host);
+    else
+        rc->prime_cmd[0] = '\0';
+    snprintf(rc->start_url[0], sizeof rc->start_url[0],
+             "http://%s/v1/streams/video:start?ip=%s:%d", cfg->host, dstv,
+             cfg->listen_port);
+    snprintf(rc->stop_url[0], sizeof rc->stop_url[0],
+             "http://%s/v1/streams/video:stop", cfg->host);
+    snprintf(rc->input_url, sizeof rc->input_url,
+             "http://%s/v1/machine:input", cfg->host);
+    rc->nstreams = 1;
+    if (asock >= 0) {
+        snprintf(rc->start_url[1], sizeof rc->start_url[1],
+                 "http://%s/v1/streams/audio:start?ip=%s:%d", cfg->host,
+                 dsta, cfg->listen_port + 1);
+        snprintf(rc->stop_url[1], sizeof rc->stop_url[1],
+                 "http://%s/v1/streams/audio:stop", cfg->host);
+        rc->nstreams = 2;
+    }
+    rc->sock = sock;
+    rc->ult_addr = (struct sockaddr_in){.sin_family = AF_INET,
+                                        .sin_port = htons(11000)};
+    inet_pton(AF_INET, cfg->host, &rc->ult_addr.sin_addr);
+    SDL_Log("requesting %s -> %s:%d", asock >= 0 ? "video+audio" : "video",
+            dstv, cfg->listen_port);
+    return SDL_CreateThread(keepalive_thread, "keepalive", rc);
+}
+
+// Picks which discovery result to use (wired FPGA interface preferred among
+// entries of the same machine) and logs the outcome. False when none found.
+static bool discovery_choose(struct discovered *found, int n, char *out,
+                             size_t outlen)
+{
+    if (n < 1)
+        return false;
+    // one machine can answer on both WiFi and wired; only warn when
+    // genuinely different machines were found
+    int distinct = 0;
+    for (int i = 0; i < n; i++) {
+        bool dup = false;
+        for (int j = 0; j < i; j++)
+            dup |= found[i].uid[0] && !strcmp(found[i].uid, found[j].uid);
+        distinct += !dup;
+    }
+    if (distinct > 1) {
+        fprintf(stderr, "found %d Ultimates, using the first; pass --host "
+                "to pick another:\n", distinct);
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, "  %-15s  %s\n", found[i].ip, found[i].hostname);
+    }
+    // Same machine on WiFi + wired: the wired (FPGA) address must win -
+    // only pings to it land in the ARP table the streams check, so the
+    // WiFi address can't start a stream cold.
+    int pick = 0;
+    for (int i = 0; i < n; i++)
+        if ((!found[i].uid[0] || !strcmp(found[i].uid, found[0].uid)) &&
+            discover_ip_is_wired(found[i].ip, "/proc/net/arp")) {
+            pick = i;
+            break;
+        }
+    // test hook: when the sweep ran against an alternate port, the REST
+    // calls must follow it there too
+    const char *tport = getenv("C64U_DISCOVER_PORT");
+    if (tport)
+        snprintf(out, outlen, "%.39s:%.5s", found[pick].ip, tport);
+    else
+        snprintf(out, outlen, "%.45s", found[pick].ip);
+    fprintf(stderr, "using %s (%s%s%s)\n", found[pick].ip,
+            found[pick].product, found[pick].hostname[0] ? ", " : "",
+            found[pick].hostname);
+    return true;
+}
+
+// Background discovery for the windowed no-host start: the window opens
+// immediately and shows progress while the sweep runs here.
+struct disc_async {
+    struct discovered found[DISCOVER_MAX];
+    atomic_int n; // -1 while a sweep runs, result count when done
+};
+
+static int discover_thread(void *arg)
+{
+    struct disc_async *d = arg;
+    atomic_store(&d->n, discover_scan(d->found, DISCOVER_MAX, false));
+    return 0;
 }
 
 // ------------------------------------------------------- keyboard passthrough
@@ -646,7 +775,7 @@ static void help_text(struct term *t, int row, int col, uint8_t color,
 static void help_fill(struct term *t)
 {
     term_init(t);
-    help_text(t, 1, 25, 1, "c64uv keys");
+    help_text(t, 1, 22, 1, "c64uv " C64UV_VERSION " keys");
     int row = 3;
     for (int i = 0; i < viewer_bindings_count && row < TERM_ROWS - 2; i++) {
         help_text(t, row, 3, 7, viewer_bindings[i].label);
@@ -655,6 +784,28 @@ static void help_fill(struct term *t)
     }
     help_text(t, TERM_ROWS - 2, 3, 12, "F10 or Esc closes this help");
     t->cx = -1; // keep term_render's cursor cell off the grid
+    t->dirty = true;
+}
+
+// The status screen shown while there is no video yet (discovery running,
+// stream not started) reuses the same grid renderer.
+
+static void status_center(struct term *t, int row, uint8_t color,
+                          const char *s)
+{
+    int col = (TERM_COLS - (int)strlen(s)) / 2;
+    help_text(t, row, col < 0 ? 0 : col, color, s);
+}
+
+static void status_set(struct term *t, const char *l1, const char *l2)
+{
+    term_init(t);
+    status_center(t, 9, 1, "c64uv " C64UV_VERSION);
+    if (l1)
+        status_center(t, 12, 15, l1);
+    if (l2)
+        status_center(t, 14, 12, l2);
+    t->cx = -1;
     t->dirty = true;
 }
 
@@ -772,69 +923,30 @@ int main(int argc, char **argv)
         return n > 0 ? 0 : 1;
     }
 
-    // No address given: try to find the machine ourselves before giving up.
+    // No address given: headless modes discover synchronously (they need
+    // the answer before doing their one thing); the windowed viewer opens
+    // immediately and discovers in the background instead.
     static char auto_host[46];
-    if (!cfg.host && !cfg.no_start) {
+    bool headless = cfg.dump_path || cfg.term_test || cfg.do_action ||
+                    cfg.run_path;
+    if (!cfg.host && !cfg.no_start && headless) {
         struct discovered found[DISCOVER_MAX];
         fprintf(stderr, "no --host given, discovering...\n");
         int n = discover_scan(found, DISCOVER_MAX, true);
-        if (n >= 1) {
-            // one machine can answer on both WiFi and wired; only warn when
-            // genuinely different machines were found
-            int distinct = 0;
-            for (int i = 0; i < n; i++) {
-                bool dup = false;
-                for (int j = 0; j < i; j++)
-                    dup |= found[i].uid[0] && !strcmp(found[i].uid,
-                                                      found[j].uid);
-                distinct += !dup;
-            }
-            if (distinct > 1) {
-                fprintf(stderr, "found %d Ultimates, using the first; pass "
-                        "--host to pick another:\n", distinct);
-                for (int i = 0; i < n; i++)
-                    fprintf(stderr, "  %-15s  %s\n", found[i].ip,
-                            found[i].hostname);
-            }
-            // Same machine on WiFi + wired: the wired (FPGA) address must
-            // win - only pings to it land in the ARP table the streams
-            // check, so the WiFi address can't start a stream cold.
-            int pick = 0;
-            for (int i = 0; i < n; i++)
-                if ((!found[i].uid[0] ||
-                     !strcmp(found[i].uid, found[0].uid)) &&
-                    discover_ip_is_wired(found[i].ip, "/proc/net/arp")) {
-                    pick = i;
-                    break;
-                }
-            snprintf(auto_host, sizeof auto_host, "%.45s", found[pick].ip);
+        if (discovery_choose(found, n, auto_host, sizeof auto_host)) {
             cfg.host = auto_host;
-            fprintf(stderr, "using %s (%s%s%s)\n", found[pick].ip,
-                    found[pick].product, found[pick].hostname[0] ? ", " : "",
-                    found[pick].hostname);
+        } else {
+            fprintf(stderr,
+                    "no Ultimate found on your network: pass --host <ip> or "
+                    "set C64U_HOST\n"
+                    "(find it on the machine: F5 menu on the Ultimate shows "
+                    "its IP, or check your router)\n");
+            return 2;
         }
     }
-    if (!cfg.host && !cfg.no_start) {
-        fprintf(stderr,
-                "no Ultimate found on your network: pass --host <ip> or set "
-                "C64U_HOST\n"
-                "(find it on the machine: F5 menu on the Ultimate shows its "
-                "IP, or check your router)\n");
-        // Launched from a desktop entry there is no terminal to read stderr.
-        if (!isatty(STDERR_FILENO) &&
-            (getenv("DISPLAY") || getenv("WAYLAND_DISPLAY")))
-            SDL_ShowSimpleMessageBox(
-                SDL_MESSAGEBOX_ERROR, "Commodore 64 Ultimate Viewer",
-                "No Ultimate found on your network.\n\n"
-                "Check that the machine is powered on, or run from a\n"
-                "terminal:  c64uv --host <ip>\n"
-                "or set C64U_HOST in your environment.\n"
-                "(F5 menu on the Ultimate shows its IP.)",
-                NULL);
-        return 2;
-    }
-    if (!cfg.host)
-        cfg.host = ""; // --no-start mock mode needs no device
+    bool discovering = !cfg.host && !cfg.no_start;
+    if (!cfg.host && cfg.no_start)
+        cfg.host = ""; // mock mode needs no device
 
     if (cfg.do_action)
         return machine_ctl(cfg.host, cfg.do_action) ? 0 : 1;
@@ -866,10 +978,12 @@ int main(int argc, char **argv)
     }
     // The join must land on the interface the stream arrives on; when the
     // Ultimate's subnet is ours, use that interface rather than the routing
-    // table's guess (policy routing can point elsewhere).
+    // table's guess (policy routing can point elsewhere). With the host
+    // still unknown (background discovery) net_start re-joins later.
     char lan_ip[46], ifname[32] = "";
-    bool on_lan = find_lan_iface(cfg.host, lan_ip, sizeof lan_ip, ifname,
-                                 sizeof ifname);
+    bool on_lan = cfg.host && find_lan_iface(cfg.host, lan_ip, sizeof lan_ip,
+                                             ifname, sizeof ifname);
+    (void)ifname;
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -911,59 +1025,12 @@ int main(int argc, char **argv)
         }
     }
 
-    struct rest_ctx rc;
+    static struct rest_ctx rc;
     SDL_Thread *ka = NULL;
-    if (!cfg.no_start) {
-        char dstv[64], dsta[64];
-        if (mc_video[0]) {
-            snprintf(dstv, sizeof dstv, "%s", mc_video);
-            snprintf(dsta, sizeof dsta, "%s", mc_audio);
-        } else if (cfg.dest) {
-            snprintf(dstv, sizeof dstv, "%s", cfg.dest);
-            char *colon = strchr(dstv, ':'); // legacy ip:port form
-            if (colon) {
-                cfg.listen_port = atoi(colon + 1);
-                *colon = '\0';
-            }
-            snprintf(dsta, sizeof dsta, "%s", dstv);
-        } else if (on_lan) {
-            snprintf(dstv, sizeof dstv, "%s", lan_ip);
-            snprintf(dsta, sizeof dsta, "%s", lan_ip);
-        } else if (detect_local_ip(cfg.host, dstv, sizeof dstv)) {
-            snprintf(dsta, sizeof dsta, "%s", dstv);
-        } else {
-            fprintf(stderr, "cannot detect local IP; use --dest\n");
+    if (!cfg.no_start && cfg.host) {
+        ka = net_start(&cfg, &rc, sock, asock, mc_video, mc_audio);
+        if (!ka)
             return 1;
-        }
-        if (on_lan)
-            snprintf(rc.prime_cmd, sizeof rc.prime_cmd,
-                     "ping -n -q -c 1 -W 1 -I '%s' '%s' >/dev/null 2>&1",
-                     ifname, cfg.host);
-        else
-            rc.prime_cmd[0] = '\0';
-        snprintf(rc.start_url[0], sizeof rc.start_url[0],
-                 "http://%s/v1/streams/video:start?ip=%s:%d", cfg.host, dstv,
-                 cfg.listen_port);
-        snprintf(rc.stop_url[0], sizeof rc.stop_url[0],
-                 "http://%s/v1/streams/video:stop", cfg.host);
-        snprintf(rc.input_url, sizeof rc.input_url,
-                 "http://%s/v1/machine:input", cfg.host);
-        rc.nstreams = 1;
-        if (asock >= 0) {
-            snprintf(rc.start_url[1], sizeof rc.start_url[1],
-                     "http://%s/v1/streams/audio:start?ip=%s:%d", cfg.host,
-                     dsta, cfg.listen_port + 1);
-            snprintf(rc.stop_url[1], sizeof rc.stop_url[1],
-                     "http://%s/v1/streams/audio:stop", cfg.host);
-            rc.nstreams = 2;
-        }
-        rc.sock = sock;
-        rc.ult_addr = (struct sockaddr_in){.sin_family = AF_INET,
-                                           .sin_port = htons(11000)};
-        inet_pton(AF_INET, cfg.host, &rc.ult_addr.sin_addr);
-        SDL_Log("requesting %s -> %s:%d", asock >= 0 ? "video+audio" : "video",
-                dstv, cfg.listen_port);
-        ka = SDL_CreateThread(keepalive_thread, "keepalive", &rc);
     }
 
     bool windowed = cfg.dump_path == NULL;
@@ -980,7 +1047,9 @@ int main(int argc, char **argv)
             fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
             return 1;
         }
-        if (!SDL_CreateWindowAndRenderer("c64uv - waiting for stream…",
+        if (!SDL_CreateWindowAndRenderer(discovering
+                                             ? "c64uv - looking for your Ultimate…"
+                                             : "c64uv - waiting for stream…",
                                          VIDEO_MAX_W * cfg.scale, 272 * cfg.scale,
                                          SDL_WINDOW_RESIZABLE, &win, &ren)) {
             fprintf(stderr, "SDL window: %s\n", SDL_GetError());
@@ -1001,9 +1070,11 @@ int main(int argc, char **argv)
 
     struct keyb kb = {.fd = -1, .host = cfg.host};
     struct minput mi = {0};
-    if (windowed && !cfg.no_keyb && !cfg.no_start) {
-        kb.enabled = true;
+    bool want_keyb = windowed && !cfg.no_keyb && !cfg.no_start;
+    if (want_keyb)
         SDL_StartTextInput(win);
+    if (want_keyb && cfg.host) {
+        kb.enabled = true;
         keyb_try_connect(&kb);
         snprintf(mi.url, sizeof mi.url, "http://%s/v1/machine:input",
                  cfg.host);
@@ -1017,6 +1088,33 @@ int main(int argc, char **argv)
     term_init(help_scr);
     bool help_active = false;
     bool term_active = false, term_present = false;
+
+    // Status screen: shown until the first video frame arrives.
+    struct term *status = calloc(1, sizeof *status);
+    {
+        char msg[TERM_COLS + 1];
+        if (discovering)
+            status_set(status, "looking for your Ultimate...",
+                       "scanning the local subnets");
+        else if (cfg.no_start) {
+            snprintf(msg, sizeof msg, "listening for a stream on UDP :%d",
+                     cfg.listen_port);
+            status_set(status, msg, NULL);
+        } else {
+            snprintf(msg, sizeof msg, "waiting for the stream from %s",
+                     cfg.host);
+            status_set(status, msg, NULL);
+        }
+    }
+
+    // Background discovery (windowed start with no host).
+    static struct disc_async da;
+    SDL_Thread *dthr = NULL;
+    Uint64 next_scan = 0;
+    if (discovering) {
+        atomic_store(&da.n, -1);
+        dthr = SDL_CreateThread(discover_thread, "discover", &da);
+    }
     int tfd = -1;
     Uint64 tfd_last_try = 0;
     SDL_Texture *term_tex = NULL;
@@ -1042,6 +1140,44 @@ int main(int argc, char **argv)
     Uint64 last_adj = 0;
 
     while (!atomic_load(&g_quit)) {
+        if (discovering) {
+            int dn = atomic_load(&da.n);
+            if (dthr && dn >= 0) { // sweep finished
+                SDL_WaitThread(dthr, NULL);
+                dthr = NULL;
+                if (discovery_choose(da.found, dn, auto_host,
+                                     sizeof auto_host)) {
+                    cfg.host = auto_host;
+                    discovering = false;
+                    char msg[TERM_COLS + 1];
+                    snprintf(msg, sizeof msg, "found %s", cfg.host);
+                    status_set(status, msg, "starting the stream...");
+                    term_present = true;
+                    if (win)
+                        SDL_SetWindowTitle(win, "c64uv - waiting for stream…");
+                    ka = net_start(&cfg, &rc, sock, asock, mc_video,
+                                   mc_audio);
+                    if (want_keyb) {
+                        kb.host = cfg.host;
+                        kb.enabled = true;
+                        keyb_try_connect(&kb);
+                        snprintf(mi.url, sizeof mi.url,
+                                 "http://%s/v1/machine:input", cfg.host);
+                    }
+                } else {
+                    status_set(status, "no Ultimate found on your network",
+                               "is it powered on? retrying in 10 s");
+                    term_present = true;
+                    next_scan = SDL_GetTicks() + 10000;
+                }
+            } else if (!dthr && SDL_GetTicks() >= next_scan) {
+                atomic_store(&da.n, -1);
+                dthr = SDL_CreateThread(discover_thread, "discover", &da);
+                status_set(status, "looking for your Ultimate...",
+                           "scanning the local subnets");
+                term_present = true;
+            }
+        }
         if (windowed) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
@@ -1062,16 +1198,18 @@ int main(int argc, char **argv)
                             help_active = false;
                             term_present = true;
                         } // anything else stays local while help is up
-                    } else if (va == VA_RESET && !cfg.no_start) {
+                    } else if (va == VA_RESET && !cfg.no_start && cfg.host) {
                         machine_ctl(cfg.host, "reset");
-                    } else if (va == VA_REBOOT && !cfg.no_start) {
+                    } else if (va == VA_REBOOT && !cfg.no_start && cfg.host) {
                         machine_ctl(cfg.host, "reboot");
-                    } else if (va == VA_PAUSE && !cfg.no_start) {
+                    } else if (va == VA_PAUSE && !cfg.no_start && cfg.host) {
                         paused = !paused;
                         machine_ctl(cfg.host, paused ? "pause" : "resume");
-                    } else if (va == VA_MENU_BTN && !cfg.no_start) {
+                    } else if (va == VA_MENU_BTN && !cfg.no_start &&
+                               cfg.host) {
                         machine_ctl(cfg.host, "menu_button");
-                    } else if (va == VA_MENU_VIEW && !cfg.no_start) {
+                    } else if (va == VA_MENU_VIEW && !cfg.no_start &&
+                               cfg.host) {
                         term_active = !term_active;
                         term_present = true; // repaint whichever view we enter
                         if (term_active && atomic_load(&g_minput) == 1)
@@ -1115,7 +1253,7 @@ int main(int argc, char **argv)
                     if (atomic_load(&g_minput) == 1)
                         minput_release_all(&mi);
                 } else if (ev.type == SDL_EVENT_DROP_FILE) {
-                    if (!cfg.no_start && ev.drop.data)
+                    if (!cfg.no_start && cfg.host && ev.drop.data)
                         run_file_async(cfg.host, ev.drop.data);
                 } else if (ev.type == SDL_EVENT_TEXT_INPUT && !help_active) {
                     for (const char *p = ev.text.text; *p; p++) {
@@ -1189,9 +1327,11 @@ int main(int argc, char **argv)
             frame_done = video_handle_packet(pkt, n, fb);
         }
 
-        struct term *view = help_active ? help_scr : trm;
-        if (windowed && (term_active || help_active) &&
-            (view->dirty || term_present)) {
+        struct term *view = help_active ? help_scr
+                            : term_active ? trm
+                            : !got_any    ? status
+                                          : NULL;
+        if (windowed && view && (view->dirty || term_present)) {
             if (!term_tex) {
                 term_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
                                              SDL_TEXTUREACCESS_STREAMING,
@@ -1267,6 +1407,8 @@ int main(int argc, char **argv)
     atomic_store(&g_quit, true);
     if (atomic_load(&g_minput) == 1 && mi.url[0])
         minput_release_all(&mi);
+    if (dthr) // a sweep may still be running; it must not outlive curl
+        SDL_WaitThread(dthr, NULL);
     if (ka)
         SDL_WaitThread(ka, NULL);
     if (mi.curl)
@@ -1281,6 +1423,7 @@ int main(int argc, char **argv)
     free(term_px);
     free(trm);
     free(help_scr);
+    free(status);
     if (astream)
         SDL_DestroyAudioStream(astream);
     if (asock >= 0)
