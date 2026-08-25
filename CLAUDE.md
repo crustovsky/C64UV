@@ -30,12 +30,18 @@ file basename must both stay `c64uv` or desktops lose the window icon.
 ```
 UDP :11000 -> frame assembler -> VIC palette LUT -> SDL streaming texture
 UDP :11001 -> SDL_AudioStream (resample + latency servo -> 60 ms target)
+  (--multicast: both sockets also join 239.0.1.64/.65, SO_REUSEADDR)
 SDL events -> PETSCII -> TCP :64 KEYB   |   F9 view: VT100 keys -> TCP :23
+  (matrix-capable firmware: key up/down -> POST machine:input instead)
 keepalive thread -> ARP prime (ping -I) + PUT streams/{video,audio}:start / 5 s
+                    + one-time GET machine:input capability probe
+no host -> discover_scan() /v1/info sweep   |   file drop/--run -> runners:*
+Ctrl hotkeys / --do -> PUT machine:{reset,reboot,pause,resume,menu_button}
 ```
 
-The hardware-independent pieces (video.c, term.c, keys.c) are split out so
-tests can link them; main.c keeps everything socket- and SDL-bound.
+The hardware-independent pieces (video.c, term.c, keys.c, discover.c) are
+split out so tests can link them; main.c keeps everything socket- and
+SDL-bound.
 
 ## Tests
 
@@ -122,6 +128,8 @@ on every push and PR.
 
 ## Roadmap
 
-All six 2026-08 roadmap milestones (discovery, multicast, machine:input,
-machine control + password, drag-and-drop run, help overlay) are shipped.
-Next candidates live in the issue tracker, not here.
+Empty. The six 2026-08 milestones (discovery, multicast, machine:input,
+machine control + password, drag-and-drop run, help overlay) all shipped
+in v0.2.0. One dormant follow-up: the matrix-keyboard path activates
+itself when official firmware ships `machine:input`; re-verify the mapping
+against real hardware when that lands.

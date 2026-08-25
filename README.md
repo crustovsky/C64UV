@@ -24,6 +24,15 @@ cable.
 - **Ultimate menu** - press **F9** to flip to the Ultimate's own menu (file
   browser, disk mounting, configuration) rendered via its telnet remote
   screen; F9 again returns to the C64.
+- **Discovery** - run it with no address and it finds the Ultimate on your
+  LAN (preferring its wired interface, the one that can stream).
+- **Run files** - drop a `.prg`, `.crt`, or `.sid` onto the window (or
+  `--run file`) and the machine runs it, cartridge-safe.
+- **Machine control** - reset, reboot, pause/resume, and menu button as
+  hotkeys or one-shot `--do` commands; F10 shows the in-window key
+  reference.
+- **Shareable streams** - `--multicast` lets any number of viewers watch
+  the same machine.
 
 ## Requirements
 
