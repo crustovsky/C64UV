@@ -157,6 +157,35 @@ static void test_petscii(void)
     CHECK(special_to_petscii(SDLK_A, 0) == -1); // printables via text input
 }
 
+static void test_matrix_keys(void)
+{
+    const char *n[2];
+    CHECK(key_to_c64_matrix(SDLK_A, n) == 1 && !strcmp(n[0], "a"));
+    CHECK(key_to_c64_matrix(SDLK_9, n) == 1 && !strcmp(n[0], "9"));
+    CHECK(key_to_c64_matrix(SDLK_SPACE, n) == 1 && !strcmp(n[0], "space"));
+    CHECK(key_to_c64_matrix(SDLK_UP, n) == 2 &&
+          !strcmp(n[0], "right_shift") && !strcmp(n[1], "cursor_up_down"));
+    CHECK(key_to_c64_matrix(SDLK_DOWN, n) == 1 &&
+          !strcmp(n[0], "cursor_up_down"));
+    CHECK(key_to_c64_matrix(SDLK_F2, n) == 2 &&
+          !strcmp(n[0], "left_shift") && !strcmp(n[1], "f1"));
+    CHECK(key_to_c64_matrix(SDLK_ESCAPE, n) == 1 && !strcmp(n[0], "run_stop"));
+    CHECK(key_to_c64_matrix(SDLK_PAGEUP, n) == 1 && !strcmp(n[0], "restore"));
+    CHECK(key_to_c64_matrix(SDLK_F9, n) == 0);   // viewer keys stay local
+    CHECK(key_to_c64_matrix(SDLK_LCTRL, n) == 0); // reserved for hotkeys
+
+    char buf[192];
+    const char *one[] = {"a"};
+    CHECK(matrix_event_json(one, 1, "press", buf, sizeof buf));
+    CHECK(!strcmp(buf, "{\"events\":[{\"kind\":\"keyboard\",\"inputs\":"
+                       "[\"a\"],\"transition\":\"press\"}]}"));
+    const char *two[] = {"left_shift", "f1"};
+    CHECK(matrix_event_json(two, 2, "tap", buf, sizeof buf));
+    CHECK(strstr(buf, "\"inputs\":[\"left_shift\",\"f1\"]") != NULL);
+    CHECK(strstr(buf, "\"transition\":\"tap\"") != NULL);
+    CHECK(!matrix_event_json(one, 1, "press", buf, 16)); // too small
+}
+
 static void test_json(void)
 {
     // shaped like a real /v1/info response
@@ -182,6 +211,7 @@ int main(void)
     test_term_keys();
     test_video_assembly();
     test_petscii();
+    test_matrix_keys();
     test_json();
     if (failures) {
         fprintf(stderr, "%d check(s) FAILED\n", failures);

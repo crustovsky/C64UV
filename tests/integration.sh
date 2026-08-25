@@ -80,3 +80,17 @@ for f in "$out/mc1.ppm" "$out/mc2.ppm"; do
     head -2 "$f" | grep -qx "384 272"
 done
 echo "multicast test passed"
+
+# ------------------------------------------------------- REST keepalive/probe
+# Full keepalive cycle against the fake server: stream start with the right
+# destination, plus the one-time machine:input capability probe.
+
+python3 tools/mockstream.py 127.0.0.1 11000 10 >/dev/null &
+pids+=($!)
+sleep 0.3
+timeout 8 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
+    --dump "$out/rest.ppm" 2> "$out/rest.err"
+grep -q "GET /v1/machine:input" "$out/disc.log"
+grep -q "PUT /v1/streams/video:start?ip=127.0.0.1:11000" "$out/disc.log"
+grep -q "machine:input available" "$out/rest.err"
+echo "rest keepalive/probe test passed"

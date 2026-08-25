@@ -43,6 +43,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"product": "Ultimate 64", "firmware_version": "3.12",
                         "fpga_version": "11F", "hostname": "fakeultimate",
                         "unique_id": "F00F00", "errors": []})
+        elif self.path == "/v1/machine:input":
+            self._json({"keyboard": {"inputs": []},
+                        "joysticks": [{"port": 1, "inputs": []},
+                                      {"port": 2, "inputs": []}],
+                        "errors": []})
         else:
             self._json({"errors": ["Unknown API Call"]}, 404)
 

@@ -78,10 +78,16 @@ on every push and PR.
   char: poke `$91 = $7F` via `DMAWRITE` (0xFF06), repeated to win the race
   against the KERNAL restoring it (the vendor web UI does the same). The
   vendor web UI itself types via `writemem $0277`, so this is the sanctioned
-  mechanism. Works only for KERNAL-read input, not matrix-scanning games -
-  upgrade to `machine:input` (CIA1-level, in upstream 3.15 beta) once the
-  official firmware ships it; probe `PUT /v1/machine:input` after firmware
-  updates.
+  mechanism. Works only for KERNAL-read input, not matrix-scanning games.
+- **`machine:input` (CIA1 matrix-level)**: probed with a side-effect-free
+  `GET /v1/machine:input` by the keepalive thread (404 on official firmware
+  1.1.0, verified; upstream 3.15 beta has it). When capable, key events POST
+  JSON batches (`{"events":[{"kind":"keyboard","inputs":[...],"transition":
+  "press"|"release"|"tap"}]}`); mapping lives in keys.c
+  (`key_to_c64_matrix`): cursor up/left and F2/4/6/8 are shift chords,
+  Tab = C64 CTRL (PC Ctrl stays free for viewer hotkeys), PageUp = RESTORE
+  (tap-only per the API). `release_all` fires on focus loss, F9, and exit.
+  Three consecutive transport failures fall back to the KERNAL buffer.
 - **Telnet menu (TCP :23)**: firmware `screen_vt100.cc` emits exactly: `ESC c`
   (RIS), `ESC[y;xH`, a fixed SGR set (`0;3X` + `;1`/`;2`, `7`/`27`), `ESC(0`
   / `ESC(B` charset switches, `ESC[2J`, `ESC[r`. Screen is fixed **60x24**.
@@ -104,15 +110,11 @@ on every push and PR.
 
 ## Roadmap
 
-1. **`machine:input` keyboard upgrade** when official firmware ships it:
-   CIA1 matrix-level press/release (games, chords, held keys). Probe
-   `PUT /v1/machine:input` for capability, cache the result, fall back to the
-   KERNAL buffer; keep the buffer path for bulk text even on capable firmware.
-2. **Machine-control hotkeys + password**: reset, reboot, pause/resume, menu
+1. **Machine-control hotkeys + password**: reset, reboot, pause/resume, menu
    button (single REST calls). Add `X-Password` header support (firmware
    3.12+ network password); currently there is no way to reach a
    password-protected Ultimate.
-3. **Drag-and-drop run**: SDL3 drop events -> POST `.prg`/`.crt`/`.sid` to
+2. **Drag-and-drop run**: SDL3 drop events -> POST `.prg`/`.crt`/`.sid` to
    `runners:run_prg`/`:sidplay`. Two protocol facts to honour: (a)
    cartridge-safe run - blank the Cartridge config item before a DMA run and
    restore it after (config applies at next reset, so the program keeps
@@ -120,7 +122,7 @@ on every push and PR.
    hard-resetting into the cart menu); (b) readiness gate - before typing
    after a reset, poll the KERNAL ready flag at zero-page `$CC` via
    `machine:readmem` and require two consecutive ready reads.
-4. **Help overlay**: F10 toggles an in-window key reference rendered with the
+3. **Help overlay**: F10 toggles an in-window key reference rendered with the
    existing font8x8.h path (no new dependencies). Drive both the overlay text
    and the event dispatch from one static key-binding table so the help can
    never drift from the actual bindings; also print the same table on

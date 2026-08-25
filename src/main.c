@@ -62,12 +62,15 @@ static int tcp_connect_to(const char *host, Uint16 port, int timeout_s)
 }
 
 static atomic_bool g_quit;
+// machine:input capability (probed once per session): -1 unknown, 0 no, 1 yes
+static atomic_int g_minput = -1;
 
 // ---------------------------------------------------------------- REST control
 
 struct rest_ctx {
     char start_url[2][256]; // [0] video, [1] audio
     char stop_url[2][256];
+    char input_url[256];    // machine:input, probed for capability
     int nstreams;
     int sock;                    // our UDP socket, for the ARP-priming packet
     struct sockaddr_in ult_addr; // Ultimate's address
@@ -86,21 +89,36 @@ static size_t curl_sink(char *data, size_t size, size_t nmemb, void *userp)
     return n;
 }
 
-// Returns HTTP status, or -1 on transport error. Response body (truncated) in resp.
-static long rest_put(CURL *curl, const char *url, char *resp)
+// Returns HTTP status, or -1 on transport error. Response body (truncated) in
+// resp. A non-NULL json_body is sent with Content-Type: application/json.
+static long rest_req(CURL *curl, const char *method, const char *url,
+                     const char *json_body, long timeout_ms, char *resp)
 {
     resp[0] = '\0';
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000L);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_sink);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
-    if (curl_easy_perform(curl) != CURLE_OK)
+    struct curl_slist *hdrs = NULL;
+    if (json_body) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
+        hdrs = curl_slist_append(NULL, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    }
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    if (res != CURLE_OK)
         return -1;
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     return code;
+}
+
+static long rest_put(CURL *curl, const char *url, char *resp)
+{
+    return rest_req(curl, "PUT", url, NULL, 3000, resp);
 }
 
 // Keepalive thread: re-issue the start command every 5 s so the stream survives
@@ -124,6 +142,19 @@ static int keepalive_thread(void *arg)
         else
             sendto(rc->sock, "", 1, 0, (struct sockaddr *)&rc->ult_addr,
                    sizeof rc->ult_addr);
+        // Capability probe (GET is side-effect free), retried until the
+        // machine gives an HTTP answer, then cached for the session.
+        if (rc->input_url[0] && atomic_load(&g_minput) < 0) {
+            long code = rest_req(curl, "GET", rc->input_url, NULL, 3000, resp);
+            if (code == 200) {
+                atomic_store(&g_minput, 1);
+                SDL_Log("machine:input available: matrix-level keyboard");
+            } else if (code > 0) {
+                atomic_store(&g_minput, 0);
+                SDL_Log("machine:input not supported (HTTP %ld): typing goes "
+                        "via the KERNAL buffer", code);
+            }
+        }
         for (int i = 0; i < rc->nstreams; i++) {
             long code = rest_put(curl, rc->start_url[i], resp);
             if (code != last_code[i]) { // log only on state change
@@ -289,6 +320,57 @@ static void keyb_stop(struct keyb *k)
     const Uint8 poke[] = {0x91, 0x00, 0x7F};
     for (int i = 0; i < 3; i++)
         keyb_raw(k, 0xFF06, poke, sizeof poke);
+}
+
+// ----------------------------------------------- matrix keyboard (REST)
+//
+// When the firmware supports machine:input (probed by the keepalive thread),
+// key presses and releases go to the CIA1 matrix instead of the KERNAL
+// buffer: games, chords, and held keys work. Sent synchronously from the
+// event loop with a short timeout; repeated transport failures flip the
+// session back to the buffer path.
+
+struct minput {
+    CURL *curl;
+    char url[256];
+    int fails;
+};
+
+static void minput_post(struct minput *mi, const char *body)
+{
+    if (!mi->curl)
+        mi->curl = curl_easy_init();
+    char resp[512];
+    if (rest_req(mi->curl, "POST", mi->url, body, 250, resp) == -1) {
+        if (++mi->fails >= 3) {
+            atomic_store(&g_minput, 0);
+            SDL_Log("machine:input unreachable, falling back to the KERNAL "
+                    "buffer");
+        }
+    } else {
+        mi->fails = 0;
+    }
+}
+
+static void minput_key(struct minput *mi, SDL_Keycode key, bool down)
+{
+    const char *names[2];
+    int n = key_to_c64_matrix(key, names);
+    if (n == 0)
+        return;
+    bool tap = strcmp(names[0], "restore") == 0; // tap-only per the API
+    if (tap && !down)
+        return;
+    char body[192];
+    if (matrix_event_json(names, n, tap ? "tap" : down ? "press" : "release",
+                          body, sizeof body))
+        minput_post(mi, body);
+}
+
+// Fired on focus loss, view switches, and exit so no key stays held down.
+static void minput_release_all(struct minput *mi)
+{
+    minput_post(mi, "{\"events\":[{\"kind\":\"release_all\"}]}");
 }
 
 // ------------------------------------------------------ telnet menu terminal
@@ -557,6 +639,8 @@ int main(int argc, char **argv)
                  cfg.listen_port);
         snprintf(rc.stop_url[0], sizeof rc.stop_url[0],
                  "http://%s/v1/streams/video:stop", cfg.host);
+        snprintf(rc.input_url, sizeof rc.input_url,
+                 "http://%s/v1/machine:input", cfg.host);
         rc.nstreams = 1;
         if (asock >= 0) {
             snprintf(rc.start_url[1], sizeof rc.start_url[1],
@@ -609,10 +693,13 @@ int main(int argc, char **argv)
     }
 
     struct keyb kb = {.fd = -1, .host = cfg.host};
+    struct minput mi = {0};
     if (windowed && !cfg.no_keyb && !cfg.no_start) {
         kb.enabled = true;
         SDL_StartTextInput(win);
         keyb_try_connect(&kb);
+        snprintf(mi.url, sizeof mi.url, "http://%s/v1/machine:input",
+                 cfg.host);
     }
 
     // Ultimate menu terminal (F9). Connected lazily on first toggle.
@@ -654,6 +741,8 @@ int main(int argc, char **argv)
                     } else if (ev.key.key == SDLK_F9 && !cfg.no_start) {
                         term_active = !term_active;
                         term_present = true; // repaint whichever view we enter
+                        if (term_active && atomic_load(&g_minput) == 1)
+                            minput_release_all(&mi); // no keys stay held
                         if (term_active && tfd < 0 &&
                             (tfd_last_try == 0 ||
                              SDL_GetTicks() - tfd_last_try > 3000)) {
@@ -674,7 +763,10 @@ int main(int argc, char **argv)
                             tfd = -1;
                         }
                     } else if (kb.enabled) {
-                        if (ev.key.key == SDLK_ESCAPE) {
+                        if (atomic_load(&g_minput) == 1) {
+                            if (!ev.key.repeat) // the matrix has no repeat
+                                minput_key(&mi, ev.key.key, true);
+                        } else if (ev.key.key == SDLK_ESCAPE) {
                             keyb_stop(&kb); // Esc = RUN/STOP
                         } else {
                             int c = special_to_petscii(ev.key.key, ev.key.mod);
@@ -682,6 +774,13 @@ int main(int argc, char **argv)
                                 keyb_type(&kb, (Uint8)c);
                         }
                     }
+                } else if (ev.type == SDL_EVENT_KEY_UP) {
+                    if (!term_active && kb.enabled &&
+                        atomic_load(&g_minput) == 1)
+                        minput_key(&mi, ev.key.key, false);
+                } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+                    if (atomic_load(&g_minput) == 1)
+                        minput_release_all(&mi);
                 } else if (ev.type == SDL_EVENT_TEXT_INPUT) {
                     for (const char *p = ev.text.text; *p; p++) {
                         if (term_active) {
@@ -690,7 +789,9 @@ int main(int argc, char **argv)
                                 close(tfd);
                                 tfd = -1;
                             }
-                        } else if (kb.enabled) {
+                        } else if (kb.enabled &&
+                                   atomic_load(&g_minput) != 1) {
+                            // matrix mode types via key events instead
                             int c = ascii_to_petscii((unsigned char)*p);
                             if (c >= 0)
                                 keyb_type(&kb, (Uint8)c);
@@ -826,8 +927,12 @@ int main(int argc, char **argv)
     }
 
     atomic_store(&g_quit, true);
+    if (atomic_load(&g_minput) == 1 && mi.url[0])
+        minput_release_all(&mi);
     if (ka)
         SDL_WaitThread(ka, NULL);
+    if (mi.curl)
+        curl_easy_cleanup(mi.curl);
     curl_global_cleanup();
     if (kb.fd >= 0)
         close(kb.fd);

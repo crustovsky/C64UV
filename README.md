@@ -109,11 +109,14 @@ terminal.
 
 ## Limitations
 
-- Typed input goes through the KERNAL keyboard buffer, so it works for BASIC,
-  the READY prompt, and anything reading input normally - **not** for games
-  that scan the keyboard matrix directly. Hardware-level injection
-  (`machine:input`) exists in upstream firmware betas and will be adopted once
-  it ships in the official Commodore firmware.
+- On current official firmware, typed input goes through the KERNAL keyboard
+  buffer: it works for BASIC, the READY prompt, and anything reading input
+  normally - **not** for games that scan the keyboard matrix directly. The
+  viewer probes for the hardware-level `machine:input` API (in upstream
+  firmware betas) on every start and switches to true matrix-level
+  press/release automatically once your firmware has it; games, chords, and
+  held keys then work, with Tab acting as the C64 CTRL key and PageUp as
+  RESTORE.
 - The Ultimate's menu overlay is not part of the VIC stream - that's what the
   F9 telnet view is for.
 - IPv4 only. The device streams to one destination, so it's one viewer per
