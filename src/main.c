@@ -407,9 +407,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "no --host given, discovering...\n");
         int n = discover_scan(found, DISCOVER_MAX, true);
         if (n >= 1) {
-            if (n > 1) {
+            // one machine can answer on both WiFi and wired; only warn when
+            // genuinely different machines were found
+            int distinct = 0;
+            for (int i = 0; i < n; i++) {
+                bool dup = false;
+                for (int j = 0; j < i; j++)
+                    dup |= found[i].uid[0] && !strcmp(found[i].uid,
+                                                      found[j].uid);
+                distinct += !dup;
+            }
+            if (distinct > 1) {
                 fprintf(stderr, "found %d Ultimates, using the first; pass "
-                        "--host to pick another:\n", n);
+                        "--host to pick another:\n", distinct);
                 for (int i = 0; i < n; i++)
                     fprintf(stderr, "  %-15s  %s\n", found[i].ip,
                             found[i].hostname);

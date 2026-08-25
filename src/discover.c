@@ -54,6 +54,8 @@ static bool is_ultimate_info(long code, const char *resp, struct discovered *d)
         d->hostname[0] = '\0';
     if (!json_find_str(resp, "firmware_version", d->fw, sizeof d->fw))
         d->fw[0] = '\0';
+    if (!json_find_str(resp, "unique_id", d->uid, sizeof d->uid))
+        d->uid[0] = '\0';
     return true;
 }
 

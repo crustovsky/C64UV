@@ -13,6 +13,7 @@ struct discovered {
     char product[64];
     char hostname[64];
     char fw[32];
+    char uid[32]; // unique_id: one machine can answer on WiFi and wired
 };
 
 // Sweeps every local /24 (one request per address, bounded concurrency,
