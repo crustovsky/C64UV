@@ -8,7 +8,7 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.2.4"
+#define C64UV_VERSION "0.2.5"
 
 #include "discover.h"
 #include "keys.h"
@@ -765,8 +765,8 @@ static int run_term_test(const char *host)
 // free. Same font, same colors.
 
 #define HELP_PX_W TERM_PX_W
-#define HELP_PX_H 264
-#define HELP_LINE 14 // 8 px glyphs + 6 px of air between rows
+#define HELP_PX_H 232
+#define HELP_LINE 11 // 8 px glyphs + 3 px of air between rows
 #define HELP_BLUE 0xFF2E2C9Bu
 
 static void help_render(uint32_t *px)
