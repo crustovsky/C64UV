@@ -49,7 +49,14 @@ def audio_packet(aseq: int, pos: int) -> bytes:
 
 def main() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    adest = (DEST[0], DEST[1] + 1)
+    aip = DEST[0]
+    if 224 <= int(DEST[0].split(".")[0]) <= 239:
+        # multicast: same convention as c64uv, audio group = video group + 1
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+        parts = DEST[0].split(".")
+        aip = ".".join(parts[:3] + [str(int(parts[3]) + 1)])
+    adest = (aip, DEST[1] + 1)
     seq = frame = aseq = apos = 0
     t0 = time.monotonic()
     sent = 0

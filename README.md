@@ -76,6 +76,17 @@ refuses to start a stream toward an address missing from its ARP table.
 | **F9** | toggle the Ultimate menu view |
 | Ctrl+Q | quit |
 
+### Several viewers, one Ultimate
+
+The Ultimate streams to a single destination, so normally the first viewer
+wins. `--multicast` asks it to stream to multicast groups instead
+(239.0.1.64 video, 239.0.1.65 audio): every viewer started with
+`--multicast` joins the groups and shows the same machine, and c64uv can
+share the stream with other multicast-aware tools watching the same groups.
+A custom group works too: `--dest 239.x.y.z` joins that group for video and
+group + 1 for audio. When one multicast viewer quits it stops the stream,
+and the remaining viewers' keepalive restarts it within 5 s (a short blip).
+
 The menu view is its own remote session on the firmware side: after you launch
 something from it (Run Disk, Run Program), the menu stays where it was and the
 viewer does not switch on its own - press F9 to flip back to the C64 screen
@@ -105,7 +116,8 @@ terminal.
   it ships in the official Commodore firmware.
 - The Ultimate's menu overlay is not part of the VIC stream - that's what the
   F9 telnet view is for.
-- IPv4 only; one viewer per Ultimate (the device streams to one destination).
+- IPv4 only. The device streams to one destination, so it's one viewer per
+  Ultimate unless everyone uses `--multicast`.
 
 ## How it talks to the machine
 

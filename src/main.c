@@ -3,6 +3,8 @@
 // Streams the Ultimate's video/audio into an SDL3 window, forwards keystrokes,
 // and shows the Ultimate menu over telnet. Protocol notes live in CLAUDE.md.
 
+#define _DEFAULT_SOURCE // struct ip_mreq with -std=c11
+
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
@@ -32,6 +34,7 @@ struct config {
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
     int listen_port;        // video; audio uses listen_port + 1
     int scale;
+    bool multicast;         // stream to the 239.0.1.64/.65 groups
     bool no_start;          // don't touch REST (mock/local testing)
     bool no_audio;
     bool no_keyb;
@@ -177,6 +180,39 @@ static bool find_lan_iface(const char *host, char *ip, size_t iplen,
     return found;
 }
 
+// ------------------------------------------------------------- multicast
+//
+// The Ultimate happily streams to a multicast group, which lifts the
+// one-viewer-per-Ultimate limitation: every viewer joins the group and asks
+// the Ultimate to stream there (the start command is idempotent for the same
+// destination). Convention (from prkl_ultimate): video group, audio group =
+// video + 1 on the last octet.
+
+static bool is_multicast_ip(const char *s)
+{
+    struct in_addr a;
+    return inet_pton(AF_INET, s, &a) == 1 && IN_MULTICAST(ntohl(a.s_addr));
+}
+
+static void mcast_next_group(const char *video, char *audio, size_t cap)
+{
+    struct in_addr a;
+    inet_pton(AF_INET, video, &a);
+    a.s_addr = htonl(ntohl(a.s_addr) + 1);
+    inet_ntop(AF_INET, &a, audio, (socklen_t)cap);
+}
+
+// Joins on the given interface address (NULL = kernel picks by route).
+static bool mcast_join(int sock, const char *group, const char *ifip)
+{
+    struct ip_mreq m = {0};
+    if (inet_pton(AF_INET, group, &m.imr_multiaddr) != 1)
+        return false;
+    if (ifip)
+        inet_pton(AF_INET, ifip, &m.imr_interface);
+    return setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) == 0;
+}
+
 // Fallback: connect a UDP socket toward the Ultimate and read back the source
 // address the kernel picked.
 static bool detect_local_ip(const char *host, char *out, size_t outlen)
@@ -295,12 +331,16 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
-            "          [--no-start] [--no-audio] [--no-keyb] [--dump FILE.ppm]\n"
-            "          [--term-test] [--discover] [--verbose] [--version]\n"
+            "          [--multicast] [--no-start] [--no-audio] [--no-keyb]\n"
+            "          [--dump FILE.ppm] [--term-test] [--discover] [--verbose]\n"
+            "          [--version]\n"
             "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
             "auto-discover)\n"
-            "  --dest    where the Ultimate should send the streams (default: auto)\n"
+            "  --dest    where the Ultimate should send the streams (default: auto;\n"
+            "            a multicast address is joined, audio group = video + 1)\n"
             "  --port    local UDP video port; audio uses port+1 (default 11000)\n"
+            "  --multicast  stream via groups 239.0.1.64/.65 so several viewers\n"
+            "            can watch the same Ultimate\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
             "  --term-test  print the telnet menu screen as text, then exit\n"
@@ -322,6 +362,8 @@ int main(int argc, char **argv)
             cfg.listen_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc)
             cfg.scale = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--multicast"))
+            cfg.multicast = true;
         else if (!strcmp(argv[i], "--no-start"))
             cfg.no_start = true;
         else if (!strcmp(argv[i], "--no-audio"))
@@ -407,13 +449,38 @@ int main(int argc, char **argv)
     if (cfg.dump_path)
         cfg.no_audio = true; // headless frame grab needs no sound
 
+    // Work out the stream destination groups before the sockets exist, so the
+    // memberships can be joined right after bind. --dest with a multicast
+    // address behaves like --multicast with custom groups.
+    char mc_video[46] = "", mc_audio[46] = "";
+    if (cfg.multicast) {
+        snprintf(mc_video, sizeof mc_video, "239.0.1.64");
+        snprintf(mc_audio, sizeof mc_audio, "239.0.1.65");
+    } else if (cfg.dest) {
+        char iponly[46];
+        snprintf(iponly, sizeof iponly, "%.*s",
+                 (int)strcspn(cfg.dest, ":"), cfg.dest);
+        if (is_multicast_ip(iponly)) {
+            snprintf(mc_video, sizeof mc_video, "%s", iponly);
+            mcast_next_group(mc_video, mc_audio, sizeof mc_audio);
+        }
+    }
+    // The join must land on the interface the stream arrives on; when the
+    // Ultimate's subnet is ours, use that interface rather than the routing
+    // table's guess (policy routing can point elsewhere).
+    char lan_ip[46], ifname[32] = "";
+    bool on_lan = find_lan_iface(cfg.host, lan_ip, sizeof lan_ip, ifname,
+                                 sizeof ifname);
+
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         perror("socket");
         return 1;
     }
-    int rcvbuf = 1 << 20;
+    int rcvbuf = 1 << 20, one = 1;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+    if (mc_video[0]) // several viewers on one host share the port
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in bind_addr = {.sin_family = AF_INET,
                                     .sin_addr.s_addr = htonl(INADDR_ANY),
                                     .sin_port = htons((Uint16)cfg.listen_port)};
@@ -421,14 +488,26 @@ int main(int argc, char **argv)
         perror("bind");
         return 1;
     }
+    if (mc_video[0] &&
+        !mcast_join(sock, mc_video, on_lan ? lan_ip : NULL)) {
+        perror("multicast join");
+        return 1;
+    }
     int asock = -1;
     if (!cfg.no_audio) {
         asock = socket(AF_INET, SOCK_DGRAM, 0);
         setsockopt(asock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+        if (mc_audio[0])
+            setsockopt(asock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
         struct sockaddr_in aaddr = bind_addr;
         aaddr.sin_port = htons((Uint16)(cfg.listen_port + 1));
         if (bind(asock, (struct sockaddr *)&aaddr, sizeof aaddr) < 0) {
             perror("bind audio");
+            return 1;
+        }
+        if (mc_audio[0] &&
+            !mcast_join(asock, mc_audio, on_lan ? lan_ip : NULL)) {
+            perror("multicast join audio");
             return 1;
         }
     }
@@ -436,19 +515,24 @@ int main(int argc, char **argv)
     struct rest_ctx rc;
     SDL_Thread *ka = NULL;
     if (!cfg.no_start) {
-        char ip[64], lan_ip[46], ifname[32] = "";
-        bool on_lan = find_lan_iface(cfg.host, lan_ip, sizeof lan_ip, ifname,
-                                     sizeof ifname);
-        if (cfg.dest) {
-            snprintf(ip, sizeof ip, "%s", cfg.dest);
-            char *colon = strchr(ip, ':'); // legacy ip:port form
+        char dstv[64], dsta[64];
+        if (mc_video[0]) {
+            snprintf(dstv, sizeof dstv, "%s", mc_video);
+            snprintf(dsta, sizeof dsta, "%s", mc_audio);
+        } else if (cfg.dest) {
+            snprintf(dstv, sizeof dstv, "%s", cfg.dest);
+            char *colon = strchr(dstv, ':'); // legacy ip:port form
             if (colon) {
                 cfg.listen_port = atoi(colon + 1);
                 *colon = '\0';
             }
+            snprintf(dsta, sizeof dsta, "%s", dstv);
         } else if (on_lan) {
-            snprintf(ip, sizeof ip, "%s", lan_ip);
-        } else if (!detect_local_ip(cfg.host, ip, sizeof ip)) {
+            snprintf(dstv, sizeof dstv, "%s", lan_ip);
+            snprintf(dsta, sizeof dsta, "%s", lan_ip);
+        } else if (detect_local_ip(cfg.host, dstv, sizeof dstv)) {
+            snprintf(dsta, sizeof dsta, "%s", dstv);
+        } else {
             fprintf(stderr, "cannot detect local IP; use --dest\n");
             return 1;
         }
@@ -459,15 +543,15 @@ int main(int argc, char **argv)
         else
             rc.prime_cmd[0] = '\0';
         snprintf(rc.start_url[0], sizeof rc.start_url[0],
-                 "http://%s/v1/streams/video:start?ip=%s:%d", cfg.host, ip,
+                 "http://%s/v1/streams/video:start?ip=%s:%d", cfg.host, dstv,
                  cfg.listen_port);
         snprintf(rc.stop_url[0], sizeof rc.stop_url[0],
                  "http://%s/v1/streams/video:stop", cfg.host);
         rc.nstreams = 1;
         if (asock >= 0) {
             snprintf(rc.start_url[1], sizeof rc.start_url[1],
-                     "http://%s/v1/streams/audio:start?ip=%s:%d", cfg.host, ip,
-                     cfg.listen_port + 1);
+                     "http://%s/v1/streams/audio:start?ip=%s:%d", cfg.host,
+                     dsta, cfg.listen_port + 1);
             snprintf(rc.stop_url[1], sizeof rc.stop_url[1],
                      "http://%s/v1/streams/audio:stop", cfg.host);
             rc.nstreams = 2;
@@ -477,7 +561,7 @@ int main(int argc, char **argv)
                                            .sin_port = htons(11000)};
         inet_pton(AF_INET, cfg.host, &rc.ult_addr.sin_addr);
         SDL_Log("requesting %s -> %s:%d", asock >= 0 ? "video+audio" : "video",
-                ip, cfg.listen_port);
+                dstv, cfg.listen_port);
         ka = SDL_CreateThread(keepalive_thread, "keepalive", &rc);
     }
 

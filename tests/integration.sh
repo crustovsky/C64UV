@@ -64,3 +64,19 @@ C64U_DISCOVER_NET=127.0.0.0 C64U_DISCOVER_PORT=8064 \
 grep -q "127.0.0.42.*Ultimate 64.*fakeultimate" "$out/disc.out"
 ! grep -q "127.0.0.99" "$out/disc.out"
 echo "discovery test passed"
+
+# ----------------------------------------------------------------- multicast
+# Two viewers join the video group and must both assemble the same stream;
+# proves IP_ADD_MEMBERSHIP plus the shared SO_REUSEADDR port binding.
+
+python3 tools/mockstream.py 239.0.1.64 11000 10 >/dev/null &
+pids+=($!)
+sleep 0.3
+timeout 8 ./c64uv --no-start --multicast --dump "$out/mc1.ppm" &
+v1=$!
+timeout 8 ./c64uv --no-start --multicast --dump "$out/mc2.ppm"
+wait "$v1"
+for f in "$out/mc1.ppm" "$out/mc2.ppm"; do
+    head -2 "$f" | grep -qx "384 272"
+done
+echo "multicast test passed"

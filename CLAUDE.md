@@ -54,6 +54,13 @@ on every push and PR.
   there is no separate `port` parameter.
 - **Streams only leave the Ultimate's wired Ethernet port** (FPGA-generated).
   On WiFi-only, start fails with HTTP 500 "No Operational Network Interface".
+- **Multicast destinations work**: `streams/*:start` accepts a multicast
+  group in `ip=` (no ARP needed). c64uv convention (matching prkl_ultimate):
+  `--multicast` = video 239.0.1.64, audio 239.0.1.65; a multicast `--dest`
+  uses that group for video and group+1 for audio. Sockets take SO_REUSEADDR
+  so several local viewers can share the port; on exit each viewer still
+  issues `:stop`, and other viewers' keepalives restart the stream within
+  5 s.
 - **The firmware never ARPs on demand**: `streams/*:start` returns HTTP 404
   "Network Host Resolve Error" unless the destination is already in its ARP
   table. Hence the `ping -I <iface>` prime before every keepalive start - a
@@ -97,20 +104,15 @@ on every push and PR.
 
 ## Roadmap
 
-1. **Multicast transport**: join groups 239.0.1.64/.65 (the prkl_ultimate
-   defaults) via IP_ADD_MEMBERSHIP on the existing UDP sockets and pass the
-   group address in `streams/*:start`. Removes the one-viewer-per-Ultimate
-   limitation and lets c64uv coexist with u64deck/VLC watching the same
-   machine.
-2. **`machine:input` keyboard upgrade** when official firmware ships it:
+1. **`machine:input` keyboard upgrade** when official firmware ships it:
    CIA1 matrix-level press/release (games, chords, held keys). Probe
    `PUT /v1/machine:input` for capability, cache the result, fall back to the
    KERNAL buffer; keep the buffer path for bulk text even on capable firmware.
-3. **Machine-control hotkeys + password**: reset, reboot, pause/resume, menu
+2. **Machine-control hotkeys + password**: reset, reboot, pause/resume, menu
    button (single REST calls). Add `X-Password` header support (firmware
    3.12+ network password); currently there is no way to reach a
    password-protected Ultimate.
-4. **Drag-and-drop run**: SDL3 drop events -> POST `.prg`/`.crt`/`.sid` to
+3. **Drag-and-drop run**: SDL3 drop events -> POST `.prg`/`.crt`/`.sid` to
    `runners:run_prg`/`:sidplay`. Two protocol facts to honour: (a)
    cartridge-safe run - blank the Cartridge config item before a DMA run and
    restore it after (config applies at next reset, so the program keeps
@@ -118,7 +120,7 @@ on every push and PR.
    hard-resetting into the cart menu); (b) readiness gate - before typing
    after a reset, poll the KERNAL ready flag at zero-page `$CC` via
    `machine:readmem` and require two consecutive ready reads.
-5. **Help overlay**: F10 toggles an in-window key reference rendered with the
+4. **Help overlay**: F10 toggles an in-window key reference rendered with the
    existing font8x8.h path (no new dependencies). Drive both the overlay text
    and the event dispatch from one static key-binding table so the help can
    never drift from the actual bindings; also print the same table on
