@@ -237,6 +237,21 @@ void term_render(const struct term *t, uint32_t *px, int pitch_px)
     }
 }
 
+void term_draw_text(uint32_t *px, int pitch_px, int x, int y, uint32_t color,
+                    const char *s)
+{
+    for (; *s; s++, x += 8) {
+        const char *glyph = font8x8_basic[(int)(unsigned char)*s & 0x7F];
+        for (int gy = 0; gy < 8; gy++) {
+            uint32_t *out = px + (size_t)(y + gy) * pitch_px + x;
+            uint8_t bits = (uint8_t)glyph[gy]; // LSB = leftmost pixel
+            for (int gx = 0; gx < 8; gx++)
+                if (bits >> gx & 1)
+                    out[gx] = color;
+        }
+    }
+}
+
 int term_encode_key(SDL_Keycode key, SDL_Keymod mod, uint8_t *out)
 {
     (void)mod;

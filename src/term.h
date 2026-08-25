@@ -34,6 +34,11 @@ void term_init(struct term *t);
 void term_feed(struct term *t, const uint8_t *data, int n);
 // Renders the full grid into a TERM_PX_W x TERM_PX_H ARGB8888 buffer.
 void term_render(const struct term *t, uint32_t *px, int pitch_px);
+// Draws s with the 8x8 font at pixel (x, y) into an ARGB8888 buffer,
+// foreground pixels only. Lets other views (help overlay) use the font
+// without a free line pitch being forced into the 24-row grid.
+void term_draw_text(uint32_t *px, int pitch_px, int x, int y, uint32_t color,
+                    const char *s);
 // Encodes an SDL key for the firmware's VT100 keyboard parser.
 // Returns bytes written to out (cap >= 8), 0 if the key isn't mapped.
 int term_encode_key(SDL_Keycode key, SDL_Keymod mod, uint8_t *out);
