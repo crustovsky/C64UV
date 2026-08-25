@@ -1,6 +1,6 @@
 # Maintainer: Michal Skorupka <michal@skorupka.me>
 pkgname=c64uv
-pkgver=0.1.2
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Viewer for the C64 Ultimate / Ultimate 64: video and audio streaming, remote keyboard, menu access"
 arch=('x86_64' 'aarch64')
@@ -8,7 +8,7 @@ url="https://github.com/crustovsky/C64UV"
 license=('MIT')
 depends=('sdl3' 'curl' 'iputils' 'hicolor-icon-theme')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('e8c4218fc8a49c41f12bbb131e2b2bde94c1575ade5bd8759528b2c9b1beab7c')
+sha256sums=('601cdaf0433919e4d8e623c39b01d3920c756dbf59785178453e6f8c5d388255')
 
 build() {
   cd "C64UV-$pkgver"
