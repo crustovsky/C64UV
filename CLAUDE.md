@@ -131,8 +131,34 @@ both on every push and PR.
 
 ## Roadmap
 
-Empty. The six 2026-08 milestones (discovery, multicast, machine:input,
-machine control + password, drag-and-drop run, help overlay) all shipped
-in v0.2.0. One dormant follow-up: the matrix-keyboard path activates
-itself when official firmware ships `machine:input`; re-verify the mapping
-against real hardware when that lands.
+The six 2026-08 milestones (discovery, multicast, machine:input, machine
+control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
+
+1. **Platform compat layer** (next up): isolate the POSIX-specific pieces
+   behind one small compat header - sockets (init/close, nonblocking,
+   `MSG_NOSIGNAL`, poll), interface enumeration (`getifaddrs`), neighbor/ARP
+   lookup (`/proc/net/arp`), and the ARP-prime command (`ping -I`; the
+   plain UDP prime likely suffices off Linux, the ping trick exists for
+   Linux policy routing). Linux stays the reference implementation and
+   sole CI target for now. Gated follow-ups, not commitments: a Windows
+   port (Winsock/`GetAdaptersAddresses`/`GetIpNetTable`, CMake or dual
+   build, CI job, zip-with-DLLs release) only when there is a test machine
+   or a motivated tester with real hardware - the community is
+   Windows-heavy, but an unverifiable port rots; a macOS port (mostly
+   builds as-is, BSD sockets + `getifaddrs`) only on request.
+2. **Gamepad -> machine:input joysticks**: SDL_Gamepad (SDL_INIT_GAMEPAD,
+   hotplug), d-pad + digitalized left stick -> directions, A = fire, B = up
+   as an option (platformers jump via up), events POSTed as
+   `{"kind":"joystick","port":N,...}` through the existing minput plumbing
+   (probe, release_all, fallback counters). Must include a port-swap
+   key/flag: games split between ports 1 and 2. Dormant until official
+   firmware ships `machine:input` (404 on 1.1.0, verified; no fallback
+   exists - games read the CIA lines directly). Testable now: unit tests
+   for mapping/JSON, integration via fakeultimate, SDL virtual gamepads
+   for synthetic input. The new Steam Controller is SDL's job: support
+   comes from SDL3's HIDAPI drivers + mapping db (worst case Steam udev
+   rules or SDL_GAMECONTROLLERCONFIG); code against generic SDL_Gamepad.
+
+Dormant follow-up: when official firmware ships `machine:input`, re-verify
+the matrix-keyboard mapping against real hardware and activate the gamepad
+path alongside it.
