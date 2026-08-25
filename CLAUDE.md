@@ -11,10 +11,11 @@ Single binary, two dependencies (SDL3, libcurl):
 
 ```
 src/main.c   event loop, sockets, audio, REST keepalive, rendering
+src/keys.c   PC key -> PETSCII / C64 matrix maps + the viewer key-binding
+             table (viewer_bindings drives dispatch, F10 overlay, --help)
 src/discover.c  /v1/info sweep of the local /24s (SDL-free, curl multi)
 src/video.c  VIC frame assembly (SDL-free, unit-tested)
 src/term.c   minimal VT100 emulator matched to the firmware's remote screen
-src/keys.c   PC key -> PETSCII mapping
 src/font8x8.h  public-domain 8x8 bitmap font (rendering for term.c)
 ```
 
@@ -121,9 +122,6 @@ on every push and PR.
 
 ## Roadmap
 
-1. **Help overlay**: F10 toggles an in-window key reference rendered with the
-   existing font8x8.h path (no new dependencies). Drive both the overlay text
-   and the event dispatch from one static key-binding table so the help can
-   never drift from the actual bindings; also print the same table on
-   `--help`. F10 is the natural key: F1-F8 belong to the C64, F9 is the menu
-   view.
+All six 2026-08 roadmap milestones (discovery, multicast, machine:input,
+machine control + password, drag-and-drop run, help overlay) are shipped.
+Next candidates live in the issue tracker, not here.

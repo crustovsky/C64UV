@@ -138,3 +138,13 @@ grep -q "POST /v1/runners:sidplay body=32" "$out/disc.log"
 touch "$out/note.txt"
 ./c64uv --host 127.0.0.42:8064 --run "$out/note.txt" 2>/dev/null && exit 1
 echo "file run test passed"
+
+# ---------------------------------------------------------------------- help
+# --help must print the shared binding table (same rows the F10 overlay
+# renders), so a missing row here means the overlay lost it too.
+
+./c64uv --help 2> "$out/help.out" || true
+grep -q "F10" "$out/help.out"
+grep -q "Ctrl+Shift+R" "$out/help.out"
+grep -q "RUN/STOP" "$out/help.out"
+echo "help test passed"

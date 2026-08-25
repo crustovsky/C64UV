@@ -102,6 +102,40 @@ bool matrix_event_json(const char *names[], int n, const char *transition,
     return w > 0 && (size_t)w < cap;
 }
 
+const struct viewer_binding viewer_bindings[] = {
+    {0, 0, "any typing", "typed into the C64; Shift graphics", VA_INFO},
+    {0, 0, "Esc", "RUN/STOP", VA_INFO},
+    {0, 0, "F1-F8, cursors, Home", "the matching C64 keys", VA_INFO},
+    {0, 0, "Tab / PgUp", "C64 CTRL / RESTORE (matrix mode)", VA_INFO},
+    {0, 0, "file drop", "run a .prg/.crt/.sid on the machine", VA_INFO},
+    {SDLK_F9, 0, "F9", "toggle the Ultimate menu view", VA_MENU_VIEW},
+    {SDLK_F10, 0, "F10", "show/hide this help", VA_HELP},
+    {SDLK_R, SDL_KMOD_CTRL, "Ctrl+R", "reset the C64", VA_RESET},
+    {SDLK_R, SDL_KMOD_CTRL | SDL_KMOD_SHIFT, "Ctrl+Shift+R",
+     "reboot the Ultimate", VA_REBOOT},
+    {SDLK_P, SDL_KMOD_CTRL, "Ctrl+P", "pause/resume the machine", VA_PAUSE},
+    {SDLK_M, SDL_KMOD_CTRL, "Ctrl+M", "press the Ultimate's menu button",
+     VA_MENU_BTN},
+    {SDLK_Q, SDL_KMOD_CTRL, "Ctrl+Q", "quit", VA_QUIT},
+};
+const int viewer_bindings_count =
+    (int)(sizeof viewer_bindings / sizeof viewer_bindings[0]);
+
+enum viewer_action viewer_binding_match(SDL_Keycode key, SDL_Keymod mod)
+{
+    SDL_Keymod m = 0; // collapse left/right variants, ignore other mods
+    if (mod & SDL_KMOD_CTRL)
+        m |= SDL_KMOD_CTRL;
+    if (mod & SDL_KMOD_SHIFT)
+        m |= SDL_KMOD_SHIFT;
+    for (int i = 0; i < viewer_bindings_count; i++) {
+        const struct viewer_binding *b = &viewer_bindings[i];
+        if (b->action != VA_INFO && b->key == key && b->mod == m)
+            return b->action;
+    }
+    return VA_NONE;
+}
+
 int special_to_petscii(SDL_Keycode key, SDL_Keymod mod)
 {
     switch (key) {

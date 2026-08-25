@@ -186,6 +186,32 @@ static void test_matrix_keys(void)
     CHECK(!matrix_event_json(one, 1, "press", buf, 16)); // too small
 }
 
+static void test_bindings(void)
+{
+    // dispatch side of the shared table
+    CHECK(viewer_binding_match(SDLK_Q, SDL_KMOD_LCTRL) == VA_QUIT);
+    CHECK(viewer_binding_match(SDLK_R, SDL_KMOD_LCTRL) == VA_RESET);
+    CHECK(viewer_binding_match(SDLK_R, SDL_KMOD_LCTRL | SDL_KMOD_LSHIFT) ==
+          VA_REBOOT);
+    CHECK(viewer_binding_match(SDLK_R, 0) == VA_NONE); // plain R types
+    CHECK(viewer_binding_match(SDLK_F9, 0) == VA_MENU_VIEW);
+    CHECK(viewer_binding_match(SDLK_F10, 0) == VA_HELP);
+    CHECK(viewer_binding_match(SDLK_F10, SDL_KMOD_NUM) == VA_HELP); // stray mod
+    CHECK(viewer_binding_match(SDLK_M, SDL_KMOD_RCTRL) == VA_MENU_BTN);
+
+    // table integrity: every row renders in help, no dispatch collisions
+    for (int i = 0; i < viewer_bindings_count; i++) {
+        const struct viewer_binding *b = &viewer_bindings[i];
+        CHECK(b->label && b->label[0] && b->desc && b->desc[0]);
+        CHECK(b->action != VA_NONE);
+        CHECK((b->action == VA_INFO) == (b->key == 0));
+        for (int j = i + 1; j < viewer_bindings_count; j++)
+            if (b->action != VA_INFO && viewer_bindings[j].action != VA_INFO)
+                CHECK(b->key != viewer_bindings[j].key ||
+                      b->mod != viewer_bindings[j].mod);
+    }
+}
+
 static void test_json(void)
 {
     // shaped like a real /v1/info response
@@ -212,6 +238,7 @@ int main(void)
     test_video_assembly();
     test_petscii();
     test_matrix_keys();
+    test_bindings();
     test_json();
     if (failures) {
         fprintf(stderr, "%d check(s) FAILED\n", failures);

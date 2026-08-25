@@ -74,6 +74,7 @@ refuses to start a stream toward an address missing from its ARP table.
 | Esc | RUN/STOP |
 | F1–F8, cursors, Home, Del/Ins | the corresponding C64 keys |
 | **F9** | toggle the Ultimate menu view |
+| **F10** | in-window key reference (same table as `--help`) |
 | Ctrl+R / Ctrl+Shift+R | reset / reboot the machine |
 | Ctrl+P | pause / resume the machine |
 | Ctrl+M | press the Ultimate's menu button |

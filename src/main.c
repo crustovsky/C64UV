@@ -629,6 +629,35 @@ static int run_term_test(const char *host)
     return 0;
 }
 
+// ------------------------------------------------------------- help overlay
+//
+// The F10 view reuses the terminal grid renderer: fill a struct term with
+// the binding table and let term_render paint it. No new drawing code.
+
+static void help_text(struct term *t, int row, int col, uint8_t color,
+                      const char *s)
+{
+    for (; *s && col < TERM_COLS; col++, s++) {
+        t->ch[row][col] = *s;
+        t->fg[row][col] = color;
+    }
+}
+
+static void help_fill(struct term *t)
+{
+    term_init(t);
+    help_text(t, 1, 25, 1, "c64uv keys");
+    int row = 3;
+    for (int i = 0; i < viewer_bindings_count && row < TERM_ROWS - 2; i++) {
+        help_text(t, row, 3, 7, viewer_bindings[i].label);
+        help_text(t, row, 25, 15, viewer_bindings[i].desc);
+        row++;
+    }
+    help_text(t, TERM_ROWS - 2, 3, 12, "F10 or Esc closes this help");
+    t->cx = -1; // keep term_render's cursor cell off the grid
+    t->dirty = true;
+}
+
 // ---------------------------------------------------------------- main
 
 static void usage(const char *argv0)
@@ -655,6 +684,10 @@ static void usage(const char *argv0)
             "  --term-test  print the telnet menu screen as text, then exit\n"
             "  --discover  scan the local subnets for Ultimates, then exit\n",
             argv0);
+    fprintf(stderr, "keys in the viewer window (F10 shows this in-window):\n");
+    for (int i = 0; i < viewer_bindings_count; i++)
+        fprintf(stderr, "  %-22s%s\n", viewer_bindings[i].label,
+                viewer_bindings[i].desc);
 }
 
 int main(int argc, char **argv)
@@ -695,6 +728,9 @@ int main(int argc, char **argv)
             cfg.verbose = true;
         else if (!strcmp(argv[i], "--version")) {
             puts("c64uv " C64UV_VERSION);
+            return 0;
+        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            usage(argv[0]);
             return 0;
         } else {
             usage(argv[0]);
@@ -963,6 +999,10 @@ int main(int argc, char **argv)
     // Ultimate menu terminal (F9). Connected lazily on first toggle.
     struct term *trm = calloc(1, sizeof *trm);
     term_init(trm);
+    // Help overlay (F10) borrows the same grid renderer.
+    struct term *help_scr = calloc(1, sizeof *help_scr);
+    term_init(help_scr);
+    bool help_active = false;
     bool term_active = false, term_present = false;
     int tfd = -1;
     Uint64 tfd_last_try = 0;
@@ -995,20 +1035,30 @@ int main(int argc, char **argv)
                 if (ev.type == SDL_EVENT_QUIT) {
                     atomic_store(&g_quit, true);
                 } else if (ev.type == SDL_EVENT_KEY_DOWN) {
-                    if ((ev.key.mod & SDL_KMOD_CTRL) && ev.key.key == SDLK_Q) {
+                    enum viewer_action va =
+                        viewer_binding_match(ev.key.key, ev.key.mod);
+                    if (va == VA_QUIT) {
                         atomic_store(&g_quit, true);
-                    } else if ((ev.key.mod & SDL_KMOD_CTRL) &&
-                               ev.key.key == SDLK_R && !cfg.no_start) {
-                        machine_ctl(cfg.host, (ev.key.mod & SDL_KMOD_SHIFT)
-                                                  ? "reboot" : "reset");
-                    } else if ((ev.key.mod & SDL_KMOD_CTRL) &&
-                               ev.key.key == SDLK_P && !cfg.no_start) {
+                    } else if (va == VA_HELP) {
+                        help_active = !help_active;
+                        if (help_active)
+                            help_fill(help_scr);
+                        term_present = true;
+                    } else if (help_active) {
+                        if (ev.key.key == SDLK_ESCAPE) {
+                            help_active = false;
+                            term_present = true;
+                        } // anything else stays local while help is up
+                    } else if (va == VA_RESET && !cfg.no_start) {
+                        machine_ctl(cfg.host, "reset");
+                    } else if (va == VA_REBOOT && !cfg.no_start) {
+                        machine_ctl(cfg.host, "reboot");
+                    } else if (va == VA_PAUSE && !cfg.no_start) {
                         paused = !paused;
                         machine_ctl(cfg.host, paused ? "pause" : "resume");
-                    } else if ((ev.key.mod & SDL_KMOD_CTRL) &&
-                               ev.key.key == SDLK_M && !cfg.no_start) {
+                    } else if (va == VA_MENU_BTN && !cfg.no_start) {
                         machine_ctl(cfg.host, "menu_button");
-                    } else if (ev.key.key == SDLK_F9 && !cfg.no_start) {
+                    } else if (va == VA_MENU_VIEW && !cfg.no_start) {
                         term_active = !term_active;
                         term_present = true; // repaint whichever view we enter
                         if (term_active && atomic_load(&g_minput) == 1)
@@ -1054,7 +1104,7 @@ int main(int argc, char **argv)
                 } else if (ev.type == SDL_EVENT_DROP_FILE) {
                     if (!cfg.no_start && ev.drop.data)
                         run_file_async(cfg.host, ev.drop.data);
-                } else if (ev.type == SDL_EVENT_TEXT_INPUT) {
+                } else if (ev.type == SDL_EVENT_TEXT_INPUT && !help_active) {
                     for (const char *p = ev.text.text; *p; p++) {
                         if (term_active) {
                             if ((unsigned char)*p < 128 && tfd >= 0 &&
@@ -1126,15 +1176,17 @@ int main(int argc, char **argv)
             frame_done = video_handle_packet(pkt, n, fb);
         }
 
-        if (windowed && term_active && (trm->dirty || term_present)) {
+        struct term *view = help_active ? help_scr : trm;
+        if (windowed && (term_active || help_active) &&
+            (view->dirty || term_present)) {
             if (!term_tex) {
                 term_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
                                              SDL_TEXTUREACCESS_STREAMING,
                                              TERM_PX_W, TERM_PX_H);
                 SDL_SetTextureScaleMode(term_tex, SDL_SCALEMODE_NEAREST);
             }
-            term_render(trm, term_px, TERM_PX_W);
-            trm->dirty = false;
+            term_render(view, term_px, TERM_PX_W);
+            view->dirty = false;
             term_present = false;
             SDL_UpdateTexture(term_tex, NULL, term_px,
                               TERM_PX_W * (int)sizeof(Uint32));
@@ -1176,7 +1228,7 @@ int main(int argc, char **argv)
                 SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
                 tex_h = fb->height;
             }
-            if (!term_active) {
+            if (!term_active && !help_active) {
                 SDL_UpdateTexture(tex, NULL, fb->px, VIDEO_MAX_W * sizeof(Uint32));
                 SDL_SetRenderLogicalPresentation(
                     ren, fb->width, fb->height,
@@ -1215,6 +1267,7 @@ int main(int argc, char **argv)
         SDL_DestroyTexture(term_tex);
     free(term_px);
     free(trm);
+    free(help_scr);
     if (astream)
         SDL_DestroyAudioStream(astream);
     if (asock >= 0)
