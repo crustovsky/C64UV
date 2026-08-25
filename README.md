@@ -24,6 +24,15 @@ cable.
 - **Ultimate menu** - press **F9** to flip to the Ultimate's own menu (file
   browser, disk mounting, configuration) rendered via its telnet remote
   screen; F9 again returns to the C64.
+- **Discovery** - run it with no address and it finds the Ultimate on your
+  LAN (preferring its wired interface, the one that can stream).
+- **Run files** - drop a `.prg`, `.crt`, or `.sid` onto the window (or
+  `--run file`) and the machine runs it, cartridge-safe.
+- **Machine control** - reset, reboot, pause/resume, and menu button as
+  hotkeys or one-shot `--do` commands; F10 shows the in-window key
+  reference.
+- **Shareable streams** - `--multicast` lets any number of viewers watch
+  the same machine.
 
 ## Requirements
 
@@ -54,7 +63,13 @@ though wired is smoother - the streams total ~22 Mbit/s.)
 ```sh
 make
 ./c64uv --host 192.168.1.64        # or: export C64U_HOST=192.168.1.64
+./c64uv                            # no address? it scans your LAN for one
 ```
+
+With no `--host` (and no `C64U_HOST`) the viewer sweeps your local /24
+subnets with one `/v1/info` request per address and uses the Ultimate it
+finds; `--discover` runs the same scan, lists every Ultimate on the
+network, and exits.
 
 The viewer asks the Ultimate to send its streams to your PC's address on the
 Ultimate's subnet (auto-detected, wired interfaces preferred; override with
@@ -68,7 +83,34 @@ refuses to start a stream toward an address missing from its ARP table.
 | Esc | RUN/STOP |
 | F1–F8, cursors, Home, Del/Ins | the corresponding C64 keys |
 | **F9** | toggle the Ultimate menu view |
+| **F10** | in-window key reference (same table as `--help`) |
+| Ctrl+R / Ctrl+Shift+R | reset / reboot the machine |
+| Ctrl+P | pause / resume the machine |
+| Ctrl+M | press the Ultimate's menu button |
 | Ctrl+Q | quit |
+
+**Drop a `.prg`, `.crt`, or `.sid` file onto the window** and the Ultimate
+runs it (DMA program run, cartridge run, or SID player). If a cartridge is
+configured on the machine, it is parked for the run and restored afterwards,
+so a freezer cart won't hijack the program's reset; the cart is back on your
+next manual reset. The same works headless: `c64uv --run game.prg`.
+
+The same machine controls work headless: `c64uv --do reset` (also `reboot`,
+`pause`, `resume`, `menu`, `poweroff`) issues one REST call and exits. If
+your Ultimate has a network password set (firmware 3.12+), pass it with
+`--password` or the `C64U_PASSWORD` environment variable; it is sent as the
+`X-Password` header on every request, discovery included.
+
+### Several viewers, one Ultimate
+
+The Ultimate streams to a single destination, so normally the first viewer
+wins. `--multicast` asks it to stream to multicast groups instead
+(239.0.1.64 video, 239.0.1.65 audio): every viewer started with
+`--multicast` joins the groups and shows the same machine, and c64uv can
+share the stream with other multicast-aware tools watching the same groups.
+A custom group works too: `--dest 239.x.y.z` joins that group for video and
+group + 1 for audio. When one multicast viewer quits it stops the stream,
+and the remaining viewers' keepalive restarts it within 5 s (a short blip).
 
 The menu view is its own remote session on the firmware side: after you launch
 something from it (Run Disk, Run Program), the menu stays where it was and the
@@ -76,10 +118,10 @@ viewer does not switch on its own - press F9 to flip back to the C64 screen
 and watch it boot.
 
 Useful flags: `--no-audio`, `--no-keyb`, `--scale N` (window size),
-`--verbose` (fps/packet/latency stats), `--dump f.ppm` (grab one frame
-headless), `--term-test` (print the menu screen as text and exit),
-`--no-start` (listen only; pair with `tools/mockstream.py` to develop with no
-hardware).
+`--discover` (list Ultimates on the network and exit), `--verbose`
+(fps/packet/latency stats), `--dump f.ppm` (grab one frame headless),
+`--term-test` (print the menu screen as text and exit), `--no-start` (listen
+only; pair with `tools/mockstream.py` to develop with no hardware).
 
 ### Installing
 
@@ -92,14 +134,18 @@ terminal.
 
 ## Limitations
 
-- Typed input goes through the KERNAL keyboard buffer, so it works for BASIC,
-  the READY prompt, and anything reading input normally - **not** for games
-  that scan the keyboard matrix directly. Hardware-level injection
-  (`machine:input`) exists in upstream firmware betas and will be adopted once
-  it ships in the official Commodore firmware.
+- On current official firmware, typed input goes through the KERNAL keyboard
+  buffer: it works for BASIC, the READY prompt, and anything reading input
+  normally - **not** for games that scan the keyboard matrix directly. The
+  viewer probes for the hardware-level `machine:input` API (in upstream
+  firmware betas) on every start and switches to true matrix-level
+  press/release automatically once your firmware has it; games, chords, and
+  held keys then work, with Tab acting as the C64 CTRL key and PageUp as
+  RESTORE.
 - The Ultimate's menu overlay is not part of the VIC stream - that's what the
   F9 telnet view is for.
-- IPv4 only; one viewer per Ultimate (the device streams to one destination).
+- IPv4 only. The device streams to one destination, so it's one viewer per
+  Ultimate unless everyone uses `--multicast`.
 
 ## How it talks to the machine
 

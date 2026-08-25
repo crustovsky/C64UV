@@ -3,17 +3,21 @@
 // Streams the Ultimate's video/audio into an SDL3 window, forwards keystrokes,
 // and shows the Ultimate menu over telnet. Protocol notes live in CLAUDE.md.
 
+#define _DEFAULT_SOURCE // struct ip_mreq with -std=c11
+
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.1.2"
+#define C64UV_VERSION "0.2.0"
 
+#include "discover.h"
 #include "keys.h"
 #include "term.h"
 #include "video.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
@@ -28,14 +32,19 @@
 
 struct config {
     const char *host;       // Ultimate hostname/IP for REST
+    const char *password;   // network password -> X-Password header
+    const char *do_action;  // one-shot machine control, then exit
+    const char *run_path;   // one-shot: run this .prg/.crt/.sid, then exit
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
     int listen_port;        // video; audio uses listen_port + 1
     int scale;
+    bool multicast;         // stream to the 239.0.1.64/.65 groups
     bool no_start;          // don't touch REST (mock/local testing)
     bool no_audio;
     bool no_keyb;
     const char *dump_path;  // write first complete frame as PPM and exit
     bool term_test;         // headless telnet check: dump menu grid, exit
+    bool discover;          // sweep the local subnets for Ultimates and exit
     bool verbose;
 };
 
@@ -57,12 +66,18 @@ static int tcp_connect_to(const char *host, Uint16 port, int timeout_s)
 }
 
 static atomic_bool g_quit;
+// machine:input capability (probed once per session): -1 unknown, 0 no, 1 yes
+static atomic_int g_minput = -1;
+// Network password (firmware 3.12+), sent as X-Password on every REST call.
+// Set once at startup, before any thread starts.
+static const char *g_password;
 
 // ---------------------------------------------------------------- REST control
 
 struct rest_ctx {
     char start_url[2][256]; // [0] video, [1] audio
     char stop_url[2][256];
+    char input_url[256];    // machine:input, probed for capability
     int nstreams;
     int sock;                    // our UDP socket, for the ARP-priming packet
     struct sockaddr_in ult_addr; // Ultimate's address
@@ -81,21 +96,46 @@ static size_t curl_sink(char *data, size_t size, size_t nmemb, void *userp)
     return n;
 }
 
-// Returns HTTP status, or -1 on transport error. Response body (truncated) in resp.
-static long rest_put(CURL *curl, const char *url, char *resp)
+// Returns HTTP status, or -1 on transport error. Response body (truncated) in
+// resp. A non-NULL body of body_len bytes is sent with the given ctype.
+static long rest_req(CURL *curl, const char *method, const char *url,
+                     const void *body, long body_len, const char *ctype,
+                     long timeout_ms, char *resp)
 {
     resp[0] = '\0';
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000L);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_sink);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
-    if (curl_easy_perform(curl) != CURLE_OK)
+    struct curl_slist *hdrs = NULL;
+    if (body) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, body_len);
+        char cthdr[64];
+        snprintf(cthdr, sizeof cthdr, "Content-Type: %s", ctype);
+        hdrs = curl_slist_append(hdrs, cthdr);
+    }
+    if (g_password) {
+        char pwhdr[160];
+        snprintf(pwhdr, sizeof pwhdr, "X-Password: %s", g_password);
+        hdrs = curl_slist_append(hdrs, pwhdr);
+    }
+    if (hdrs)
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    if (res != CURLE_OK)
         return -1;
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     return code;
+}
+
+static long rest_put(CURL *curl, const char *url, char *resp)
+{
+    return rest_req(curl, "PUT", url, NULL, 0, NULL, 3000, resp);
 }
 
 // Keepalive thread: re-issue the start command every 5 s so the stream survives
@@ -119,6 +159,20 @@ static int keepalive_thread(void *arg)
         else
             sendto(rc->sock, "", 1, 0, (struct sockaddr *)&rc->ult_addr,
                    sizeof rc->ult_addr);
+        // Capability probe (GET is side-effect free), retried until the
+        // machine gives an HTTP answer, then cached for the session.
+        if (rc->input_url[0] && atomic_load(&g_minput) < 0) {
+            long code = rest_req(curl, "GET", rc->input_url, NULL, 0, NULL,
+                                 3000, resp);
+            if (code == 200) {
+                atomic_store(&g_minput, 1);
+                SDL_Log("machine:input available: matrix-level keyboard");
+            } else if (code > 0) {
+                atomic_store(&g_minput, 0);
+                SDL_Log("machine:input not supported (HTTP %ld): typing goes "
+                        "via the KERNAL buffer", code);
+            }
+        }
         for (int i = 0; i < rc->nstreams; i++) {
             long code = rest_put(curl, rc->start_url[i], resp);
             if (code != last_code[i]) { // log only on state change
@@ -173,6 +227,39 @@ static bool find_lan_iface(const char *host, char *ip, size_t iplen,
     }
     freeifaddrs(ifs);
     return found;
+}
+
+// ------------------------------------------------------------- multicast
+//
+// The Ultimate happily streams to a multicast group, which lifts the
+// one-viewer-per-Ultimate limitation: every viewer joins the group and asks
+// the Ultimate to stream there (the start command is idempotent for the same
+// destination). Convention (from prkl_ultimate): video group, audio group =
+// video + 1 on the last octet.
+
+static bool is_multicast_ip(const char *s)
+{
+    struct in_addr a;
+    return inet_pton(AF_INET, s, &a) == 1 && IN_MULTICAST(ntohl(a.s_addr));
+}
+
+static void mcast_next_group(const char *video, char *audio, size_t cap)
+{
+    struct in_addr a;
+    inet_pton(AF_INET, video, &a);
+    a.s_addr = htonl(ntohl(a.s_addr) + 1);
+    inet_ntop(AF_INET, &a, audio, (socklen_t)cap);
+}
+
+// Joins on the given interface address (NULL = kernel picks by route).
+static bool mcast_join(int sock, const char *group, const char *ifip)
+{
+    struct ip_mreq m = {0};
+    if (inet_pton(AF_INET, group, &m.imr_multiaddr) != 1)
+        return false;
+    if (ifip)
+        inet_pton(AF_INET, ifip, &m.imr_interface);
+    return setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) == 0;
 }
 
 // Fallback: connect a UDP socket toward the Ultimate and read back the source
@@ -253,6 +340,261 @@ static void keyb_stop(struct keyb *k)
         keyb_raw(k, 0xFF06, poke, sizeof poke);
 }
 
+// ------------------------------------------------------- machine control
+//
+// Single REST calls: PUT /v1/machine:<action>. Shared by the Ctrl hotkeys
+// and the one-shot --do flag.
+
+static const char *const machine_actions[] = {
+    "reset", "reboot", "pause", "resume", "menu_button", "poweroff", NULL,
+};
+
+static bool machine_ctl(const char *host, const char *action)
+{
+    static CURL *curl; // hotkeys reuse the connection
+    if (!curl)
+        curl = curl_easy_init();
+    char url[256], resp[512];
+    snprintf(url, sizeof url, "http://%s/v1/machine:%s", host, action);
+    long code = rest_req(curl, "PUT", url, NULL, 0, NULL, 3000, resp);
+    if (code == 200)
+        SDL_Log("machine:%s OK", action);
+    else if (code == -1)
+        SDL_Log("machine:%s: no response from Ultimate", action);
+    else
+        SDL_Log("machine:%s HTTP %ld: %s", action, code, resp);
+    return code == 200;
+}
+
+// --------------------------------------------------------------- file runner
+//
+// POST a .prg/.crt/.sid to the matching runners: endpoint. Verified on real
+// firmware 1.1.0: run_prg takes the raw file as the request body, then the
+// firmware itself resets the machine, types LOAD"/TEMP/TEMP0000",8,1 and
+// RUN. Because that internal reset would boot a configured freezer cart
+// into its menu instead, the Cartridge config item is blanked first and
+// restored only after the machine came back up (config applies at reset
+// time, so the program keeps running with the cart parked).
+
+#define CART_CFG_PATH "configs/C64%20and%20Cartridge%20Settings/Cartridge"
+
+static const char *runner_for(const char *path)
+{
+    const char *dot = strrchr(path, '.');
+    if (!dot)
+        return NULL;
+    if (!strcasecmp(dot, ".prg"))
+        return "run_prg";
+    if (!strcasecmp(dot, ".crt"))
+        return "run_crt";
+    if (!strcasecmp(dot, ".sid"))
+        return "sidplay";
+    return NULL;
+}
+
+struct binbuf {
+    uint8_t data[16];
+    int len;
+};
+
+static size_t bin_sink(char *d, size_t size, size_t nmemb, void *userp)
+{
+    struct binbuf *b = userp;
+    size_t n = size * nmemb;
+    for (size_t i = 0; i < n && b->len < (int)sizeof b->data; i++)
+        b->data[b->len++] = (uint8_t)d[i];
+    return n;
+}
+
+// Readiness gate: the KERNAL zeroes $CC when it sits at a prompt with the
+// cursor flashing. Two consecutive ready reads guard against sampling a
+// transient zero mid-boot; the timeout covers programs that never return
+// to the prompt (games) - by then the internal reset is long done.
+static void wait_kernal_ready(CURL *curl, const char *host, int max_ms)
+{
+    char url[256];
+    snprintf(url, sizeof url,
+             "http://%s/v1/machine:readmem?address=00CC&length=1", host);
+    int ready = 0;
+    for (int t = 0; t < max_ms && ready < 2; t += 500) {
+        struct binbuf b = {.len = 0};
+        curl_easy_reset(curl);
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 1000L);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, bin_sink);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
+        struct curl_slist *hdrs = NULL;
+        if (g_password) {
+            char pwhdr[160];
+            snprintf(pwhdr, sizeof pwhdr, "X-Password: %s", g_password);
+            hdrs = curl_slist_append(NULL, pwhdr);
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+        }
+        bool ok = curl_easy_perform(curl) == CURLE_OK;
+        curl_slist_free_all(hdrs);
+        if (ok && b.len >= 1 && b.data[0] == 0)
+            ready++;
+        else
+            ready = 0;
+        SDL_Delay(500);
+    }
+}
+
+static bool run_file(const char *host, const char *path)
+{
+    const char *ep = runner_for(path);
+    if (!ep) {
+        SDL_Log("%s: only .prg, .crt and .sid files can be run", path);
+        return false;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        SDL_Log("%s: %s", path, strerror(errno));
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0 || len > 2 << 20) { // largest sensible .crt is ~1 MB
+        SDL_Log("%s: unreasonable file size (%ld)", path, len);
+        fclose(f);
+        return false;
+    }
+    uint8_t *data = malloc((size_t)len);
+    bool readok = data && fread(data, 1, (size_t)len, f) == (size_t)len;
+    fclose(f);
+    if (!readok) {
+        SDL_Log("%s: short read", path);
+        free(data);
+        return false;
+    }
+
+    CURL *curl = curl_easy_init();
+    char url[512], resp[512];
+    // cartridge parking (not for .crt: that one runs a cart on purpose)
+    char cart[128];
+    bool parked = false;
+    if (strcmp(ep, "run_crt") != 0) {
+        snprintf(url, sizeof url, "http://%s/v1/%s", host, CART_CFG_PATH);
+        if (rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp) == 200 &&
+            json_find_str(resp, "current", cart, sizeof cart) && cart[0]) {
+            char blank[560];
+            snprintf(blank, sizeof blank, "%s?value=", url);
+            parked = rest_put(curl, blank, resp) == 200;
+            SDL_Log("cartridge '%s' parked for the run%s", cart,
+                    parked ? "" : " FAILED");
+        }
+    }
+
+    snprintf(url, sizeof url, "http://%s/v1/runners:%s", host, ep);
+    // generous timeout: the firmware saves the file before answering
+    long code = rest_req(curl, "POST", url, data, len, "application/octet-stream",
+                         15000, resp);
+    free(data);
+    if (code == 200)
+        SDL_Log("runners:%s %s OK (%ld bytes)", ep, path, len);
+    else if (code == -1)
+        SDL_Log("runners:%s: no response from Ultimate", ep);
+    else
+        SDL_Log("runners:%s HTTP %ld: %s", ep, code, resp);
+
+    if (parked) {
+        wait_kernal_ready(curl, host, 10000);
+        char restore[560], *esc = curl_easy_escape(curl, cart, 0);
+        snprintf(restore, sizeof restore, "http://%s/v1/%s?value=%s", host,
+                 CART_CFG_PATH, esc ? esc : "");
+        curl_free(esc);
+        if (rest_put(curl, restore, resp) == 200)
+            SDL_Log("cartridge '%s' restored (applies at next reset)", cart);
+        else
+            SDL_Log("cartridge restore FAILED - check the Ultimate's "
+                    "Cartridge setting");
+    }
+    curl_easy_cleanup(curl);
+    return code == 200;
+}
+
+// Drag-and-drop runs on a worker thread: the whole sequence can take
+// seconds and must not freeze the viewer.
+static atomic_bool g_run_busy;
+struct runjob {
+    char host[64];
+    char path[1024];
+};
+
+static int run_thread(void *arg)
+{
+    struct runjob *j = arg;
+    run_file(j->host, j->path);
+    free(j);
+    atomic_store(&g_run_busy, false);
+    return 0;
+}
+
+static void run_file_async(const char *host, const char *path)
+{
+    if (atomic_exchange(&g_run_busy, true)) {
+        SDL_Log("still busy with the previous file");
+        return;
+    }
+    struct runjob *j = malloc(sizeof *j);
+    snprintf(j->host, sizeof j->host, "%s", host);
+    snprintf(j->path, sizeof j->path, "%s", path);
+    SDL_DetachThread(SDL_CreateThread(run_thread, "runfile", j));
+}
+
+// ----------------------------------------------- matrix keyboard (REST)
+//
+// When the firmware supports machine:input (probed by the keepalive thread),
+// key presses and releases go to the CIA1 matrix instead of the KERNAL
+// buffer: games, chords, and held keys work. Sent synchronously from the
+// event loop with a short timeout; repeated transport failures flip the
+// session back to the buffer path.
+
+struct minput {
+    CURL *curl;
+    char url[256];
+    int fails;
+};
+
+static void minput_post(struct minput *mi, const char *body)
+{
+    if (!mi->curl)
+        mi->curl = curl_easy_init();
+    char resp[512];
+    if (rest_req(mi->curl, "POST", mi->url, body, (long)strlen(body),
+                 "application/json", 250, resp) == -1) {
+        if (++mi->fails >= 3) {
+            atomic_store(&g_minput, 0);
+            SDL_Log("machine:input unreachable, falling back to the KERNAL "
+                    "buffer");
+        }
+    } else {
+        mi->fails = 0;
+    }
+}
+
+static void minput_key(struct minput *mi, SDL_Keycode key, bool down)
+{
+    const char *names[2];
+    int n = key_to_c64_matrix(key, names);
+    if (n == 0)
+        return;
+    bool tap = strcmp(names[0], "restore") == 0; // tap-only per the API
+    if (tap && !down)
+        return;
+    char body[192];
+    if (matrix_event_json(names, n, tap ? "tap" : down ? "press" : "release",
+                          body, sizeof body))
+        minput_post(mi, body);
+}
+
+// Fired on focus loss, view switches, and exit so no key stays held down.
+static void minput_release_all(struct minput *mi)
+{
+    minput_post(mi, "{\"events\":[{\"kind\":\"release_all\"}]}");
+}
+
 // ------------------------------------------------------ telnet menu terminal
 //
 // Port 23 mirrors the Ultimate's menu as a VT100 session (src/term.c). The
@@ -287,21 +629,65 @@ static int run_term_test(const char *host)
     return 0;
 }
 
+// ------------------------------------------------------------- help overlay
+//
+// The F10 view reuses the terminal grid renderer: fill a struct term with
+// the binding table and let term_render paint it. No new drawing code.
+
+static void help_text(struct term *t, int row, int col, uint8_t color,
+                      const char *s)
+{
+    for (; *s && col < TERM_COLS; col++, s++) {
+        t->ch[row][col] = *s;
+        t->fg[row][col] = color;
+    }
+}
+
+static void help_fill(struct term *t)
+{
+    term_init(t);
+    help_text(t, 1, 25, 1, "c64uv keys");
+    int row = 3;
+    for (int i = 0; i < viewer_bindings_count && row < TERM_ROWS - 2; i++) {
+        help_text(t, row, 3, 7, viewer_bindings[i].label);
+        help_text(t, row, 25, 15, viewer_bindings[i].desc);
+        row++;
+    }
+    help_text(t, TERM_ROWS - 2, 3, 12, "F10 or Esc closes this help");
+    t->cx = -1; // keep term_render's cursor cell off the grid
+    t->dirty = true;
+}
+
 // ---------------------------------------------------------------- main
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
-            "          [--no-start] [--no-audio] [--no-keyb] [--dump FILE.ppm]\n"
-            "          [--term-test] [--verbose] [--version]\n"
-            "  --host    C64 Ultimate address (or set C64U_HOST)\n"
-            "  --dest    where the Ultimate should send the streams (default: auto)\n"
+            "          [--multicast] [--no-start] [--no-audio] [--no-keyb]\n"
+            "          [--password PW] [--do ACTION] [--dump FILE.ppm]\n"
+            "          [--term-test] [--discover] [--verbose] [--version]\n"
+            "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
+            "auto-discover)\n"
+            "  --dest    where the Ultimate should send the streams (default: auto;\n"
+            "            a multicast address is joined, audio group = video + 1)\n"
             "  --port    local UDP video port; audio uses port+1 (default 11000)\n"
+            "  --multicast  stream via groups 239.0.1.64/.65 so several viewers\n"
+            "            can watch the same Ultimate\n"
+            "  --password  network password (or set C64U_PASSWORD)\n"
+            "  --do      one machine action, then exit: reset reboot pause\n"
+            "            resume menu poweroff\n"
+            "  --run     run a .prg/.crt/.sid on the machine, then exit\n"
+            "            (in the window: drop the file onto it instead)\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
-            "  --term-test  print the telnet menu screen as text, then exit\n",
+            "  --term-test  print the telnet menu screen as text, then exit\n"
+            "  --discover  scan the local subnets for Ultimates, then exit\n",
             argv0);
+    fprintf(stderr, "keys in the viewer window (F10 shows this in-window):\n");
+    for (int i = 0; i < viewer_bindings_count; i++)
+        fprintf(stderr, "  %-22s%s\n", viewer_bindings[i].label,
+                viewer_bindings[i].desc);
 }
 
 int main(int argc, char **argv)
@@ -312,12 +698,20 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--host") && i + 1 < argc)
             cfg.host = argv[++i];
+        else if (!strcmp(argv[i], "--password") && i + 1 < argc)
+            cfg.password = argv[++i];
+        else if (!strcmp(argv[i], "--do") && i + 1 < argc)
+            cfg.do_action = argv[++i];
+        else if (!strcmp(argv[i], "--run") && i + 1 < argc)
+            cfg.run_path = argv[++i];
         else if (!strcmp(argv[i], "--dest") && i + 1 < argc)
             cfg.dest = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc)
             cfg.listen_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc)
             cfg.scale = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--multicast"))
+            cfg.multicast = true;
         else if (!strcmp(argv[i], "--no-start"))
             cfg.no_start = true;
         else if (!strcmp(argv[i], "--no-audio"))
@@ -328,19 +722,102 @@ int main(int argc, char **argv)
             cfg.dump_path = argv[++i];
         else if (!strcmp(argv[i], "--term-test"))
             cfg.term_test = true;
+        else if (!strcmp(argv[i], "--discover"))
+            cfg.discover = true;
         else if (!strcmp(argv[i], "--verbose"))
             cfg.verbose = true;
         else if (!strcmp(argv[i], "--version")) {
             puts("c64uv " C64UV_VERSION);
+            return 0;
+        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            usage(argv[0]);
             return 0;
         } else {
             usage(argv[0]);
             return 2;
         }
     }
+    if (!cfg.password)
+        cfg.password = getenv("C64U_PASSWORD");
+    g_password = cfg.password;
+    if (g_password)
+        setenv("C64U_PASSWORD", g_password, 1); // discovery reads the env
+    if (cfg.do_action) {
+        if (!strcmp(cfg.do_action, "menu"))
+            cfg.do_action = "menu_button";
+        bool known = false;
+        for (int i = 0; machine_actions[i]; i++)
+            known |= !strcmp(cfg.do_action, machine_actions[i]);
+        if (!known) {
+            fprintf(stderr,
+                    "--do: unknown action '%s' (one of: reset reboot pause "
+                    "resume menu poweroff)\n", cfg.do_action);
+            return 2;
+        }
+    }
+
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    if (cfg.discover) {
+        struct discovered found[DISCOVER_MAX];
+        int n = discover_scan(found, DISCOVER_MAX, true);
+        for (int i = 0; i < n; i++)
+            printf("%-15s  %s%s%s  firmware %s%s\n", found[i].ip,
+                   found[i].product, found[i].hostname[0] ? "  " : "",
+                   found[i].hostname, found[i].fw,
+                   discover_ip_is_wired(found[i].ip, "/proc/net/arp")
+                       ? "  (wired)" : "");
+        if (n == 0)
+            fprintf(stderr, "no Ultimate found\n");
+        return n > 0 ? 0 : 1;
+    }
+
+    // No address given: try to find the machine ourselves before giving up.
+    static char auto_host[46];
+    if (!cfg.host && !cfg.no_start) {
+        struct discovered found[DISCOVER_MAX];
+        fprintf(stderr, "no --host given, discovering...\n");
+        int n = discover_scan(found, DISCOVER_MAX, true);
+        if (n >= 1) {
+            // one machine can answer on both WiFi and wired; only warn when
+            // genuinely different machines were found
+            int distinct = 0;
+            for (int i = 0; i < n; i++) {
+                bool dup = false;
+                for (int j = 0; j < i; j++)
+                    dup |= found[i].uid[0] && !strcmp(found[i].uid,
+                                                      found[j].uid);
+                distinct += !dup;
+            }
+            if (distinct > 1) {
+                fprintf(stderr, "found %d Ultimates, using the first; pass "
+                        "--host to pick another:\n", distinct);
+                for (int i = 0; i < n; i++)
+                    fprintf(stderr, "  %-15s  %s\n", found[i].ip,
+                            found[i].hostname);
+            }
+            // Same machine on WiFi + wired: the wired (FPGA) address must
+            // win - only pings to it land in the ARP table the streams
+            // check, so the WiFi address can't start a stream cold.
+            int pick = 0;
+            for (int i = 0; i < n; i++)
+                if ((!found[i].uid[0] ||
+                     !strcmp(found[i].uid, found[0].uid)) &&
+                    discover_ip_is_wired(found[i].ip, "/proc/net/arp")) {
+                    pick = i;
+                    break;
+                }
+            snprintf(auto_host, sizeof auto_host, "%.45s", found[pick].ip);
+            cfg.host = auto_host;
+            fprintf(stderr, "using %s (%s%s%s)\n", found[pick].ip,
+                    found[pick].product, found[pick].hostname[0] ? ", " : "",
+                    found[pick].hostname);
+        }
+    }
     if (!cfg.host && !cfg.no_start) {
         fprintf(stderr,
-                "no Ultimate address: pass --host <ip> or set C64U_HOST\n"
+                "no Ultimate found on your network: pass --host <ip> or set "
+                "C64U_HOST\n"
                 "(find it on the machine: F5 menu on the Ultimate shows its "
                 "IP, or check your router)\n");
         // Launched from a desktop entry there is no terminal to read stderr.
@@ -348,8 +825,9 @@ int main(int argc, char **argv)
             (getenv("DISPLAY") || getenv("WAYLAND_DISPLAY")))
             SDL_ShowSimpleMessageBox(
                 SDL_MESSAGEBOX_ERROR, "Commodore 64 Ultimate Viewer",
-                "No Ultimate address configured.\n\n"
-                "Run from a terminal:  c64uv --host <ip>\n"
+                "No Ultimate found on your network.\n\n"
+                "Check that the machine is powered on, or run from a\n"
+                "terminal:  c64uv --host <ip>\n"
                 "or set C64U_HOST in your environment.\n"
                 "(F5 menu on the Ultimate shows its IP.)",
                 NULL);
@@ -358,19 +836,50 @@ int main(int argc, char **argv)
     if (!cfg.host)
         cfg.host = ""; // --no-start mock mode needs no device
 
+    if (cfg.do_action)
+        return machine_ctl(cfg.host, cfg.do_action) ? 0 : 1;
+
+    if (cfg.run_path)
+        return run_file(cfg.host, cfg.run_path) ? 0 : 1;
+
     if (cfg.term_test)
         return run_term_test(cfg.host);
 
     if (cfg.dump_path)
         cfg.no_audio = true; // headless frame grab needs no sound
 
+    // Work out the stream destination groups before the sockets exist, so the
+    // memberships can be joined right after bind. --dest with a multicast
+    // address behaves like --multicast with custom groups.
+    char mc_video[46] = "", mc_audio[46] = "";
+    if (cfg.multicast) {
+        snprintf(mc_video, sizeof mc_video, "239.0.1.64");
+        snprintf(mc_audio, sizeof mc_audio, "239.0.1.65");
+    } else if (cfg.dest) {
+        char iponly[46];
+        snprintf(iponly, sizeof iponly, "%.*s",
+                 (int)strcspn(cfg.dest, ":"), cfg.dest);
+        if (is_multicast_ip(iponly)) {
+            snprintf(mc_video, sizeof mc_video, "%s", iponly);
+            mcast_next_group(mc_video, mc_audio, sizeof mc_audio);
+        }
+    }
+    // The join must land on the interface the stream arrives on; when the
+    // Ultimate's subnet is ours, use that interface rather than the routing
+    // table's guess (policy routing can point elsewhere).
+    char lan_ip[46], ifname[32] = "";
+    bool on_lan = find_lan_iface(cfg.host, lan_ip, sizeof lan_ip, ifname,
+                                 sizeof ifname);
+
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         perror("socket");
         return 1;
     }
-    int rcvbuf = 1 << 20;
+    int rcvbuf = 1 << 20, one = 1;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+    if (mc_video[0]) // several viewers on one host share the port
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in bind_addr = {.sin_family = AF_INET,
                                     .sin_addr.s_addr = htonl(INADDR_ANY),
                                     .sin_port = htons((Uint16)cfg.listen_port)};
@@ -378,35 +887,51 @@ int main(int argc, char **argv)
         perror("bind");
         return 1;
     }
+    if (mc_video[0] &&
+        !mcast_join(sock, mc_video, on_lan ? lan_ip : NULL)) {
+        perror("multicast join");
+        return 1;
+    }
     int asock = -1;
     if (!cfg.no_audio) {
         asock = socket(AF_INET, SOCK_DGRAM, 0);
         setsockopt(asock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+        if (mc_audio[0])
+            setsockopt(asock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
         struct sockaddr_in aaddr = bind_addr;
         aaddr.sin_port = htons((Uint16)(cfg.listen_port + 1));
         if (bind(asock, (struct sockaddr *)&aaddr, sizeof aaddr) < 0) {
             perror("bind audio");
             return 1;
         }
+        if (mc_audio[0] &&
+            !mcast_join(asock, mc_audio, on_lan ? lan_ip : NULL)) {
+            perror("multicast join audio");
+            return 1;
+        }
     }
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
     struct rest_ctx rc;
     SDL_Thread *ka = NULL;
     if (!cfg.no_start) {
-        char ip[64], lan_ip[46], ifname[32] = "";
-        bool on_lan = find_lan_iface(cfg.host, lan_ip, sizeof lan_ip, ifname,
-                                     sizeof ifname);
-        if (cfg.dest) {
-            snprintf(ip, sizeof ip, "%s", cfg.dest);
-            char *colon = strchr(ip, ':'); // legacy ip:port form
+        char dstv[64], dsta[64];
+        if (mc_video[0]) {
+            snprintf(dstv, sizeof dstv, "%s", mc_video);
+            snprintf(dsta, sizeof dsta, "%s", mc_audio);
+        } else if (cfg.dest) {
+            snprintf(dstv, sizeof dstv, "%s", cfg.dest);
+            char *colon = strchr(dstv, ':'); // legacy ip:port form
             if (colon) {
                 cfg.listen_port = atoi(colon + 1);
                 *colon = '\0';
             }
+            snprintf(dsta, sizeof dsta, "%s", dstv);
         } else if (on_lan) {
-            snprintf(ip, sizeof ip, "%s", lan_ip);
-        } else if (!detect_local_ip(cfg.host, ip, sizeof ip)) {
+            snprintf(dstv, sizeof dstv, "%s", lan_ip);
+            snprintf(dsta, sizeof dsta, "%s", lan_ip);
+        } else if (detect_local_ip(cfg.host, dstv, sizeof dstv)) {
+            snprintf(dsta, sizeof dsta, "%s", dstv);
+        } else {
             fprintf(stderr, "cannot detect local IP; use --dest\n");
             return 1;
         }
@@ -417,15 +942,17 @@ int main(int argc, char **argv)
         else
             rc.prime_cmd[0] = '\0';
         snprintf(rc.start_url[0], sizeof rc.start_url[0],
-                 "http://%s/v1/streams/video:start?ip=%s:%d", cfg.host, ip,
+                 "http://%s/v1/streams/video:start?ip=%s:%d", cfg.host, dstv,
                  cfg.listen_port);
         snprintf(rc.stop_url[0], sizeof rc.stop_url[0],
                  "http://%s/v1/streams/video:stop", cfg.host);
+        snprintf(rc.input_url, sizeof rc.input_url,
+                 "http://%s/v1/machine:input", cfg.host);
         rc.nstreams = 1;
         if (asock >= 0) {
             snprintf(rc.start_url[1], sizeof rc.start_url[1],
-                     "http://%s/v1/streams/audio:start?ip=%s:%d", cfg.host, ip,
-                     cfg.listen_port + 1);
+                     "http://%s/v1/streams/audio:start?ip=%s:%d", cfg.host,
+                     dsta, cfg.listen_port + 1);
             snprintf(rc.stop_url[1], sizeof rc.stop_url[1],
                      "http://%s/v1/streams/audio:stop", cfg.host);
             rc.nstreams = 2;
@@ -435,7 +962,7 @@ int main(int argc, char **argv)
                                            .sin_port = htons(11000)};
         inet_pton(AF_INET, cfg.host, &rc.ult_addr.sin_addr);
         SDL_Log("requesting %s -> %s:%d", asock >= 0 ? "video+audio" : "video",
-                ip, cfg.listen_port);
+                dstv, cfg.listen_port);
         ka = SDL_CreateThread(keepalive_thread, "keepalive", &rc);
     }
 
@@ -473,15 +1000,22 @@ int main(int argc, char **argv)
     }
 
     struct keyb kb = {.fd = -1, .host = cfg.host};
+    struct minput mi = {0};
     if (windowed && !cfg.no_keyb && !cfg.no_start) {
         kb.enabled = true;
         SDL_StartTextInput(win);
         keyb_try_connect(&kb);
+        snprintf(mi.url, sizeof mi.url, "http://%s/v1/machine:input",
+                 cfg.host);
     }
 
     // Ultimate menu terminal (F9). Connected lazily on first toggle.
     struct term *trm = calloc(1, sizeof *trm);
     term_init(trm);
+    // Help overlay (F10) borrows the same grid renderer.
+    struct term *help_scr = calloc(1, sizeof *help_scr);
+    term_init(help_scr);
+    bool help_active = false;
     bool term_active = false, term_present = false;
     int tfd = -1;
     Uint64 tfd_last_try = 0;
@@ -497,6 +1031,7 @@ int main(int argc, char **argv)
     Uint16 aseq_prev = 0;
     bool aseq_valid = false;
     bool got_any = false;
+    bool paused = false; // Ctrl+P toggle state (viewer-side best guess)
     // Audio latency control: startup fill and jitter leave a standing queue
     // that never drains on its own (input and output rates match). A servo on
     // the resample ratio (±2%, inaudible) steers the queue toward ~60 ms;
@@ -513,11 +1048,34 @@ int main(int argc, char **argv)
                 if (ev.type == SDL_EVENT_QUIT) {
                     atomic_store(&g_quit, true);
                 } else if (ev.type == SDL_EVENT_KEY_DOWN) {
-                    if ((ev.key.mod & SDL_KMOD_CTRL) && ev.key.key == SDLK_Q) {
+                    enum viewer_action va =
+                        viewer_binding_match(ev.key.key, ev.key.mod);
+                    if (va == VA_QUIT) {
                         atomic_store(&g_quit, true);
-                    } else if (ev.key.key == SDLK_F9 && !cfg.no_start) {
+                    } else if (va == VA_HELP) {
+                        help_active = !help_active;
+                        if (help_active)
+                            help_fill(help_scr);
+                        term_present = true;
+                    } else if (help_active) {
+                        if (ev.key.key == SDLK_ESCAPE) {
+                            help_active = false;
+                            term_present = true;
+                        } // anything else stays local while help is up
+                    } else if (va == VA_RESET && !cfg.no_start) {
+                        machine_ctl(cfg.host, "reset");
+                    } else if (va == VA_REBOOT && !cfg.no_start) {
+                        machine_ctl(cfg.host, "reboot");
+                    } else if (va == VA_PAUSE && !cfg.no_start) {
+                        paused = !paused;
+                        machine_ctl(cfg.host, paused ? "pause" : "resume");
+                    } else if (va == VA_MENU_BTN && !cfg.no_start) {
+                        machine_ctl(cfg.host, "menu_button");
+                    } else if (va == VA_MENU_VIEW && !cfg.no_start) {
                         term_active = !term_active;
                         term_present = true; // repaint whichever view we enter
+                        if (term_active && atomic_load(&g_minput) == 1)
+                            minput_release_all(&mi); // no keys stay held
                         if (term_active && tfd < 0 &&
                             (tfd_last_try == 0 ||
                              SDL_GetTicks() - tfd_last_try > 3000)) {
@@ -538,7 +1096,10 @@ int main(int argc, char **argv)
                             tfd = -1;
                         }
                     } else if (kb.enabled) {
-                        if (ev.key.key == SDLK_ESCAPE) {
+                        if (atomic_load(&g_minput) == 1) {
+                            if (!ev.key.repeat) // the matrix has no repeat
+                                minput_key(&mi, ev.key.key, true);
+                        } else if (ev.key.key == SDLK_ESCAPE) {
                             keyb_stop(&kb); // Esc = RUN/STOP
                         } else {
                             int c = special_to_petscii(ev.key.key, ev.key.mod);
@@ -546,7 +1107,17 @@ int main(int argc, char **argv)
                                 keyb_type(&kb, (Uint8)c);
                         }
                     }
-                } else if (ev.type == SDL_EVENT_TEXT_INPUT) {
+                } else if (ev.type == SDL_EVENT_KEY_UP) {
+                    if (!term_active && kb.enabled &&
+                        atomic_load(&g_minput) == 1)
+                        minput_key(&mi, ev.key.key, false);
+                } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+                    if (atomic_load(&g_minput) == 1)
+                        minput_release_all(&mi);
+                } else if (ev.type == SDL_EVENT_DROP_FILE) {
+                    if (!cfg.no_start && ev.drop.data)
+                        run_file_async(cfg.host, ev.drop.data);
+                } else if (ev.type == SDL_EVENT_TEXT_INPUT && !help_active) {
                     for (const char *p = ev.text.text; *p; p++) {
                         if (term_active) {
                             if ((unsigned char)*p < 128 && tfd >= 0 &&
@@ -554,7 +1125,9 @@ int main(int argc, char **argv)
                                 close(tfd);
                                 tfd = -1;
                             }
-                        } else if (kb.enabled) {
+                        } else if (kb.enabled &&
+                                   atomic_load(&g_minput) != 1) {
+                            // matrix mode types via key events instead
                             int c = ascii_to_petscii((unsigned char)*p);
                             if (c >= 0)
                                 keyb_type(&kb, (Uint8)c);
@@ -616,15 +1189,17 @@ int main(int argc, char **argv)
             frame_done = video_handle_packet(pkt, n, fb);
         }
 
-        if (windowed && term_active && (trm->dirty || term_present)) {
+        struct term *view = help_active ? help_scr : trm;
+        if (windowed && (term_active || help_active) &&
+            (view->dirty || term_present)) {
             if (!term_tex) {
                 term_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
                                              SDL_TEXTUREACCESS_STREAMING,
                                              TERM_PX_W, TERM_PX_H);
                 SDL_SetTextureScaleMode(term_tex, SDL_SCALEMODE_NEAREST);
             }
-            term_render(trm, term_px, TERM_PX_W);
-            trm->dirty = false;
+            term_render(view, term_px, TERM_PX_W);
+            view->dirty = false;
             term_present = false;
             SDL_UpdateTexture(term_tex, NULL, term_px,
                               TERM_PX_W * (int)sizeof(Uint32));
@@ -666,7 +1241,7 @@ int main(int argc, char **argv)
                 SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
                 tex_h = fb->height;
             }
-            if (!term_active) {
+            if (!term_active && !help_active) {
                 SDL_UpdateTexture(tex, NULL, fb->px, VIDEO_MAX_W * sizeof(Uint32));
                 SDL_SetRenderLogicalPresentation(
                     ren, fb->width, fb->height,
@@ -690,8 +1265,12 @@ int main(int argc, char **argv)
     }
 
     atomic_store(&g_quit, true);
+    if (atomic_load(&g_minput) == 1 && mi.url[0])
+        minput_release_all(&mi);
     if (ka)
         SDL_WaitThread(ka, NULL);
+    if (mi.curl)
+        curl_easy_cleanup(mi.curl);
     curl_global_cleanup();
     if (kb.fd >= 0)
         close(kb.fd);
@@ -701,6 +1280,7 @@ int main(int argc, char **argv)
         SDL_DestroyTexture(term_tex);
     free(term_px);
     free(trm);
+    free(help_scr);
     if (astream)
         SDL_DestroyAudioStream(astream);
     if (asock >= 0)

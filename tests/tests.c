@@ -1,6 +1,7 @@
 // Unit tests for the hardware-independent parts: VT100 terminal parsing,
 // VIC frame assembly, and PETSCII key mapping. No device needed; run with
 // `make test`.
+#include "../src/discover.h"
 #include "../src/keys.h"
 #include "../src/term.h"
 #include "../src/video.h"
@@ -156,6 +157,97 @@ static void test_petscii(void)
     CHECK(special_to_petscii(SDLK_A, 0) == -1); // printables via text input
 }
 
+static void test_matrix_keys(void)
+{
+    const char *n[2];
+    CHECK(key_to_c64_matrix(SDLK_A, n) == 1 && !strcmp(n[0], "a"));
+    CHECK(key_to_c64_matrix(SDLK_9, n) == 1 && !strcmp(n[0], "9"));
+    CHECK(key_to_c64_matrix(SDLK_SPACE, n) == 1 && !strcmp(n[0], "space"));
+    CHECK(key_to_c64_matrix(SDLK_UP, n) == 2 &&
+          !strcmp(n[0], "right_shift") && !strcmp(n[1], "cursor_up_down"));
+    CHECK(key_to_c64_matrix(SDLK_DOWN, n) == 1 &&
+          !strcmp(n[0], "cursor_up_down"));
+    CHECK(key_to_c64_matrix(SDLK_F2, n) == 2 &&
+          !strcmp(n[0], "left_shift") && !strcmp(n[1], "f1"));
+    CHECK(key_to_c64_matrix(SDLK_ESCAPE, n) == 1 && !strcmp(n[0], "run_stop"));
+    CHECK(key_to_c64_matrix(SDLK_PAGEUP, n) == 1 && !strcmp(n[0], "restore"));
+    CHECK(key_to_c64_matrix(SDLK_F9, n) == 0);   // viewer keys stay local
+    CHECK(key_to_c64_matrix(SDLK_LCTRL, n) == 0); // reserved for hotkeys
+
+    char buf[192];
+    const char *one[] = {"a"};
+    CHECK(matrix_event_json(one, 1, "press", buf, sizeof buf));
+    CHECK(!strcmp(buf, "{\"events\":[{\"kind\":\"keyboard\",\"inputs\":"
+                       "[\"a\"],\"transition\":\"press\"}]}"));
+    const char *two[] = {"left_shift", "f1"};
+    CHECK(matrix_event_json(two, 2, "tap", buf, sizeof buf));
+    CHECK(strstr(buf, "\"inputs\":[\"left_shift\",\"f1\"]") != NULL);
+    CHECK(strstr(buf, "\"transition\":\"tap\"") != NULL);
+    CHECK(!matrix_event_json(one, 1, "press", buf, 16)); // too small
+}
+
+static void test_bindings(void)
+{
+    // dispatch side of the shared table
+    CHECK(viewer_binding_match(SDLK_Q, SDL_KMOD_LCTRL) == VA_QUIT);
+    CHECK(viewer_binding_match(SDLK_R, SDL_KMOD_LCTRL) == VA_RESET);
+    CHECK(viewer_binding_match(SDLK_R, SDL_KMOD_LCTRL | SDL_KMOD_LSHIFT) ==
+          VA_REBOOT);
+    CHECK(viewer_binding_match(SDLK_R, 0) == VA_NONE); // plain R types
+    CHECK(viewer_binding_match(SDLK_F9, 0) == VA_MENU_VIEW);
+    CHECK(viewer_binding_match(SDLK_F10, 0) == VA_HELP);
+    CHECK(viewer_binding_match(SDLK_F10, SDL_KMOD_NUM) == VA_HELP); // stray mod
+    CHECK(viewer_binding_match(SDLK_M, SDL_KMOD_RCTRL) == VA_MENU_BTN);
+
+    // table integrity: every row renders in help, no dispatch collisions
+    for (int i = 0; i < viewer_bindings_count; i++) {
+        const struct viewer_binding *b = &viewer_bindings[i];
+        CHECK(b->label && b->label[0] && b->desc && b->desc[0]);
+        CHECK(b->action != VA_NONE);
+        CHECK((b->action == VA_INFO) == (b->key == 0));
+        for (int j = i + 1; j < viewer_bindings_count; j++)
+            if (b->action != VA_INFO && viewer_bindings[j].action != VA_INFO)
+                CHECK(b->key != viewer_bindings[j].key ||
+                      b->mod != viewer_bindings[j].mod);
+    }
+}
+
+static void test_json(void)
+{
+    // shaped like a real /v1/info response
+    const char *info = "{\"product\": \"Ultimate 64\", \"firmware_version\": "
+                       "\"3.12\",\n \"hostname\": \"c64\", \"errors\": []}";
+    char v[64];
+    CHECK(json_find_str(info, "product", v, sizeof v) &&
+          !strcmp(v, "Ultimate 64"));
+    CHECK(json_find_str(info, "hostname", v, sizeof v) && !strcmp(v, "c64"));
+    CHECK(!json_find_str(info, "missing", v, sizeof v));
+    CHECK(!json_find_str(info, "errors", v, sizeof v)); // not a string value
+    // truncation to cap, still NUL-terminated
+    CHECK(json_find_str(info, "product", v, 4) && !strcmp(v, "Ult"));
+    // escaped quote inside a value must not end the string early
+    CHECK(json_find_str("{\"a\": \"x\\\"y\"}", "a", v, sizeof v) &&
+          !strcmp(v, "x\"y"));
+}
+
+static void test_arp_wired(void)
+{
+    const char *path = "/tmp/c64uv-test-arp";
+    FILE *f = fopen(path, "w");
+    fputs("IP address       HW type     Flags       HW address            "
+          "Mask     Device\n"
+          "192.168.8.173    0x1         0x2         9c:13:9e:ef:14:d0     "
+          "*        eth0\n"
+          "192.168.8.236    0x1         0x2         02:15:41:79:9d:c6     "
+          "*        eth0\n", f);
+    fclose(f);
+    CHECK(discover_ip_is_wired("192.168.8.236", path));
+    CHECK(!discover_ip_is_wired("192.168.8.173", path)); // ESP32 WiFi side
+    CHECK(!discover_ip_is_wired("192.168.8.99", path));  // not in the table
+    CHECK(!discover_ip_is_wired("192.168.8.236", "/nonexistent"));
+    remove(path);
+}
+
 int main(void)
 {
     test_term_basics();
@@ -163,6 +255,10 @@ int main(void)
     test_term_keys();
     test_video_assembly();
     test_petscii();
+    test_matrix_keys();
+    test_bindings();
+    test_json();
+    test_arp_wired();
     if (failures) {
         fprintf(stderr, "%d check(s) FAILED\n", failures);
         return 1;
