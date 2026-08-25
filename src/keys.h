@@ -42,6 +42,7 @@ struct viewer_binding {
     const char *label; // shown in the overlay and --help
     const char *desc;
     enum viewer_action action;
+    bool gap; // blank line after this row in the overlay and --help
 };
 
 extern const struct viewer_binding viewer_bindings[];
