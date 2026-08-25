@@ -107,3 +107,34 @@ timeout 8 ./c64uv --host 127.0.0.42:8064 --do pause
 grep -q "PUT /v1/machine:pause$" "$out/disc.log"
 ./c64uv --host 127.0.0.42:8064 --do frobnicate 2>/dev/null && exit 1
 echo "machine control test passed"
+
+# ------------------------------------------------------------------ file run
+# --run must pick the runner from the extension and, for DMA runs, park the
+# configured cartridge first and restore it only after the readiness gate.
+
+printf '\x01\x08\x0b\x08\x0a\x00\x99\x22\x48\x49\x22\x00\x00\x00' > "$out/hi.prg"
+: > "$out/disc.log"
+timeout 30 ./c64uv --host 127.0.0.42:8064 --run "$out/hi.prg"
+python3 - "$out/disc.log" <<'EOF'
+import sys
+log = open(sys.argv[1]).read().splitlines()
+want = ["GET /v1/configs/C64%20and%20Cartridge%20Settings/Cartridge",
+        "PUT /v1/configs/C64%20and%20Cartridge%20Settings/Cartridge?value=",
+        "POST /v1/runners:run_prg body=14",
+        "GET /v1/machine:readmem?address=00CC&length=1",
+        "PUT /v1/configs/C64%20and%20Cartridge%20Settings/Cartridge?value=Retro%20Replay"]
+i = 0
+for line in log:
+    if i < len(want) and line == want[i]:
+        i += 1
+assert i == len(want), f"missing/mis-ordered step {i}: {want[i]}\nlog: {log}"
+EOF
+head -c 64 /dev/urandom > "$out/game.crt"
+timeout 8 ./c64uv --host 127.0.0.42:8064 --run "$out/game.crt"
+grep -q "POST /v1/runners:run_crt body=64" "$out/disc.log"
+head -c 32 /dev/urandom > "$out/tune.sid"
+timeout 30 ./c64uv --host 127.0.0.42:8064 --run "$out/tune.sid"
+grep -q "POST /v1/runners:sidplay body=32" "$out/disc.log"
+touch "$out/note.txt"
+./c64uv --host 127.0.0.42:8064 --run "$out/note.txt" 2>/dev/null && exit 1
+echo "file run test passed"

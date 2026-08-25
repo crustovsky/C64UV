@@ -98,6 +98,17 @@ on every push and PR.
   is not in the VIC stream; telnet is the only remote view of it.
 - Screen RAM is remotely readable: `GET /v1/machine:readmem?address=0400&
   length=1000` - used to close the loop when testing typed input.
+- **Runners (verified on firmware 1.1.0)**: `POST /v1/runners:run_prg` takes
+  the raw file as the request body (application/octet-stream, no multipart).
+  The firmware then resets the machine itself, types
+  `LOAD"/TEMP/TEMP0000",8,1` and `RUN` - no client-side reset or typing is
+  needed. Because that internal reset re-reads the config, a configured
+  cartridge would boot instead: blank `configs/C64 and Cartridge
+  Settings/Cartridge` first, POST, then restore only after the readiness
+  gate (`machine:readmem` of `$CC` == 0 twice in a row, 10 s timeout for
+  programs that never return to the prompt). `run_crt` runs the posted cart
+  on purpose, so no parking there. `$CC` reads 0x00 at the READY prompt,
+  verified.
 
 ## Dev workflow (no hardware needed)
 
@@ -110,15 +121,7 @@ on every push and PR.
 
 ## Roadmap
 
-1. **Drag-and-drop run**: SDL3 drop events -> POST `.prg`/`.crt`/`.sid` to
-   `runners:run_prg`/`:sidplay`. Two protocol facts to honour: (a)
-   cartridge-safe run - blank the Cartridge config item before a DMA run and
-   restore it after (config applies at next reset, so the program keeps
-   running with the cart parked; avoids freezer-cart restore failures
-   hard-resetting into the cart menu); (b) readiness gate - before typing
-   after a reset, poll the KERNAL ready flag at zero-page `$CC` via
-   `machine:readmem` and require two consecutive ready reads.
-2. **Help overlay**: F10 toggles an in-window key reference rendered with the
+1. **Help overlay**: F10 toggles an in-window key reference rendered with the
    existing font8x8.h path (no new dependencies). Drive both the overlay text
    and the event dispatch from one static key-binding table so the help can
    never drift from the actual bindings; also print the same table on

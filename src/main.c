@@ -17,6 +17,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
@@ -33,6 +34,7 @@ struct config {
     const char *host;       // Ultimate hostname/IP for REST
     const char *password;   // network password -> X-Password header
     const char *do_action;  // one-shot machine control, then exit
+    const char *run_path;   // one-shot: run this .prg/.crt/.sid, then exit
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
     int listen_port;        // video; audio uses listen_port + 1
     int scale;
@@ -95,9 +97,10 @@ static size_t curl_sink(char *data, size_t size, size_t nmemb, void *userp)
 }
 
 // Returns HTTP status, or -1 on transport error. Response body (truncated) in
-// resp. A non-NULL json_body is sent with Content-Type: application/json.
+// resp. A non-NULL body of body_len bytes is sent with the given ctype.
 static long rest_req(CURL *curl, const char *method, const char *url,
-                     const char *json_body, long timeout_ms, char *resp)
+                     const void *body, long body_len, const char *ctype,
+                     long timeout_ms, char *resp)
 {
     resp[0] = '\0';
     curl_easy_reset(curl);
@@ -107,9 +110,12 @@ static long rest_req(CURL *curl, const char *method, const char *url,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_sink);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
     struct curl_slist *hdrs = NULL;
-    if (json_body) {
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
-        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+    if (body) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, body_len);
+        char cthdr[64];
+        snprintf(cthdr, sizeof cthdr, "Content-Type: %s", ctype);
+        hdrs = curl_slist_append(hdrs, cthdr);
     }
     if (g_password) {
         char pwhdr[160];
@@ -129,7 +135,7 @@ static long rest_req(CURL *curl, const char *method, const char *url,
 
 static long rest_put(CURL *curl, const char *url, char *resp)
 {
-    return rest_req(curl, "PUT", url, NULL, 3000, resp);
+    return rest_req(curl, "PUT", url, NULL, 0, NULL, 3000, resp);
 }
 
 // Keepalive thread: re-issue the start command every 5 s so the stream survives
@@ -156,7 +162,8 @@ static int keepalive_thread(void *arg)
         // Capability probe (GET is side-effect free), retried until the
         // machine gives an HTTP answer, then cached for the session.
         if (rc->input_url[0] && atomic_load(&g_minput) < 0) {
-            long code = rest_req(curl, "GET", rc->input_url, NULL, 3000, resp);
+            long code = rest_req(curl, "GET", rc->input_url, NULL, 0, NULL,
+                                 3000, resp);
             if (code == 200) {
                 atomic_store(&g_minput, 1);
                 SDL_Log("machine:input available: matrix-level keyboard");
@@ -349,7 +356,7 @@ static bool machine_ctl(const char *host, const char *action)
         curl = curl_easy_init();
     char url[256], resp[512];
     snprintf(url, sizeof url, "http://%s/v1/machine:%s", host, action);
-    long code = rest_req(curl, "PUT", url, NULL, 3000, resp);
+    long code = rest_req(curl, "PUT", url, NULL, 0, NULL, 3000, resp);
     if (code == 200)
         SDL_Log("machine:%s OK", action);
     else if (code == -1)
@@ -357,6 +364,183 @@ static bool machine_ctl(const char *host, const char *action)
     else
         SDL_Log("machine:%s HTTP %ld: %s", action, code, resp);
     return code == 200;
+}
+
+// --------------------------------------------------------------- file runner
+//
+// POST a .prg/.crt/.sid to the matching runners: endpoint. Verified on real
+// firmware 1.1.0: run_prg takes the raw file as the request body, then the
+// firmware itself resets the machine, types LOAD"/TEMP/TEMP0000",8,1 and
+// RUN. Because that internal reset would boot a configured freezer cart
+// into its menu instead, the Cartridge config item is blanked first and
+// restored only after the machine came back up (config applies at reset
+// time, so the program keeps running with the cart parked).
+
+#define CART_CFG_PATH "configs/C64%20and%20Cartridge%20Settings/Cartridge"
+
+static const char *runner_for(const char *path)
+{
+    const char *dot = strrchr(path, '.');
+    if (!dot)
+        return NULL;
+    if (!strcasecmp(dot, ".prg"))
+        return "run_prg";
+    if (!strcasecmp(dot, ".crt"))
+        return "run_crt";
+    if (!strcasecmp(dot, ".sid"))
+        return "sidplay";
+    return NULL;
+}
+
+struct binbuf {
+    uint8_t data[16];
+    int len;
+};
+
+static size_t bin_sink(char *d, size_t size, size_t nmemb, void *userp)
+{
+    struct binbuf *b = userp;
+    size_t n = size * nmemb;
+    for (size_t i = 0; i < n && b->len < (int)sizeof b->data; i++)
+        b->data[b->len++] = (uint8_t)d[i];
+    return n;
+}
+
+// Readiness gate: the KERNAL zeroes $CC when it sits at a prompt with the
+// cursor flashing. Two consecutive ready reads guard against sampling a
+// transient zero mid-boot; the timeout covers programs that never return
+// to the prompt (games) - by then the internal reset is long done.
+static void wait_kernal_ready(CURL *curl, const char *host, int max_ms)
+{
+    char url[256];
+    snprintf(url, sizeof url,
+             "http://%s/v1/machine:readmem?address=00CC&length=1", host);
+    int ready = 0;
+    for (int t = 0; t < max_ms && ready < 2; t += 500) {
+        struct binbuf b = {.len = 0};
+        curl_easy_reset(curl);
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 1000L);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, bin_sink);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
+        struct curl_slist *hdrs = NULL;
+        if (g_password) {
+            char pwhdr[160];
+            snprintf(pwhdr, sizeof pwhdr, "X-Password: %s", g_password);
+            hdrs = curl_slist_append(NULL, pwhdr);
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+        }
+        bool ok = curl_easy_perform(curl) == CURLE_OK;
+        curl_slist_free_all(hdrs);
+        if (ok && b.len >= 1 && b.data[0] == 0)
+            ready++;
+        else
+            ready = 0;
+        SDL_Delay(500);
+    }
+}
+
+static bool run_file(const char *host, const char *path)
+{
+    const char *ep = runner_for(path);
+    if (!ep) {
+        SDL_Log("%s: only .prg, .crt and .sid files can be run", path);
+        return false;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        SDL_Log("%s: %s", path, strerror(errno));
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0 || len > 2 << 20) { // largest sensible .crt is ~1 MB
+        SDL_Log("%s: unreasonable file size (%ld)", path, len);
+        fclose(f);
+        return false;
+    }
+    uint8_t *data = malloc((size_t)len);
+    bool readok = data && fread(data, 1, (size_t)len, f) == (size_t)len;
+    fclose(f);
+    if (!readok) {
+        SDL_Log("%s: short read", path);
+        free(data);
+        return false;
+    }
+
+    CURL *curl = curl_easy_init();
+    char url[512], resp[512];
+    // cartridge parking (not for .crt: that one runs a cart on purpose)
+    char cart[128];
+    bool parked = false;
+    if (strcmp(ep, "run_crt") != 0) {
+        snprintf(url, sizeof url, "http://%s/v1/%s", host, CART_CFG_PATH);
+        if (rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp) == 200 &&
+            json_find_str(resp, "current", cart, sizeof cart) && cart[0]) {
+            char blank[560];
+            snprintf(blank, sizeof blank, "%s?value=", url);
+            parked = rest_put(curl, blank, resp) == 200;
+            SDL_Log("cartridge '%s' parked for the run%s", cart,
+                    parked ? "" : " FAILED");
+        }
+    }
+
+    snprintf(url, sizeof url, "http://%s/v1/runners:%s", host, ep);
+    // generous timeout: the firmware saves the file before answering
+    long code = rest_req(curl, "POST", url, data, len, "application/octet-stream",
+                         15000, resp);
+    free(data);
+    if (code == 200)
+        SDL_Log("runners:%s %s OK (%ld bytes)", ep, path, len);
+    else if (code == -1)
+        SDL_Log("runners:%s: no response from Ultimate", ep);
+    else
+        SDL_Log("runners:%s HTTP %ld: %s", ep, code, resp);
+
+    if (parked) {
+        wait_kernal_ready(curl, host, 10000);
+        char restore[560], *esc = curl_easy_escape(curl, cart, 0);
+        snprintf(restore, sizeof restore, "http://%s/v1/%s?value=%s", host,
+                 CART_CFG_PATH, esc ? esc : "");
+        curl_free(esc);
+        if (rest_put(curl, restore, resp) == 200)
+            SDL_Log("cartridge '%s' restored (applies at next reset)", cart);
+        else
+            SDL_Log("cartridge restore FAILED - check the Ultimate's "
+                    "Cartridge setting");
+    }
+    curl_easy_cleanup(curl);
+    return code == 200;
+}
+
+// Drag-and-drop runs on a worker thread: the whole sequence can take
+// seconds and must not freeze the viewer.
+static atomic_bool g_run_busy;
+struct runjob {
+    char host[64];
+    char path[1024];
+};
+
+static int run_thread(void *arg)
+{
+    struct runjob *j = arg;
+    run_file(j->host, j->path);
+    free(j);
+    atomic_store(&g_run_busy, false);
+    return 0;
+}
+
+static void run_file_async(const char *host, const char *path)
+{
+    if (atomic_exchange(&g_run_busy, true)) {
+        SDL_Log("still busy with the previous file");
+        return;
+    }
+    struct runjob *j = malloc(sizeof *j);
+    snprintf(j->host, sizeof j->host, "%s", host);
+    snprintf(j->path, sizeof j->path, "%s", path);
+    SDL_DetachThread(SDL_CreateThread(run_thread, "runfile", j));
 }
 
 // ----------------------------------------------- matrix keyboard (REST)
@@ -378,7 +562,8 @@ static void minput_post(struct minput *mi, const char *body)
     if (!mi->curl)
         mi->curl = curl_easy_init();
     char resp[512];
-    if (rest_req(mi->curl, "POST", mi->url, body, 250, resp) == -1) {
+    if (rest_req(mi->curl, "POST", mi->url, body, (long)strlen(body),
+                 "application/json", 250, resp) == -1) {
         if (++mi->fails >= 3) {
             atomic_store(&g_minput, 0);
             SDL_Log("machine:input unreachable, falling back to the KERNAL "
@@ -463,6 +648,8 @@ static void usage(const char *argv0)
             "  --password  network password (or set C64U_PASSWORD)\n"
             "  --do      one machine action, then exit: reset reboot pause\n"
             "            resume menu poweroff\n"
+            "  --run     run a .prg/.crt/.sid on the machine, then exit\n"
+            "            (in the window: drop the file onto it instead)\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
             "  --term-test  print the telnet menu screen as text, then exit\n"
@@ -482,6 +669,8 @@ int main(int argc, char **argv)
             cfg.password = argv[++i];
         else if (!strcmp(argv[i], "--do") && i + 1 < argc)
             cfg.do_action = argv[++i];
+        else if (!strcmp(argv[i], "--run") && i + 1 < argc)
+            cfg.run_path = argv[++i];
         else if (!strcmp(argv[i], "--dest") && i + 1 < argc)
             cfg.dest = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc)
@@ -600,6 +789,9 @@ int main(int argc, char **argv)
 
     if (cfg.do_action)
         return machine_ctl(cfg.host, cfg.do_action) ? 0 : 1;
+
+    if (cfg.run_path)
+        return run_file(cfg.host, cfg.run_path) ? 0 : 1;
 
     if (cfg.term_test)
         return run_term_test(cfg.host);
@@ -859,6 +1051,9 @@ int main(int argc, char **argv)
                 } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
                     if (atomic_load(&g_minput) == 1)
                         minput_release_all(&mi);
+                } else if (ev.type == SDL_EVENT_DROP_FILE) {
+                    if (!cfg.no_start && ev.drop.data)
+                        run_file_async(cfg.host, ev.drop.data);
                 } else if (ev.type == SDL_EVENT_TEXT_INPUT) {
                     for (const char *p = ev.text.text; *p; p++) {
                         if (term_active) {

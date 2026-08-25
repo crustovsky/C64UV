@@ -79,6 +79,12 @@ refuses to start a stream toward an address missing from its ARP table.
 | Ctrl+M | press the Ultimate's menu button |
 | Ctrl+Q | quit |
 
+**Drop a `.prg`, `.crt`, or `.sid` file onto the window** and the Ultimate
+runs it (DMA program run, cartridge run, or SID player). If a cartridge is
+configured on the machine, it is parked for the run and restored afterwards,
+so a freezer cart won't hijack the program's reset; the cart is back on your
+next manual reset. The same works headless: `c64uv --run game.prg`.
+
 The same machine controls work headless: `c64uv --do reset` (also `reboot`,
 `pause`, `resume`, `menu`, `poweroff`) issues one REST call and exits. If
 your Ultimate has a network password set (firmware 3.12+), pass it with

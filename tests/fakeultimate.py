@@ -43,6 +43,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"product": "Ultimate 64", "firmware_version": "3.12",
                         "fpga_version": "11F", "hostname": "fakeultimate",
                         "unique_id": "F00F00", "errors": []})
+        elif self.path == "/v1/configs/C64%20and%20Cartridge%20Settings/Cartridge":
+            self._json({"C64 and Cartridge Settings": {
+                        "Cartridge": {"current": "Retro Replay",
+                                      "presets": ["", "Retro Replay"],
+                                      "default": ""}}, "errors": []})
+        elif self.path.startswith("/v1/machine:readmem"):
+            self._reply(200, b"\x00", "application/octet-stream")
         elif self.path == "/v1/machine:input":
             self._json({"keyboard": {"inputs": []},
                         "joysticks": [{"port": 1, "inputs": []},
