@@ -51,8 +51,11 @@ end (frame geometry, palette, nibble order) plus REST-level tests against
 `tests/fakeultimate.py`, a fake `/v1` server that logs every request.
 Discovery is testable hermetically via env hooks: `C64U_DISCOVER_NET`
 (sweep exactly that /24, loopback allowed) and `C64U_DISCOVER_PORT`
-(override port 80). CI (GitHub Actions, Arch container) runs build + both
-on every push and PR.
+(override port 80; the chosen host then keeps `:port` for the REST calls
+too). The suite listens on port 21000 so a viewer the user left running
+cannot collide, and the windowed no-host path is exercised headless via
+`SDL_VIDEODRIVER=dummy`. CI (GitHub Actions, Arch container) runs build +
+both on every push and PR.
 
 ## Protocol facts (hard-won, verified on real hardware)
 

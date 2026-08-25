@@ -13,13 +13,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Off the default 11000/11001 so a viewer the user left running cannot
+# collide with the suite.
+VPORT=21000
+
 # ---------------------------------------------------------------- mock stream
 # mockstream -> c64uv --dump, then verify geometry, palette, nibble order.
 
-python3 tools/mockstream.py 127.0.0.1 11000 10 >/dev/null &
+python3 tools/mockstream.py 127.0.0.1 "$VPORT" 10 >/dev/null &
 pids+=($!)
 sleep 0.3
-timeout 8 ./c64uv --no-start --dump "$out/frame.ppm"
+timeout 8 ./c64uv --no-start --port "$VPORT" --dump "$out/frame.ppm"
 
 python3 - "$out/frame.ppm" <<'EOF'
 import sys
@@ -69,12 +73,12 @@ echo "discovery test passed"
 # Two viewers join the video group and must both assemble the same stream;
 # proves IP_ADD_MEMBERSHIP plus the shared SO_REUSEADDR port binding.
 
-python3 tools/mockstream.py 239.0.1.64 11000 10 >/dev/null &
+python3 tools/mockstream.py 239.0.1.64 "$VPORT" 10 >/dev/null &
 pids+=($!)
 sleep 0.3
-timeout 8 ./c64uv --no-start --multicast --dump "$out/mc1.ppm" &
+timeout 8 ./c64uv --no-start --multicast --port "$VPORT" --dump "$out/mc1.ppm" &
 v1=$!
-timeout 8 ./c64uv --no-start --multicast --dump "$out/mc2.ppm"
+timeout 8 ./c64uv --no-start --multicast --port "$VPORT" --dump "$out/mc2.ppm"
 wait "$v1"
 for f in "$out/mc1.ppm" "$out/mc2.ppm"; do
     head -2 "$f" | grep -qx "384 272"
@@ -85,13 +89,13 @@ echo "multicast test passed"
 # Full keepalive cycle against the fake server: stream start with the right
 # destination, plus the one-time machine:input capability probe.
 
-python3 tools/mockstream.py 127.0.0.1 11000 10 >/dev/null &
+python3 tools/mockstream.py 127.0.0.1 "$VPORT" 10 >/dev/null &
 pids+=($!)
 sleep 0.3
 timeout 8 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
-    --dump "$out/rest.ppm" 2> "$out/rest.err"
+    --port "$VPORT" --dump "$out/rest.ppm" 2> "$out/rest.err"
 grep -q "GET /v1/machine:input" "$out/disc.log"
-grep -q "PUT /v1/streams/video:start?ip=127.0.0.1:11000" "$out/disc.log"
+grep -q "PUT /v1/streams/video:start?ip=127.0.0.1:$VPORT" "$out/disc.log"
 grep -q "machine:input available" "$out/rest.err"
 echo "rest keepalive/probe test passed"
 
@@ -148,3 +152,22 @@ grep -q "F10" "$out/help.out"
 grep -q "Ctrl+Shift+R" "$out/help.out"
 grep -q "RUN/STOP" "$out/help.out"
 echo "help test passed"
+
+# ------------------------------------------------- windowed async discovery
+# A bare windowed start (dummy video driver) must open without blocking,
+# discover the fake Ultimate in the background, and start the stream.
+
+: > "$out/disc.log"
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+    C64U_DISCOVER_NET=127.0.0.0 C64U_DISCOVER_PORT=8064 \
+    ./c64uv --dest 127.0.0.1 --port "$VPORT" --no-audio 2> "$out/async.err" &
+cpid=$!
+for _ in $(seq 1 150); do
+    grep -q "PUT /v1/streams/video:start" "$out/disc.log" 2>/dev/null && break
+    sleep 0.2
+done
+kill "$cpid" 2>/dev/null
+wait "$cpid" 2>/dev/null || true
+grep -q "using 127.0.0.42" "$out/async.err"
+grep -q "PUT /v1/streams/video:start?ip=127.0.0.1:$VPORT" "$out/disc.log"
+echo "async discovery test passed"
