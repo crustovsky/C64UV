@@ -1,6 +1,7 @@
 // Unit tests for the hardware-independent parts: VT100 terminal parsing,
 // VIC frame assembly, and PETSCII key mapping. No device needed; run with
 // `make test`.
+#include "../src/discover.h"
 #include "../src/keys.h"
 #include "../src/term.h"
 #include "../src/video.h"
@@ -156,6 +157,24 @@ static void test_petscii(void)
     CHECK(special_to_petscii(SDLK_A, 0) == -1); // printables via text input
 }
 
+static void test_json(void)
+{
+    // shaped like a real /v1/info response
+    const char *info = "{\"product\": \"Ultimate 64\", \"firmware_version\": "
+                       "\"3.12\",\n \"hostname\": \"c64\", \"errors\": []}";
+    char v[64];
+    CHECK(json_find_str(info, "product", v, sizeof v) &&
+          !strcmp(v, "Ultimate 64"));
+    CHECK(json_find_str(info, "hostname", v, sizeof v) && !strcmp(v, "c64"));
+    CHECK(!json_find_str(info, "missing", v, sizeof v));
+    CHECK(!json_find_str(info, "errors", v, sizeof v)); // not a string value
+    // truncation to cap, still NUL-terminated
+    CHECK(json_find_str(info, "product", v, 4) && !strcmp(v, "Ult"));
+    // escaped quote inside a value must not end the string early
+    CHECK(json_find_str("{\"a\": \"x\\\"y\"}", "a", v, sizeof v) &&
+          !strcmp(v, "x\"y"));
+}
+
 int main(void)
 {
     test_term_basics();
@@ -163,6 +182,7 @@ int main(void)
     test_term_keys();
     test_video_assembly();
     test_petscii();
+    test_json();
     if (failures) {
         fprintf(stderr, "%d check(s) FAILED\n", failures);
         return 1;

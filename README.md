@@ -54,7 +54,13 @@ though wired is smoother - the streams total ~22 Mbit/s.)
 ```sh
 make
 ./c64uv --host 192.168.1.64        # or: export C64U_HOST=192.168.1.64
+./c64uv                            # no address? it scans your LAN for one
 ```
+
+With no `--host` (and no `C64U_HOST`) the viewer sweeps your local /24
+subnets with one `/v1/info` request per address and uses the Ultimate it
+finds; `--discover` runs the same scan, lists every Ultimate on the
+network, and exits.
 
 The viewer asks the Ultimate to send its streams to your PC's address on the
 Ultimate's subnet (auto-detected, wired interfaces preferred; override with
@@ -76,10 +82,10 @@ viewer does not switch on its own - press F9 to flip back to the C64 screen
 and watch it boot.
 
 Useful flags: `--no-audio`, `--no-keyb`, `--scale N` (window size),
-`--verbose` (fps/packet/latency stats), `--dump f.ppm` (grab one frame
-headless), `--term-test` (print the menu screen as text and exit),
-`--no-start` (listen only; pair with `tools/mockstream.py` to develop with no
-hardware).
+`--discover` (list Ultimates on the network and exit), `--verbose`
+(fps/packet/latency stats), `--dump f.ppm` (grab one frame headless),
+`--term-test` (print the menu screen as text and exit), `--no-start` (listen
+only; pair with `tools/mockstream.py` to develop with no hardware).
 
 ### Installing
 

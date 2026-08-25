@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
-# End-to-end pipeline test without hardware: mockstream -> c64uv --dump,
-# then verify frame geometry, palette, and nibble order in the PPM.
+# End-to-end tests without hardware. Each section is independent; the mock
+# stream test exercises the UDP pipeline, the others run against the fake
+# REST server (tests/fakeultimate.py).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 out=$(mktemp -d)
-trap 'rm -rf "$out"; kill %1 2>/dev/null || true' EXIT
+pids=()
+cleanup() {
+    rm -rf "$out"
+    for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- mock stream
+# mockstream -> c64uv --dump, then verify geometry, palette, nibble order.
 
 python3 tools/mockstream.py 127.0.0.1 11000 10 >/dev/null &
+pids+=($!)
 sleep 0.3
 timeout 8 ./c64uv --no-start --dump "$out/frame.ppm"
 
@@ -38,4 +48,19 @@ for y in (10, 100, 250):  # mock pattern: 16 bars of 24px, plus a sweep line
 errors += px(23, 10) != (0, 0, 0) or px(24, 10) != (255, 255, 255)
 sys.exit(1 if errors else 0)
 EOF
-echo "integration test passed"
+echo "mock stream test passed"
+
+# ----------------------------------------------------------------- discovery
+# A fake Ultimate on one loopback address must be found; a plain web server
+# on another must be rejected (real subnets are full of port-80 responders).
+
+python3 tests/fakeultimate.py 127.0.0.42 8064 "$out/disc.log" &
+pids+=($!)
+python3 -m http.server 8064 --bind 127.0.0.99 >/dev/null 2>&1 &
+pids+=($!)
+sleep 0.3
+C64U_DISCOVER_NET=127.0.0.0 C64U_DISCOVER_PORT=8064 \
+    timeout 30 ./c64uv --discover > "$out/disc.out"
+grep -q "127.0.0.42.*Ultimate 64.*fakeultimate" "$out/disc.out"
+! grep -q "127.0.0.99" "$out/disc.out"
+echo "discovery test passed"

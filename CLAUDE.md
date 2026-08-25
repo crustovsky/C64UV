@@ -11,6 +11,7 @@ Single binary, two dependencies (SDL3, libcurl):
 
 ```
 src/main.c   event loop, sockets, audio, REST keepalive, rendering
+src/discover.c  /v1/info sweep of the local /24s (SDL-free, curl multi)
 src/video.c  VIC frame assembly (SDL-free, unit-tested)
 src/term.c   minimal VT100 emulator matched to the firmware's remote screen
 src/keys.c   PC key -> PETSCII mapping
@@ -37,10 +38,14 @@ tests can link them; main.c keeps everything socket- and SDL-bound.
 
 ## Tests
 
-`make test` runs tests/tests.c (VT100 parser, frame assembly, PETSCII map).
-`tests/integration.sh` runs the mock-stream pipeline end to end and checks
-the dumped frame's geometry, palette, and nibble order. CI (GitHub Actions,
-Arch container) runs build + both on every push and PR.
+`make test` runs tests/tests.c (VT100 parser, frame assembly, PETSCII map,
+JSON scanner). `tests/integration.sh` runs the mock-stream pipeline end to
+end (frame geometry, palette, nibble order) plus REST-level tests against
+`tests/fakeultimate.py`, a fake `/v1` server that logs every request.
+Discovery is testable hermetically via env hooks: `C64U_DISCOVER_NET`
+(sweep exactly that /24, loopback allowed) and `C64U_DISCOVER_PORT`
+(override port 80). CI (GitHub Actions, Arch container) runs build + both
+on every push and PR.
 
 ## Protocol facts (hard-won, verified on real hardware)
 
@@ -92,26 +97,20 @@ Arch container) runs build + both on every push and PR.
 
 ## Roadmap
 
-1. **Discovery**: `--discover` flag (and auto-discovery when no host is given).
-   One-shot `GET /v1/info` sweep of the local /24, bounded concurrency, one
-   request per address, no port pre-scan and no retries. Use a split timeout:
-   1.5 s TCP connect, then a separate 3.25 s for the response (wired REST can
-   take ~2.5 s to answer while unreachable addresses should fail on the short
-   connect budget). No mDNS/broadcast exists in the firmware.
-2. **Multicast transport**: join groups 239.0.1.64/.65 (the prkl_ultimate
+1. **Multicast transport**: join groups 239.0.1.64/.65 (the prkl_ultimate
    defaults) via IP_ADD_MEMBERSHIP on the existing UDP sockets and pass the
    group address in `streams/*:start`. Removes the one-viewer-per-Ultimate
    limitation and lets c64uv coexist with u64deck/VLC watching the same
    machine.
-3. **`machine:input` keyboard upgrade** when official firmware ships it:
+2. **`machine:input` keyboard upgrade** when official firmware ships it:
    CIA1 matrix-level press/release (games, chords, held keys). Probe
    `PUT /v1/machine:input` for capability, cache the result, fall back to the
    KERNAL buffer; keep the buffer path for bulk text even on capable firmware.
-4. **Machine-control hotkeys + password**: reset, reboot, pause/resume, menu
+3. **Machine-control hotkeys + password**: reset, reboot, pause/resume, menu
    button (single REST calls). Add `X-Password` header support (firmware
    3.12+ network password); currently there is no way to reach a
    password-protected Ultimate.
-5. **Drag-and-drop run**: SDL3 drop events -> POST `.prg`/`.crt`/`.sid` to
+4. **Drag-and-drop run**: SDL3 drop events -> POST `.prg`/`.crt`/`.sid` to
    `runners:run_prg`/`:sidplay`. Two protocol facts to honour: (a)
    cartridge-safe run - blank the Cartridge config item before a DMA run and
    restore it after (config applies at next reset, so the program keeps
@@ -119,7 +118,7 @@ Arch container) runs build + both on every push and PR.
    hard-resetting into the cart menu); (b) readiness gate - before typing
    after a reset, poll the KERNAL ready flag at zero-page `$CC` via
    `machine:readmem` and require two consecutive ready reads.
-6. **Help overlay**: F10 toggles an in-window key reference rendered with the
+5. **Help overlay**: F10 toggles an in-window key reference rendered with the
    existing font8x8.h path (no new dependencies). Drive both the overlay text
    and the event dispatch from one static key-binding table so the help can
    never drift from the actual bindings; also print the same table on

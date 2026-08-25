@@ -11,14 +11,15 @@ else
 LDLIBS  += $(shell pkg-config --libs sdl3 libcurl)
 endif
 
-SRC = src/main.c src/video.c src/term.c src/keys.c
-HDR = src/video.h src/term.h src/keys.h src/font8x8.h
+SRC = src/main.c src/video.c src/term.c src/keys.c src/discover.c
+LIB = src/video.c src/term.c src/keys.c src/discover.c
+HDR = src/video.h src/term.h src/keys.h src/discover.h src/font8x8.h
 
 c64uv: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC) $(LDLIBS)
 
-tests/run: tests/tests.c src/video.c src/term.c src/keys.c $(HDR)
-	$(CC) $(CFLAGS) -o $@ tests/tests.c src/video.c src/term.c src/keys.c $(LDLIBS)
+tests/run: tests/tests.c $(LIB) $(HDR)
+	$(CC) $(CFLAGS) -o $@ tests/tests.c $(LIB) $(LDLIBS)
 
 test: tests/run
 	./tests/run

@@ -8,6 +8,7 @@
 
 #define C64UV_VERSION "0.1.2"
 
+#include "discover.h"
 #include "keys.h"
 #include "term.h"
 #include "video.h"
@@ -36,6 +37,7 @@ struct config {
     bool no_keyb;
     const char *dump_path;  // write first complete frame as PPM and exit
     bool term_test;         // headless telnet check: dump menu grid, exit
+    bool discover;          // sweep the local subnets for Ultimates and exit
     bool verbose;
 };
 
@@ -294,13 +296,15 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
             "          [--no-start] [--no-audio] [--no-keyb] [--dump FILE.ppm]\n"
-            "          [--term-test] [--verbose] [--version]\n"
-            "  --host    C64 Ultimate address (or set C64U_HOST)\n"
+            "          [--term-test] [--discover] [--verbose] [--version]\n"
+            "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
+            "auto-discover)\n"
             "  --dest    where the Ultimate should send the streams (default: auto)\n"
             "  --port    local UDP video port; audio uses port+1 (default 11000)\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
-            "  --term-test  print the telnet menu screen as text, then exit\n",
+            "  --term-test  print the telnet menu screen as text, then exit\n"
+            "  --discover  scan the local subnets for Ultimates, then exit\n",
             argv0);
 }
 
@@ -328,6 +332,8 @@ int main(int argc, char **argv)
             cfg.dump_path = argv[++i];
         else if (!strcmp(argv[i], "--term-test"))
             cfg.term_test = true;
+        else if (!strcmp(argv[i], "--discover"))
+            cfg.discover = true;
         else if (!strcmp(argv[i], "--verbose"))
             cfg.verbose = true;
         else if (!strcmp(argv[i], "--version")) {
@@ -338,9 +344,45 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    if (cfg.discover) {
+        struct discovered found[DISCOVER_MAX];
+        int n = discover_scan(found, DISCOVER_MAX, true);
+        for (int i = 0; i < n; i++)
+            printf("%-15s  %s%s%s  firmware %s\n", found[i].ip,
+                   found[i].product, found[i].hostname[0] ? "  " : "",
+                   found[i].hostname, found[i].fw);
+        if (n == 0)
+            fprintf(stderr, "no Ultimate found\n");
+        return n > 0 ? 0 : 1;
+    }
+
+    // No address given: try to find the machine ourselves before giving up.
+    static char auto_host[46];
+    if (!cfg.host && !cfg.no_start) {
+        struct discovered found[DISCOVER_MAX];
+        fprintf(stderr, "no --host given, discovering...\n");
+        int n = discover_scan(found, DISCOVER_MAX, true);
+        if (n >= 1) {
+            if (n > 1) {
+                fprintf(stderr, "found %d Ultimates, using the first; pass "
+                        "--host to pick another:\n", n);
+                for (int i = 0; i < n; i++)
+                    fprintf(stderr, "  %-15s  %s\n", found[i].ip,
+                            found[i].hostname);
+            }
+            snprintf(auto_host, sizeof auto_host, "%s", found[0].ip);
+            cfg.host = auto_host;
+            fprintf(stderr, "using %s (%s%s%s)\n", found[0].ip,
+                    found[0].product, found[0].hostname[0] ? ", " : "",
+                    found[0].hostname);
+        }
+    }
     if (!cfg.host && !cfg.no_start) {
         fprintf(stderr,
-                "no Ultimate address: pass --host <ip> or set C64U_HOST\n"
+                "no Ultimate found on your network: pass --host <ip> or set "
+                "C64U_HOST\n"
                 "(find it on the machine: F5 menu on the Ultimate shows its "
                 "IP, or check your router)\n");
         // Launched from a desktop entry there is no terminal to read stderr.
@@ -348,8 +390,9 @@ int main(int argc, char **argv)
             (getenv("DISPLAY") || getenv("WAYLAND_DISPLAY")))
             SDL_ShowSimpleMessageBox(
                 SDL_MESSAGEBOX_ERROR, "Commodore 64 Ultimate Viewer",
-                "No Ultimate address configured.\n\n"
-                "Run from a terminal:  c64uv --host <ip>\n"
+                "No Ultimate found on your network.\n\n"
+                "Check that the machine is powered on, or run from a\n"
+                "terminal:  c64uv --host <ip>\n"
                 "or set C64U_HOST in your environment.\n"
                 "(F5 menu on the Ultimate shows its IP.)",
                 NULL);
@@ -390,7 +433,6 @@ int main(int argc, char **argv)
         }
     }
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
     struct rest_ctx rc;
     SDL_Thread *ka = NULL;
     if (!cfg.no_start) {
