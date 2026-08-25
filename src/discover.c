@@ -86,6 +86,13 @@ int discover_scan(struct discovered *out, int max, bool verbose)
     const char *penv = getenv("C64U_DISCOVER_PORT");
     if (penv)
         port = atol(penv);
+    // password-protected Ultimates refuse /v1/info without the header
+    struct curl_slist *pwhdr = NULL;
+    if (getenv("C64U_PASSWORD")) {
+        char h[160];
+        snprintf(h, sizeof h, "X-Password: %s", getenv("C64U_PASSWORD"));
+        pwhdr = curl_slist_append(NULL, h);
+    }
 
     // Collect the /24 of every usable IPv4 interface (deduplicated: wired and
     // wireless commonly share a subnet), remembering our own addresses so the
@@ -173,6 +180,8 @@ int discover_scan(struct discovered *out, int max, bool verbose)
             curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, probe_sink);
             curl_easy_setopt(h, CURLOPT_WRITEDATA, pr->resp);
             curl_easy_setopt(h, CURLOPT_PRIVATE, pr);
+            if (pwhdr)
+                curl_easy_setopt(h, CURLOPT_HTTPHEADER, pwhdr);
             curl_multi_add_handle(multi, h);
             running++;
         }
@@ -208,5 +217,6 @@ int discover_scan(struct discovered *out, int max, bool verbose)
         }
     }
     curl_multi_cleanup(multi);
+    curl_slist_free_all(pwhdr);
     return found;
 }

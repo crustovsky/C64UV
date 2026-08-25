@@ -94,3 +94,16 @@ grep -q "GET /v1/machine:input" "$out/disc.log"
 grep -q "PUT /v1/streams/video:start?ip=127.0.0.1:11000" "$out/disc.log"
 grep -q "machine:input available" "$out/rest.err"
 echo "rest keepalive/probe test passed"
+
+# ------------------------------------------------- machine control + password
+# --do issues exactly one PUT /v1/machine:<action>; X-Password must reach the
+# wire from both the flag and the environment.
+
+timeout 8 ./c64uv --host 127.0.0.42:8064 --password sekret --do reset
+grep -q "PUT /v1/machine:reset pw=sekret" "$out/disc.log"
+C64U_PASSWORD=envpw timeout 8 ./c64uv --host 127.0.0.42:8064 --do menu
+grep -q "PUT /v1/machine:menu_button pw=envpw" "$out/disc.log"
+timeout 8 ./c64uv --host 127.0.0.42:8064 --do pause
+grep -q "PUT /v1/machine:pause$" "$out/disc.log"
+./c64uv --host 127.0.0.42:8064 --do frobnicate 2>/dev/null && exit 1
+echo "machine control test passed"

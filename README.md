@@ -74,7 +74,16 @@ refuses to start a stream toward an address missing from its ARP table.
 | Esc | RUN/STOP |
 | F1–F8, cursors, Home, Del/Ins | the corresponding C64 keys |
 | **F9** | toggle the Ultimate menu view |
+| Ctrl+R / Ctrl+Shift+R | reset / reboot the machine |
+| Ctrl+P | pause / resume the machine |
+| Ctrl+M | press the Ultimate's menu button |
 | Ctrl+Q | quit |
+
+The same machine controls work headless: `c64uv --do reset` (also `reboot`,
+`pause`, `resume`, `menu`, `poweroff`) issues one REST call and exits. If
+your Ultimate has a network password set (firmware 3.12+), pass it with
+`--password` or the `C64U_PASSWORD` environment variable; it is sent as the
+`X-Password` header on every request, discovery included.
 
 ### Several viewers, one Ultimate
 

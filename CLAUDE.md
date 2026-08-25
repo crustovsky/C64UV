@@ -110,11 +110,7 @@ on every push and PR.
 
 ## Roadmap
 
-1. **Machine-control hotkeys + password**: reset, reboot, pause/resume, menu
-   button (single REST calls). Add `X-Password` header support (firmware
-   3.12+ network password); currently there is no way to reach a
-   password-protected Ultimate.
-2. **Drag-and-drop run**: SDL3 drop events -> POST `.prg`/`.crt`/`.sid` to
+1. **Drag-and-drop run**: SDL3 drop events -> POST `.prg`/`.crt`/`.sid` to
    `runners:run_prg`/`:sidplay`. Two protocol facts to honour: (a)
    cartridge-safe run - blank the Cartridge config item before a DMA run and
    restore it after (config applies at next reset, so the program keeps
@@ -122,7 +118,7 @@ on every push and PR.
    hard-resetting into the cart menu); (b) readiness gate - before typing
    after a reset, poll the KERNAL ready flag at zero-page `$CC` via
    `machine:readmem` and require two consecutive ready reads.
-3. **Help overlay**: F10 toggles an in-window key reference rendered with the
+2. **Help overlay**: F10 toggles an in-window key reference rendered with the
    existing font8x8.h path (no new dependencies). Drive both the overlay text
    and the event dispatch from one static key-binding table so the help can
    never drift from the actual bindings; also print the same table on

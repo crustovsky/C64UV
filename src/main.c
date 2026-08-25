@@ -31,6 +31,8 @@
 
 struct config {
     const char *host;       // Ultimate hostname/IP for REST
+    const char *password;   // network password -> X-Password header
+    const char *do_action;  // one-shot machine control, then exit
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
     int listen_port;        // video; audio uses listen_port + 1
     int scale;
@@ -64,6 +66,9 @@ static int tcp_connect_to(const char *host, Uint16 port, int timeout_s)
 static atomic_bool g_quit;
 // machine:input capability (probed once per session): -1 unknown, 0 no, 1 yes
 static atomic_int g_minput = -1;
+// Network password (firmware 3.12+), sent as X-Password on every REST call.
+// Set once at startup, before any thread starts.
+static const char *g_password;
 
 // ---------------------------------------------------------------- REST control
 
@@ -104,9 +109,15 @@ static long rest_req(CURL *curl, const char *method, const char *url,
     struct curl_slist *hdrs = NULL;
     if (json_body) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
-        hdrs = curl_slist_append(NULL, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
     }
+    if (g_password) {
+        char pwhdr[160];
+        snprintf(pwhdr, sizeof pwhdr, "X-Password: %s", g_password);
+        hdrs = curl_slist_append(hdrs, pwhdr);
+    }
+    if (hdrs)
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     CURLcode res = curl_easy_perform(curl);
     curl_slist_free_all(hdrs);
     if (res != CURLE_OK)
@@ -322,6 +333,32 @@ static void keyb_stop(struct keyb *k)
         keyb_raw(k, 0xFF06, poke, sizeof poke);
 }
 
+// ------------------------------------------------------- machine control
+//
+// Single REST calls: PUT /v1/machine:<action>. Shared by the Ctrl hotkeys
+// and the one-shot --do flag.
+
+static const char *const machine_actions[] = {
+    "reset", "reboot", "pause", "resume", "menu_button", "poweroff", NULL,
+};
+
+static bool machine_ctl(const char *host, const char *action)
+{
+    static CURL *curl; // hotkeys reuse the connection
+    if (!curl)
+        curl = curl_easy_init();
+    char url[256], resp[512];
+    snprintf(url, sizeof url, "http://%s/v1/machine:%s", host, action);
+    long code = rest_req(curl, "PUT", url, NULL, 3000, resp);
+    if (code == 200)
+        SDL_Log("machine:%s OK", action);
+    else if (code == -1)
+        SDL_Log("machine:%s: no response from Ultimate", action);
+    else
+        SDL_Log("machine:%s HTTP %ld: %s", action, code, resp);
+    return code == 200;
+}
+
 // ----------------------------------------------- matrix keyboard (REST)
 //
 // When the firmware supports machine:input (probed by the keepalive thread),
@@ -414,8 +451,8 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
             "          [--multicast] [--no-start] [--no-audio] [--no-keyb]\n"
-            "          [--dump FILE.ppm] [--term-test] [--discover] [--verbose]\n"
-            "          [--version]\n"
+            "          [--password PW] [--do ACTION] [--dump FILE.ppm]\n"
+            "          [--term-test] [--discover] [--verbose] [--version]\n"
             "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
             "auto-discover)\n"
             "  --dest    where the Ultimate should send the streams (default: auto;\n"
@@ -423,6 +460,9 @@ static void usage(const char *argv0)
             "  --port    local UDP video port; audio uses port+1 (default 11000)\n"
             "  --multicast  stream via groups 239.0.1.64/.65 so several viewers\n"
             "            can watch the same Ultimate\n"
+            "  --password  network password (or set C64U_PASSWORD)\n"
+            "  --do      one machine action, then exit: reset reboot pause\n"
+            "            resume menu poweroff\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
             "  --term-test  print the telnet menu screen as text, then exit\n"
@@ -438,6 +478,10 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--host") && i + 1 < argc)
             cfg.host = argv[++i];
+        else if (!strcmp(argv[i], "--password") && i + 1 < argc)
+            cfg.password = argv[++i];
+        else if (!strcmp(argv[i], "--do") && i + 1 < argc)
+            cfg.do_action = argv[++i];
         else if (!strcmp(argv[i], "--dest") && i + 1 < argc)
             cfg.dest = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc)
@@ -468,6 +512,25 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    if (!cfg.password)
+        cfg.password = getenv("C64U_PASSWORD");
+    g_password = cfg.password;
+    if (g_password)
+        setenv("C64U_PASSWORD", g_password, 1); // discovery reads the env
+    if (cfg.do_action) {
+        if (!strcmp(cfg.do_action, "menu"))
+            cfg.do_action = "menu_button";
+        bool known = false;
+        for (int i = 0; machine_actions[i]; i++)
+            known |= !strcmp(cfg.do_action, machine_actions[i]);
+        if (!known) {
+            fprintf(stderr,
+                    "--do: unknown action '%s' (one of: reset reboot pause "
+                    "resume menu poweroff)\n", cfg.do_action);
+            return 2;
+        }
+    }
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     if (cfg.discover) {
@@ -534,6 +597,9 @@ int main(int argc, char **argv)
     }
     if (!cfg.host)
         cfg.host = ""; // --no-start mock mode needs no device
+
+    if (cfg.do_action)
+        return machine_ctl(cfg.host, cfg.do_action) ? 0 : 1;
 
     if (cfg.term_test)
         return run_term_test(cfg.host);
@@ -720,6 +786,7 @@ int main(int argc, char **argv)
     Uint16 aseq_prev = 0;
     bool aseq_valid = false;
     bool got_any = false;
+    bool paused = false; // Ctrl+P toggle state (viewer-side best guess)
     // Audio latency control: startup fill and jitter leave a standing queue
     // that never drains on its own (input and output rates match). A servo on
     // the resample ratio (±2%, inaudible) steers the queue toward ~60 ms;
@@ -738,6 +805,17 @@ int main(int argc, char **argv)
                 } else if (ev.type == SDL_EVENT_KEY_DOWN) {
                     if ((ev.key.mod & SDL_KMOD_CTRL) && ev.key.key == SDLK_Q) {
                         atomic_store(&g_quit, true);
+                    } else if ((ev.key.mod & SDL_KMOD_CTRL) &&
+                               ev.key.key == SDLK_R && !cfg.no_start) {
+                        machine_ctl(cfg.host, (ev.key.mod & SDL_KMOD_SHIFT)
+                                                  ? "reboot" : "reset");
+                    } else if ((ev.key.mod & SDL_KMOD_CTRL) &&
+                               ev.key.key == SDLK_P && !cfg.no_start) {
+                        paused = !paused;
+                        machine_ctl(cfg.host, paused ? "pause" : "resume");
+                    } else if ((ev.key.mod & SDL_KMOD_CTRL) &&
+                               ev.key.key == SDLK_M && !cfg.no_start) {
+                        machine_ctl(cfg.host, "menu_button");
                     } else if (ev.key.key == SDLK_F9 && !cfg.no_start) {
                         term_active = !term_active;
                         term_present = true; // repaint whichever view we enter
