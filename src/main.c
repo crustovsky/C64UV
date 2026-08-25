@@ -8,7 +8,7 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.2.1"
+#define C64UV_VERSION "0.2.2"
 
 #include "discover.h"
 #include "keys.h"
@@ -800,7 +800,7 @@ static void status_center(struct term *t, int row, uint8_t color,
 static void status_set(struct term *t, const char *l1, const char *l2)
 {
     term_init(t);
-    status_center(t, 9, 1, "c64uv " C64UV_VERSION);
+    status_center(t, 10, 1, "c64uv " C64UV_VERSION);
     if (l1)
         status_center(t, 12, 15, l1);
     if (l2)
@@ -1252,6 +1252,13 @@ int main(int argc, char **argv)
                 } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
                     if (atomic_load(&g_minput) == 1)
                         minput_release_all(&mi);
+                } else if (ev.type == SDL_EVENT_WINDOW_RESIZED ||
+                           ev.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
+                           ev.type == SDL_EVENT_WINDOW_EXPOSED) {
+                    // repaint the current grid view at the new size; the
+                    // tiling WM resizes the window right after it maps, and
+                    // a stale frame would be shown scaled and off-center
+                    term_present = true;
                 } else if (ev.type == SDL_EVENT_DROP_FILE) {
                     if (!cfg.no_start && cfg.host && ev.drop.data)
                         run_file_async(cfg.host, ev.drop.data);
@@ -1346,6 +1353,9 @@ int main(int argc, char **argv)
             // 2x vertical stretch: 8x8 glyphs read as 8x16 cells
             SDL_SetRenderLogicalPresentation(ren, TERM_PX_W, TERM_PX_H * 2,
                                              SDL_LOGICAL_PRESENTATION_LETTERBOX);
+            // fill the letterbox borders with the grid's C64 blue, so the
+            // status/help/menu screens cover the whole window
+            SDL_SetRenderDrawColor(ren, 0x2E, 0x2C, 0x9B, 255);
             SDL_RenderClear(ren);
             SDL_RenderTexture(ren, term_tex, NULL, NULL);
             SDL_RenderPresent(ren);
@@ -1386,6 +1396,7 @@ int main(int argc, char **argv)
                 SDL_SetRenderLogicalPresentation(
                     ren, fb->width, fb->height,
                     SDL_LOGICAL_PRESENTATION_INTEGER_SCALE);
+                SDL_SetRenderDrawColor(ren, 0, 0, 0, 255); // video keeps black
                 SDL_RenderClear(ren);
                 SDL_RenderTexture(ren, tex, NULL, NULL);
                 SDL_RenderPresent(ren);
