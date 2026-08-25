@@ -8,7 +8,7 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.2.3"
+#define C64UV_VERSION "0.2.4"
 
 #include "discover.h"
 #include "keys.h"
@@ -760,41 +760,47 @@ static int run_term_test(const char *host)
 
 // ------------------------------------------------------------- help overlay
 //
-// The F10 view reuses the terminal grid renderer: fill a struct term with
-// the binding table and let term_render paint it. No new drawing code.
+// The F10 view draws pixels directly (term_draw_text): 12 spaced rows do
+// not fit the terminal's fixed 24-row grid, and this way the line pitch is
+// free. Same font, same colors.
 
-static void help_text(struct term *t, int row, int col, uint8_t color,
-                      const char *s)
-{
-    for (; *s && col < TERM_COLS; col++, s++) {
-        t->ch[row][col] = *s;
-        t->fg[row][col] = color;
-    }
-}
+#define HELP_PX_W TERM_PX_W
+#define HELP_PX_H 264
+#define HELP_LINE 14 // 8 px glyphs + 6 px of air between rows
+#define HELP_BLUE 0xFF2E2C9Bu
 
-static void help_fill(struct term *t)
+static void help_render(uint32_t *px)
 {
-    term_init(t);
-    help_text(t, 2, 22, 1, "c64uv " C64UV_VERSION " keys");
-    int row = 4;
-    for (int i = 0; i < viewer_bindings_count && row < TERM_ROWS - 3; i++) {
-        help_text(t, row, 3, 7, viewer_bindings[i].label);
-        help_text(t, row, 25, 15, viewer_bindings[i].desc);
-        row += 1 + viewer_bindings[i].gap; // table gaps group the rows
+    for (int i = 0; i < HELP_PX_W * HELP_PX_H; i++)
+        px[i] = HELP_BLUE;
+    int y = 14;
+    term_draw_text(px, HELP_PX_W, (HELP_PX_W - 16 * 8) / 2, y, 0xFFFFFFFF,
+                   "c64uv " C64UV_VERSION " keys");
+    y += 8 + 18;
+    for (int i = 0; i < viewer_bindings_count; i++) {
+        term_draw_text(px, HELP_PX_W, 24, y, 0xFFEDF171, // VIC yellow
+                       viewer_bindings[i].label);
+        term_draw_text(px, HELP_PX_W, 200, y, 0xFFB2B2B2, // light grey
+                       viewer_bindings[i].desc);
+        y += HELP_LINE + (viewer_bindings[i].gap ? 8 : 0);
     }
-    help_text(t, TERM_ROWS - 3, 3, 12, "F10 or Esc closes this help");
-    t->cx = -1; // keep term_render's cursor cell off the grid
-    t->dirty = true;
+    term_draw_text(px, HELP_PX_W, 24, y + 12, 0xFF7B7B7B, // dark grey
+                   "F10 or Esc closes this help");
 }
 
 // The status screen shown while there is no video yet (discovery running,
-// stream not started) reuses the same grid renderer.
+// stream not started) reuses the terminal grid renderer.
 
 static void status_center(struct term *t, int row, uint8_t color,
                           const char *s)
 {
     int col = (TERM_COLS - (int)strlen(s)) / 2;
-    help_text(t, row, col < 0 ? 0 : col, color, s);
+    if (col < 0)
+        col = 0;
+    for (; *s && col < TERM_COLS; col++, s++) {
+        t->ch[row][col] = *s;
+        t->fg[row][col] = color;
+    }
 }
 
 static void status_set(struct term *t, const char *l1, const char *l2)
@@ -1083,9 +1089,9 @@ int main(int argc, char **argv)
     // Ultimate menu terminal (F9). Connected lazily on first toggle.
     struct term *trm = calloc(1, sizeof *trm);
     term_init(trm);
-    // Help overlay (F10) borrows the same grid renderer.
-    struct term *help_scr = calloc(1, sizeof *help_scr);
-    term_init(help_scr);
+    // Help overlay (F10): own pixel buffer, spaced lines don't fit the grid.
+    uint32_t *help_px = calloc(HELP_PX_W * HELP_PX_H, sizeof(Uint32));
+    SDL_Texture *help_tex = NULL;
     bool help_active = false;
     bool term_active = false, term_present = false;
 
@@ -1190,8 +1196,6 @@ int main(int argc, char **argv)
                         atomic_store(&g_quit, true);
                     } else if (va == VA_HELP) {
                         help_active = !help_active;
-                        if (help_active)
-                            help_fill(help_scr);
                         term_present = true;
                     } else if (help_active) {
                         if (ev.key.key == SDLK_ESCAPE) {
@@ -1334,7 +1338,27 @@ int main(int argc, char **argv)
             frame_done = video_handle_packet(pkt, n, fb);
         }
 
-        struct term *view = help_active ? help_scr
+        if (windowed && help_active && term_present) {
+            if (!help_tex) {
+                help_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                             SDL_TEXTUREACCESS_STREAMING,
+                                             HELP_PX_W, HELP_PX_H);
+                SDL_SetTextureScaleMode(help_tex, SDL_SCALEMODE_NEAREST);
+            }
+            help_render(help_px);
+            term_present = false;
+            SDL_UpdateTexture(help_tex, NULL, help_px,
+                              HELP_PX_W * (int)sizeof(Uint32));
+            // same 2x vertical stretch as the terminal views
+            SDL_SetRenderLogicalPresentation(ren, HELP_PX_W, HELP_PX_H * 2,
+                                             SDL_LOGICAL_PRESENTATION_LETTERBOX);
+            SDL_SetRenderDrawColor(ren, 0x2E, 0x2C, 0x9B, 255);
+            SDL_RenderClear(ren);
+            SDL_RenderTexture(ren, help_tex, NULL, NULL);
+            SDL_RenderPresent(ren);
+        }
+
+        struct term *view = help_active ? NULL
                             : term_active ? trm
                             : !got_any    ? status
                                           : NULL;
@@ -1431,9 +1455,11 @@ int main(int argc, char **argv)
         close(tfd);
     if (term_tex)
         SDL_DestroyTexture(term_tex);
+    if (help_tex)
+        SDL_DestroyTexture(help_tex);
     free(term_px);
     free(trm);
-    free(help_scr);
+    free(help_px);
     free(status);
     if (astream)
         SDL_DestroyAudioStream(astream);
