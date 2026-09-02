@@ -3,32 +3,23 @@
 // Streams the Ultimate's video/audio into an SDL3 window, forwards keystrokes,
 // and shows the Ultimate menu over telnet. Protocol notes live in CLAUDE.md.
 
-#define _DEFAULT_SOURCE // struct ip_mreq with -std=c11
-
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
 #define C64UV_VERSION "0.2.5"
 
+#include "compat.h"
 #include "discover.h"
 #include "keys.h"
 #include "term.h"
 #include "video.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <strings.h>
-#include <fcntl.h>
-#include <ifaddrs.h>
-#include <netinet/in.h>
-#include <poll.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 struct config {
     const char *host;       // Ultimate hostname/IP for REST
@@ -48,23 +39,6 @@ struct config {
     bool verbose;
 };
 
-// Lazy TCP connection with rate-limited reconnect (used for ports 64 and 23).
-static int tcp_connect_to(const char *host, Uint16 port, int timeout_s)
-{
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
-        return -1;
-    struct timeval tv = {.tv_sec = timeout_s};
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(port)};
-    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1 ||
-        connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
 static atomic_bool g_quit;
 // machine:input capability (probed once per session): -1 unknown, 0 no, 1 yes
 static atomic_int g_minput = -1;
@@ -79,9 +53,9 @@ struct rest_ctx {
     char stop_url[2][256];
     char input_url[256];    // machine:input, probed for capability
     int nstreams;
-    int sock;                    // our UDP socket, for the ARP-priming packet
-    struct sockaddr_in ult_addr; // Ultimate's address
-    char prime_cmd[160];         // ping command forcing the LAN iface, or ""
+    compat_sock sock;   // our UDP socket, for the ARP-priming packet
+    char host[64];      // Ultimate's address, as given
+    char prime_if[32];  // LAN interface to force the prime out of, or ""
 };
 
 static size_t curl_sink(char *data, size_t size, size_t nmemb, void *userp)
@@ -150,15 +124,11 @@ static int keepalive_thread(void *arg)
         // The Ultimate refuses to start a stream toward an address missing
         // from its ARP table ("Network Host Resolve Error") and never ARPs on
         // demand, so make it hear from us first - and keep refreshing its
-        // entry every cycle. A plain sendto can leave through the wrong
+        // entry every cycle. A plain datagram can leave through the wrong
         // interface when policy routing claims the LAN (Tailscale
-        // accept-routes does), so prefer ping -I on the subnet's interface,
-        // which is allowed to force the egress device without privileges.
-        if (rc->prime_cmd[0])
-            (void)!system(rc->prime_cmd);
-        else
-            sendto(rc->sock, "", 1, 0, (struct sockaddr *)&rc->ult_addr,
-                   sizeof rc->ult_addr);
+        // accept-routes does), so the prime is forced out of the subnet's
+        // interface whenever one was found (see compat_arp_prime).
+        compat_arp_prime(rc->sock, rc->host, rc->prime_if);
         // Capability probe (GET is side-effect free), retried until the
         // machine gives an HTTP answer, then cached for the session.
         if (rc->input_url[0] && atomic_load(&g_minput) < 0) {
@@ -204,28 +174,24 @@ static int keepalive_thread(void *arg)
 static bool find_lan_iface(const char *host, char *ip, size_t iplen,
                            char *ifname, size_t iflen)
 {
-    struct in_addr target;
-    if (inet_pton(AF_INET, host, &target) != 1)
+    uint32_t target;
+    if (!compat_ipv4_parse(host, &target))
         return false; // hostname given; caller falls back to route lookup
-    struct ifaddrs *ifs;
-    if (getifaddrs(&ifs) != 0)
-        return false;
-    bool found = false;
-    for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
-        if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || !i->ifa_netmask)
-            continue;
-        struct in_addr a = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
-        struct in_addr m = ((struct sockaddr_in *)i->ifa_netmask)->sin_addr;
-        if (!m.s_addr || (a.s_addr & m.s_addr) != (target.s_addr & m.s_addr))
+    struct compat_iface ifs[32];
+    int n = compat_ifaces(ifs, 32);
+    bool found = false, found_wireless = false;
+    for (int k = 0; k < n; k++) {
+        const struct compat_iface *i = &ifs[k];
+        if (!i->mask || (i->addr & i->mask) != (target & i->mask))
             continue;
         // wired and wireless can share the subnet; prefer wired for 22 Mbps
-        if (found && strncmp(ifname, "wl", 2) != 0)
+        if (found && !found_wireless)
             continue;
-        inet_ntop(AF_INET, &a, ip, (socklen_t)iplen);
-        snprintf(ifname, iflen, "%s", i->ifa_name);
+        compat_ipv4_format(i->addr, ip, iplen);
+        snprintf(ifname, iflen, "%.31s", i->name); // both are 32-byte names
         found = true;
+        found_wireless = i->wireless;
     }
-    freeifaddrs(ifs);
     return found;
 }
 
@@ -239,55 +205,23 @@ static bool find_lan_iface(const char *host, char *ip, size_t iplen,
 
 static bool is_multicast_ip(const char *s)
 {
-    struct in_addr a;
-    return inet_pton(AF_INET, s, &a) == 1 && IN_MULTICAST(ntohl(a.s_addr));
+    uint32_t a;
+    return compat_ipv4_parse(s, &a) && compat_ipv4_is_multicast(a);
 }
 
 static void mcast_next_group(const char *video, char *audio, size_t cap)
 {
-    struct in_addr a;
-    inet_pton(AF_INET, video, &a);
-    a.s_addr = htonl(ntohl(a.s_addr) + 1);
-    inet_ntop(AF_INET, &a, audio, (socklen_t)cap);
-}
-
-// Joins on the given interface address (NULL = kernel picks by route).
-static bool mcast_join(int sock, const char *group, const char *ifip)
-{
-    struct ip_mreq m = {0};
-    if (inet_pton(AF_INET, group, &m.imr_multiaddr) != 1)
-        return false;
-    if (ifip)
-        inet_pton(AF_INET, ifip, &m.imr_interface);
-    return setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) == 0;
-}
-
-// Fallback: connect a UDP socket toward the Ultimate and read back the source
-// address the kernel picked.
-static bool detect_local_ip(const char *host, char *out, size_t outlen)
-{
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0)
-        return false;
-    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons(80)};
-    bool ok = inet_pton(AF_INET, host, &sa.sin_addr) == 1 &&
-              connect(s, (struct sockaddr *)&sa, sizeof sa) == 0;
-    if (ok) {
-        struct sockaddr_in local;
-        socklen_t len = sizeof local;
-        ok = getsockname(s, (struct sockaddr *)&local, &len) == 0 &&
-             inet_ntop(AF_INET, &local.sin_addr, out, outlen) != NULL;
-    }
-    close(s);
-    return ok;
+    uint32_t a = 0;
+    compat_ipv4_parse(video, &a);
+    compat_ipv4_format(a + 1, audio, cap);
 }
 
 // Everything that needs the Ultimate's address: destination detection, ARP
 // prime command, REST URLs, and the keepalive thread. Callable at startup
 // (host given) or later, when background discovery finds the machine.
 static SDL_Thread *net_start(struct config *cfg, struct rest_ctx *rc,
-                             int sock, int asock, const char *mc_video,
-                             const char *mc_audio)
+                             compat_sock sock, compat_sock asock,
+                             const char *mc_video, const char *mc_audio)
 {
     char lan_ip[46], ifname[32] = "";
     bool on_lan = find_lan_iface(cfg->host, lan_ip, sizeof lan_ip, ifname,
@@ -296,9 +230,9 @@ static SDL_Thread *net_start(struct config *cfg, struct rest_ctx *rc,
         // Background discovery bound the sockets before the host was known,
         // so the joins may sit on a routing-table-picked interface; join
         // again on the right one (a duplicate join just returns EADDRINUSE).
-        (void)mcast_join(sock, mc_video, lan_ip);
-        if (asock >= 0 && mc_audio[0])
-            (void)mcast_join(asock, mc_audio, lan_ip);
+        (void)compat_mcast_join(sock, mc_video, lan_ip);
+        if (asock != COMPAT_BAD_SOCK && mc_audio[0])
+            (void)compat_mcast_join(asock, mc_audio, lan_ip);
     }
     char dstv[64], dsta[64];
     if (mc_video[0]) {
@@ -315,18 +249,15 @@ static SDL_Thread *net_start(struct config *cfg, struct rest_ctx *rc,
     } else if (on_lan) {
         snprintf(dstv, sizeof dstv, "%s", lan_ip);
         snprintf(dsta, sizeof dsta, "%s", lan_ip);
-    } else if (detect_local_ip(cfg->host, dstv, sizeof dstv)) {
+    } else if (compat_route_source_ip(cfg->host, dstv, sizeof dstv)) {
+        // fallback: the source address the OS would route toward the host
         snprintf(dsta, sizeof dsta, "%s", dstv);
     } else {
         SDL_Log("cannot detect local IP; use --dest");
         return NULL;
     }
-    if (on_lan)
-        snprintf(rc->prime_cmd, sizeof rc->prime_cmd,
-                 "ping -n -q -c 1 -W 1 -I '%s' '%s' >/dev/null 2>&1",
-                 ifname, cfg->host);
-    else
-        rc->prime_cmd[0] = '\0';
+    snprintf(rc->host, sizeof rc->host, "%s", cfg->host);
+    snprintf(rc->prime_if, sizeof rc->prime_if, "%s", on_lan ? ifname : "");
     snprintf(rc->start_url[0], sizeof rc->start_url[0],
              "http://%s/v1/streams/video:start?ip=%s:%d", cfg->host, dstv,
              cfg->listen_port);
@@ -335,7 +266,7 @@ static SDL_Thread *net_start(struct config *cfg, struct rest_ctx *rc,
     snprintf(rc->input_url, sizeof rc->input_url,
              "http://%s/v1/machine:input", cfg->host);
     rc->nstreams = 1;
-    if (asock >= 0) {
+    if (asock != COMPAT_BAD_SOCK) {
         snprintf(rc->start_url[1], sizeof rc->start_url[1],
                  "http://%s/v1/streams/audio:start?ip=%s:%d", cfg->host,
                  dsta, cfg->listen_port + 1);
@@ -344,10 +275,7 @@ static SDL_Thread *net_start(struct config *cfg, struct rest_ctx *rc,
         rc->nstreams = 2;
     }
     rc->sock = sock;
-    rc->ult_addr = (struct sockaddr_in){.sin_family = AF_INET,
-                                        .sin_port = htons(11000)};
-    inet_pton(AF_INET, cfg->host, &rc->ult_addr.sin_addr);
-    SDL_Log("requesting %s -> %s:%d", asock >= 0 ? "video+audio" : "video",
+    SDL_Log("requesting %s -> %s:%d", asock != COMPAT_BAD_SOCK ? "video+audio" : "video",
             dstv, cfg->listen_port);
     return SDL_CreateThread(keepalive_thread, "keepalive", rc);
 }
@@ -380,7 +308,7 @@ static bool discovery_choose(struct discovered *found, int n, char *out,
     int pick = 0;
     for (int i = 0; i < n; i++)
         if ((!found[i].uid[0] || !strcmp(found[i].uid, found[0].uid)) &&
-            discover_ip_is_wired(found[i].ip, "/proc/net/arp")) {
+            discover_ip_is_wired(found[i].ip)) {
             pick = i;
             break;
         }
@@ -420,27 +348,28 @@ static int discover_thread(void *arg)
 // machine:input firmware feature, not shipped yet).
 
 struct keyb {
-    int fd; // -1 when disconnected
+    compat_sock fd; // COMPAT_BAD_SOCK when disconnected
     bool enabled;
     const char *host;
     Uint64 last_try;
 };
 
+// Lazy connection with rate-limited reconnect.
 static void keyb_try_connect(struct keyb *k)
 {
-    if (!k->enabled || k->fd >= 0 ||
+    if (!k->enabled || k->fd != COMPAT_BAD_SOCK ||
         (k->last_try != 0 && SDL_GetTicks() - k->last_try < 3000))
         return;
     k->last_try = SDL_GetTicks();
-    k->fd = tcp_connect_to(k->host, 64, 1);
-    if (k->fd >= 0)
+    k->fd = compat_tcp_connect(k->host, 64, 1);
+    if (k->fd != COMPAT_BAD_SOCK)
         SDL_Log("keyboard channel connected (port 64)");
 }
 
 static void keyb_raw(struct keyb *k, Uint16 cmd, const Uint8 *data, int n)
 {
     keyb_try_connect(k);
-    if (k->fd < 0)
+    if (k->fd == COMPAT_BAD_SOCK)
         return;
     Uint8 frame[4 + 16];
     frame[0] = cmd & 0xFF;
@@ -448,9 +377,9 @@ static void keyb_raw(struct keyb *k, Uint16 cmd, const Uint8 *data, int n)
     frame[2] = (Uint8)n;
     frame[3] = 0;
     memcpy(frame + 4, data, (size_t)n);
-    if (send(k->fd, frame, 4 + (size_t)n, MSG_NOSIGNAL) < 0) {
-        close(k->fd);
-        k->fd = -1; // reconnect on next keypress
+    if (compat_send(k->fd, frame, 4 + (size_t)n) < 0) {
+        compat_close(k->fd);
+        k->fd = COMPAT_BAD_SOCK; // reconnect on next keypress
     }
 }
 
@@ -512,11 +441,11 @@ static const char *runner_for(const char *path)
     const char *dot = strrchr(path, '.');
     if (!dot)
         return NULL;
-    if (!strcasecmp(dot, ".prg"))
+    if (!SDL_strcasecmp(dot, ".prg"))
         return "run_prg";
-    if (!strcasecmp(dot, ".crt"))
+    if (!SDL_strcasecmp(dot, ".crt"))
         return "run_crt";
-    if (!strcasecmp(dot, ".sid"))
+    if (!SDL_strcasecmp(dot, ".sid"))
         return "sidplay";
     return NULL;
 }
@@ -733,8 +662,8 @@ static void minput_release_all(struct minput *mi)
 // Headless verification: connect, read for a bit, print the parsed grid.
 static int run_term_test(const char *host)
 {
-    int fd = tcp_connect_to(host, 23, 3);
-    if (fd < 0) {
+    compat_sock fd = compat_tcp_connect(host, 23, 3);
+    if (fd == COMPAT_BAD_SOCK) {
         fprintf(stderr, "cannot connect to %s:23\n", host);
         return 1;
     }
@@ -743,15 +672,14 @@ static int run_term_test(const char *host)
     Uint8 buf[4096];
     Uint64 t0 = SDL_GetTicks();
     while (SDL_GetTicks() - t0 < 2500) {
-        struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        if (poll(&pfd, 1, 200) > 0) {
-            ssize_t n = recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (compat_wait_readable(&fd, 1, 200) > 0) {
+            int n = compat_recv_nowait(fd, buf, sizeof buf);
             if (n <= 0)
                 break;
-            term_feed(t, buf, (int)n);
+            term_feed(t, buf, n);
         }
     }
-    close(fd);
+    compat_close(fd);
     for (int r = 0; r < TERM_ROWS; r++)
         printf("%.*s\n", TERM_COLS, t->ch[r]);
     free(t);
@@ -898,7 +826,8 @@ int main(int argc, char **argv)
         cfg.password = getenv("C64U_PASSWORD");
     g_password = cfg.password;
     if (g_password)
-        setenv("C64U_PASSWORD", g_password, 1); // discovery reads the env
+        // discovery reads the env; SDL wraps the C runtime setenv portably
+        SDL_setenv_unsafe("C64U_PASSWORD", g_password, 1);
     if (cfg.do_action) {
         if (!strcmp(cfg.do_action, "menu"))
             cfg.do_action = "menu_button";
@@ -914,6 +843,10 @@ int main(int argc, char **argv)
     }
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (!compat_net_init()) {
+        fprintf(stderr, "network init: %s\n", compat_neterr());
+        return 1;
+    }
 
     if (cfg.discover) {
         struct discovered found[DISCOVER_MAX];
@@ -922,7 +855,7 @@ int main(int argc, char **argv)
             printf("%-15s  %s%s%s  firmware %s%s\n", found[i].ip,
                    found[i].product, found[i].hostname[0] ? "  " : "",
                    found[i].hostname, found[i].fw,
-                   discover_ip_is_wired(found[i].ip, "/proc/net/arp")
+                   discover_ip_is_wired(found[i].ip)
                        ? "  (wired)" : "");
         if (n == 0)
             fprintf(stderr, "no Ultimate found\n");
@@ -991,42 +924,32 @@ int main(int argc, char **argv)
                                              ifname, sizeof ifname);
     (void)ifname;
 
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        return 1;
-    }
-    int rcvbuf = 1 << 20, one = 1;
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
-    if (mc_video[0]) // several viewers on one host share the port
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in bind_addr = {.sin_family = AF_INET,
-                                    .sin_addr.s_addr = htonl(INADDR_ANY),
-                                    .sin_port = htons((Uint16)cfg.listen_port)};
-    if (bind(sock, (struct sockaddr *)&bind_addr, sizeof bind_addr) < 0) {
-        perror("bind");
+    // 1 MB receive buffers: a frame is ~70 packets and the loop is polled
+    // between renders. Multicast viewers on one host share the port.
+    int rcvbuf = 1 << 20;
+    compat_sock sock = compat_udp_bind((Uint16)cfg.listen_port, rcvbuf,
+                                       mc_video[0] != '\0');
+    if (sock == COMPAT_BAD_SOCK) {
+        fprintf(stderr, "bind port %d: %s\n", cfg.listen_port, compat_neterr());
         return 1;
     }
     if (mc_video[0] &&
-        !mcast_join(sock, mc_video, on_lan ? lan_ip : NULL)) {
-        perror("multicast join");
+        !compat_mcast_join(sock, mc_video, on_lan ? lan_ip : NULL)) {
+        fprintf(stderr, "multicast join: %s\n", compat_neterr());
         return 1;
     }
-    int asock = -1;
+    compat_sock asock = COMPAT_BAD_SOCK;
     if (!cfg.no_audio) {
-        asock = socket(AF_INET, SOCK_DGRAM, 0);
-        setsockopt(asock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
-        if (mc_audio[0])
-            setsockopt(asock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        struct sockaddr_in aaddr = bind_addr;
-        aaddr.sin_port = htons((Uint16)(cfg.listen_port + 1));
-        if (bind(asock, (struct sockaddr *)&aaddr, sizeof aaddr) < 0) {
-            perror("bind audio");
+        asock = compat_udp_bind((Uint16)(cfg.listen_port + 1), rcvbuf,
+                                mc_audio[0] != '\0');
+        if (asock == COMPAT_BAD_SOCK) {
+            fprintf(stderr, "bind audio port %d: %s\n", cfg.listen_port + 1,
+                    compat_neterr());
             return 1;
         }
         if (mc_audio[0] &&
-            !mcast_join(asock, mc_audio, on_lan ? lan_ip : NULL)) {
-            perror("multicast join audio");
+            !compat_mcast_join(asock, mc_audio, on_lan ? lan_ip : NULL)) {
+            fprintf(stderr, "multicast join audio: %s\n", compat_neterr());
             return 1;
         }
     }
@@ -1049,7 +972,7 @@ int main(int argc, char **argv)
         // the c64uv.desktop basename so desktops pair the window with its icon.
         SDL_SetAppMetadata("Commodore 64 Ultimate Viewer", C64UV_VERSION,
                            "c64uv");
-        if (!SDL_Init(SDL_INIT_VIDEO | (asock >= 0 ? SDL_INIT_AUDIO : 0))) {
+        if (!SDL_Init(SDL_INIT_VIDEO | (asock != COMPAT_BAD_SOCK ? SDL_INIT_AUDIO : 0))) {
             fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
             return 1;
         }
@@ -1061,7 +984,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "SDL window: %s\n", SDL_GetError());
             return 1;
         }
-        if (asock >= 0) {
+        if (asock != COMPAT_BAD_SOCK) {
             // Ultimate PAL audio clock; SDL resamples to whatever the
             // device wants. (NTSC is ~47940 - 0.09% off, inaudible.)
             SDL_AudioSpec aspec = {SDL_AUDIO_S16LE, 2, 47983};
@@ -1074,7 +997,7 @@ int main(int argc, char **argv)
         }
     }
 
-    struct keyb kb = {.fd = -1, .host = cfg.host};
+    struct keyb kb = {.fd = COMPAT_BAD_SOCK, .host = cfg.host};
     struct minput mi = {0};
     bool want_keyb = windowed && !cfg.no_keyb && !cfg.no_start;
     if (want_keyb)
@@ -1121,7 +1044,7 @@ int main(int argc, char **argv)
         atomic_store(&da.n, -1);
         dthr = SDL_CreateThread(discover_thread, "discover", &da);
     }
-    int tfd = -1;
+    compat_sock tfd = COMPAT_BAD_SOCK;
     Uint64 tfd_last_try = 0;
     SDL_Texture *term_tex = NULL;
     Uint32 *term_px = calloc(TERM_PX_W * TERM_PX_H, sizeof(Uint32));
@@ -1218,12 +1141,12 @@ int main(int argc, char **argv)
                         term_present = true; // repaint whichever view we enter
                         if (term_active && atomic_load(&g_minput) == 1)
                             minput_release_all(&mi); // no keys stay held
-                        if (term_active && tfd < 0 &&
+                        if (term_active && tfd == COMPAT_BAD_SOCK &&
                             (tfd_last_try == 0 ||
                              SDL_GetTicks() - tfd_last_try > 3000)) {
                             tfd_last_try = SDL_GetTicks();
-                            tfd = tcp_connect_to(cfg.host, 23, 1);
-                            if (tfd >= 0) {
+                            tfd = compat_tcp_connect(cfg.host, 23, 1);
+                            if (tfd != COMPAT_BAD_SOCK) {
                                 term_init(trm);
                                 SDL_Log("menu terminal connected (port 23)");
                             } else
@@ -1232,10 +1155,10 @@ int main(int argc, char **argv)
                     } else if (term_active) {
                         Uint8 seq[8];
                         int n = term_encode_key(ev.key.key, ev.key.mod, seq);
-                        if (n > 0 && tfd >= 0 &&
-                            send(tfd, seq, (size_t)n, MSG_NOSIGNAL) < 0) {
-                            close(tfd);
-                            tfd = -1;
+                        if (n > 0 && tfd != COMPAT_BAD_SOCK &&
+                            compat_send(tfd, seq, (size_t)n) < 0) {
+                            compat_close(tfd);
+                            tfd = COMPAT_BAD_SOCK;
                         }
                     } else if (kb.enabled) {
                         if (atomic_load(&g_minput) == 1) {
@@ -1269,10 +1192,11 @@ int main(int argc, char **argv)
                 } else if (ev.type == SDL_EVENT_TEXT_INPUT && !help_active) {
                     for (const char *p = ev.text.text; *p; p++) {
                         if (term_active) {
-                            if ((unsigned char)*p < 128 && tfd >= 0 &&
-                                send(tfd, p, 1, MSG_NOSIGNAL) < 0) {
-                                close(tfd);
-                                tfd = -1;
+                            if ((unsigned char)*p < 128 &&
+                                tfd != COMPAT_BAD_SOCK &&
+                                compat_send(tfd, p, 1) < 0) {
+                                compat_close(tfd);
+                                tfd = COMPAT_BAD_SOCK;
                             }
                         } else if (kb.enabled &&
                                    atomic_load(&g_minput) != 1) {
@@ -1286,24 +1210,22 @@ int main(int argc, char **argv)
             }
         }
 
-        struct pollfd pfd[3] = {{.fd = sock, .events = POLLIN},
-                                {.fd = asock, .events = POLLIN},
-                                {.fd = tfd, .events = POLLIN}};
-        poll(pfd, 3, 5); // negative fds are ignored by poll
+        compat_sock waitset[3] = {sock, asock, tfd}; // unset ones are skipped
+        compat_wait_readable(waitset, 3, 5);
 
-        if (tfd >= 0) { // keep the menu session current even when hidden
-            ssize_t n;
-            while ((n = recv(tfd, pkt, sizeof pkt, MSG_DONTWAIT)) > 0)
-                term_feed(trm, pkt, (int)n);
+        if (tfd != COMPAT_BAD_SOCK) { // keep the menu session current even when hidden
+            int n;
+            while ((n = compat_recv_nowait(tfd, pkt, sizeof pkt)) > 0)
+                term_feed(trm, pkt, n);
             if (n == 0) { // server closed
-                close(tfd);
-                tfd = -1;
+                compat_close(tfd);
+                tfd = COMPAT_BAD_SOCK;
             }
         }
 
-        if (asock >= 0) {
-            ssize_t n;
-            while ((n = recv(asock, pkt, sizeof pkt, MSG_DONTWAIT)) > 0) {
+        if (asock != COMPAT_BAD_SOCK) {
+            int n;
+            while ((n = compat_recv_nowait(asock, pkt, sizeof pkt)) > 0) {
                 if (n < 6)
                     continue;
                 Uint16 aseq = (Uint16)(pkt[0] | pkt[1] << 8);
@@ -1331,7 +1253,7 @@ int main(int argc, char **argv)
 
         bool frame_done = false;
         while (!frame_done) { // drain socket, stop at a completed frame
-            ssize_t n = recv(sock, pkt, sizeof pkt, MSG_DONTWAIT);
+            int n = compat_recv_nowait(sock, pkt, sizeof pkt);
             if (n < 0)
                 break;
             packets++;
@@ -1449,10 +1371,8 @@ int main(int argc, char **argv)
     if (mi.curl)
         curl_easy_cleanup(mi.curl);
     curl_global_cleanup();
-    if (kb.fd >= 0)
-        close(kb.fd);
-    if (tfd >= 0)
-        close(tfd);
+    compat_close(kb.fd);
+    compat_close(tfd);
     if (term_tex)
         SDL_DestroyTexture(term_tex);
     if (help_tex)
@@ -1463,8 +1383,7 @@ int main(int argc, char **argv)
     free(status);
     if (astream)
         SDL_DestroyAudioStream(astream);
-    if (asock >= 0)
-        close(asock);
+    compat_close(asock);
     if (tex)
         SDL_DestroyTexture(tex);
     if (ren)
@@ -1473,7 +1392,8 @@ int main(int argc, char **argv)
         SDL_DestroyWindow(win);
     if (windowed)
         SDL_Quit();
-    close(sock);
+    compat_close(sock);
+    compat_net_quit();
     free(fb);
     return 0;
 }

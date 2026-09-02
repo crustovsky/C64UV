@@ -11,9 +11,13 @@ else
 LDLIBS  += $(shell pkg-config --libs sdl3 libcurl)
 endif
 
-SRC = src/main.c src/video.c src/term.c src/keys.c src/discover.c
-LIB = src/video.c src/term.c src/keys.c src/discover.c
-HDR = src/video.h src/term.h src/keys.h src/discover.h src/font8x8.h
+# compat_posix.c is the Linux reference implementation of compat.h; a port
+# swaps in its own file here.
+COMPAT = src/compat_posix.c
+SRC = src/main.c src/video.c src/term.c src/keys.c src/discover.c $(COMPAT)
+LIB = src/video.c src/term.c src/keys.c src/discover.c $(COMPAT)
+HDR = src/video.h src/term.h src/keys.h src/discover.h src/compat.h \
+      src/font8x8.h
 
 c64uv: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC) $(LDLIBS)
