@@ -1,13 +1,10 @@
-#define _DEFAULT_SOURCE // IFF_* flags with -std=c11
-
 #include "discover.h"
+
+#include "compat.h"
 
 #include <curl/curl.h>
 
-#include <arpa/inet.h>
-#include <ifaddrs.h>
-#include <net/if.h>
-#include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,21 +56,11 @@ static bool is_ultimate_info(long code, const char *resp, struct discovered *d)
     return true;
 }
 
-bool discover_ip_is_wired(const char *ip, const char *arp_path)
+bool discover_ip_is_wired(const char *ip)
 {
-    FILE *f = fopen(arp_path, "r");
-    if (!f)
-        return false;
-    char line[256];
-    bool wired = false;
-    while (!wired && fgets(line, sizeof line, f)) {
-        char a[46], hw[64];
-        // /proc/net/arp: IP  HWtype  Flags  HWaddress  Mask  Device
-        if (sscanf(line, "%45s %*s %*s %63s", a, hw) == 2 && !strcmp(a, ip))
-            wired = strncmp(hw, "02:15:41", 8) == 0;
-    }
-    fclose(f);
-    return wired;
+    char mac[COMPAT_MAC_STRLEN];
+    return compat_neighbor_mac(ip, mac, sizeof mac) &&
+           strncmp(mac, "02:15:41", 8) == 0;
 }
 
 struct probe {
@@ -118,38 +105,31 @@ int discover_scan(struct discovered *out, int max, bool verbose)
     int nnets = 0, nself = 0;
     const char *nenv = getenv("C64U_DISCOVER_NET");
     if (nenv) {
-        struct in_addr a;
-        if (inet_pton(AF_INET, nenv, &a) != 1)
+        uint32_t a;
+        if (!compat_ipv4_parse(nenv, &a))
             return 0;
-        nets[nnets++] = ntohl(a.s_addr) & 0xFFFFFF00u;
+        nets[nnets++] = a & 0xFFFFFF00u;
     } else {
-        struct ifaddrs *ifs;
-        if (getifaddrs(&ifs) != 0)
-            return 0;
-        for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
-            if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET ||
-                (i->ifa_flags & IFF_LOOPBACK) || !(i->ifa_flags & IFF_UP))
+        struct compat_iface ifs[32];
+        int n = compat_ifaces(ifs, 32);
+        for (int k = 0; k < n; k++) {
+            const struct compat_iface *i = &ifs[k];
+            if (i->loopback || !i->up)
                 continue;
             // The sweep covers the /24 around the address, so it only makes
             // sense on interfaces whose subnet is at least that big; this
             // skips /32 VPN endpoints (Tailscale, WireGuard).
-            if (i->ifa_netmask &&
-                (ntohl(((struct sockaddr_in *)i->ifa_netmask)
-                           ->sin_addr.s_addr) &
-                 0xFF) != 0)
+            if (i->mask & 0xFF)
                 continue;
-            uint32_t a = ntohl(((struct sockaddr_in *)i->ifa_addr)
-                                   ->sin_addr.s_addr);
             if (nself < 16)
-                self[nself++] = a;
-            uint32_t net = a & 0xFFFFFF00u;
+                self[nself++] = i->addr;
+            uint32_t net = i->addr & 0xFFFFFF00u;
             bool dup = false;
-            for (int k = 0; k < nnets; k++)
-                dup |= nets[k] == net;
+            for (int j = 0; j < nnets; j++)
+                dup |= nets[j] == net;
             if (!dup && nnets < 8)
                 nets[nnets++] = net;
         }
-        freeifaddrs(ifs);
     }
 
     CURLM *multi = curl_multi_init();
@@ -160,10 +140,9 @@ int discover_scan(struct discovered *out, int max, bool verbose)
     int found = 0, next = 0, total = nnets * 254, running = 0;
 
     for (int k = 0; k < nnets && verbose; k++) {
-        struct in_addr a = {.s_addr = htonl(nets[k])};
-        char s[46];
+        char s[COMPAT_IP_STRLEN];
         fprintf(stderr, "scanning %s/24 for /v1/info responders...\n",
-                inet_ntop(AF_INET, &a, s, sizeof s));
+                compat_ipv4_format(nets[k], s, sizeof s));
     }
 
     while ((next < total || running > 0) && found < max) {
@@ -181,8 +160,7 @@ int discover_scan(struct discovered *out, int max, bool verbose)
                     pr = &probes[k];
                     break;
                 }
-            struct in_addr a = {.s_addr = htonl(addr)};
-            inet_ntop(AF_INET, &a, pr->ip, sizeof pr->ip);
+            compat_ipv4_format(addr, pr->ip, sizeof pr->ip);
             snprintf(pr->url, sizeof pr->url, "http://%s:%ld/v1/info", pr->ip,
                      port);
             pr->resp[0] = '\0';

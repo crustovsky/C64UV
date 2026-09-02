@@ -29,8 +29,8 @@ bool json_find_str(const char *json, const char *key, char *out, size_t cap);
 
 // True if `ip` maps to the Ultimate's wired (FPGA) interface: its MAC in the
 // neighbor table starts with the firmware's fixed 02:15:41 prefix, unlike
-// the WiFi side's Espressif MAC. The probe sweep itself fills the table.
-// arp_path is /proc/net/arp in production, a fixture in tests.
-bool discover_ip_is_wired(const char *ip, const char *arp_path);
+// the WiFi side's Espressif MAC. The probe sweep itself fills the table
+// (tests point compat_neighbor_mac at a fixture via C64U_ARP_TABLE).
+bool discover_ip_is_wired(const char *ip);
 
 #endif

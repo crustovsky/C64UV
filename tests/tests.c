@@ -1,12 +1,16 @@
 // Unit tests for the hardware-independent parts: VT100 terminal parsing,
 // VIC frame assembly, and PETSCII key mapping. No device needed; run with
 // `make test`.
+#define _POSIX_C_SOURCE 200809L // setenv with -std=c11 (test-only)
+
+#include "../src/compat.h"
 #include "../src/discover.h"
 #include "../src/keys.h"
 #include "../src/term.h"
 #include "../src/video.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures;
@@ -241,15 +245,77 @@ static void test_arp_wired(void)
           "192.168.8.236    0x1         0x2         02:15:41:79:9d:c6     "
           "*        eth0\n", f);
     fclose(f);
-    CHECK(discover_ip_is_wired("192.168.8.236", path));
-    CHECK(!discover_ip_is_wired("192.168.8.173", path)); // ESP32 WiFi side
-    CHECK(!discover_ip_is_wired("192.168.8.99", path));  // not in the table
-    CHECK(!discover_ip_is_wired("192.168.8.236", "/nonexistent"));
+    setenv("C64U_ARP_TABLE", path, 1);
+    char mac[COMPAT_MAC_STRLEN];
+    CHECK(compat_neighbor_mac("192.168.8.173", mac, sizeof mac) &&
+          !strcmp(mac, "9c:13:9e:ef:14:d0"));
+    CHECK(discover_ip_is_wired("192.168.8.236"));
+    CHECK(!discover_ip_is_wired("192.168.8.173")); // ESP32 WiFi side
+    CHECK(!discover_ip_is_wired("192.168.8.99"));  // not in the table
+    setenv("C64U_ARP_TABLE", "/nonexistent", 1);
+    CHECK(!discover_ip_is_wired("192.168.8.236"));
+    unsetenv("C64U_ARP_TABLE");
     remove(path);
+}
+
+static void test_compat(void)
+{
+    uint32_t a = 0;
+    char s[COMPAT_IP_STRLEN];
+    CHECK(compat_ipv4_parse("192.168.8.236", &a) && a == 0xC0A808ECu);
+    CHECK(!strcmp(compat_ipv4_format(a, s, sizeof s), "192.168.8.236"));
+    CHECK(!strcmp(compat_ipv4_format(a + 1, s, sizeof s), "192.168.8.237"));
+    CHECK(!compat_ipv4_parse("c64-ultimate", &a)); // hostnames are refused
+    CHECK(!compat_ipv4_parse("192.168.8", &a));
+    CHECK(!compat_ipv4_parse("192.168.8.256", &a));
+    CHECK(compat_ipv4_parse("239.0.1.64", &a) && compat_ipv4_is_multicast(a));
+    CHECK(compat_ipv4_parse("10.0.0.1", &a) && !compat_ipv4_is_multicast(a));
+
+    // sockets: bind an ephemeral UDP port, loop a datagram back, and make
+    // sure the non-blocking receive and the readiness wait agree
+    CHECK(compat_net_init());
+    compat_sock rx = compat_udp_bind(0, 65536, false);
+    compat_sock tx = compat_udp_bind(0, 65536, false);
+    CHECK(rx != COMPAT_BAD_SOCK && tx != COMPAT_BAD_SOCK);
+    char local[COMPAT_IP_STRLEN];
+    CHECK(compat_route_source_ip("127.0.0.1", local, sizeof local) &&
+          !strcmp(local, "127.0.0.1"));
+    char buf[16];
+    CHECK(compat_recv_nowait(rx, buf, sizeof buf) < 0); // nothing yet
+    CHECK(compat_wait_readable(&rx, 1, 0) == 0);
+    // the bound port is the one detail the layer has no getter for, so the
+    // loopback test uses a fixed high port for the receiver instead
+    compat_close(rx);
+    rx = compat_udp_bind(21099, 65536, true);
+    CHECK(rx != COMPAT_BAD_SOCK);
+    CHECK(compat_sendto(tx, "hi", 2, "127.0.0.1", 21099) == 2);
+    CHECK(compat_sendto(tx, "hi", 2, "nowhere", 21099) < 0);
+    compat_sock set[3] = {COMPAT_BAD_SOCK, rx, COMPAT_BAD_SOCK};
+    CHECK(compat_wait_readable(set, 3, 1000) == 1);
+    CHECK(compat_recv_nowait(rx, buf, sizeof buf) == 2 && buf[0] == 'h');
+    CHECK(compat_recv_nowait(rx, buf, sizeof buf) < 0);
+    // a duplicate bind without reuse fails and reports why
+    CHECK(compat_udp_bind(21099, 65536, false) == COMPAT_BAD_SOCK);
+    CHECK(compat_neterr()[0] != '\0');
+    // TCP to a closed port fails cleanly instead of hanging
+    CHECK(compat_tcp_connect("127.0.0.1", 21098, 1) == COMPAT_BAD_SOCK);
+    compat_close(rx);
+    compat_close(tx);
+    compat_close(COMPAT_BAD_SOCK); // must be a no-op
+
+    // interface enumeration: loopback is always there and flagged
+    struct compat_iface ifs[32];
+    int n = compat_ifaces(ifs, 32);
+    bool lo = false;
+    for (int i = 0; i < n; i++)
+        lo |= ifs[i].loopback && (ifs[i].addr >> 24) == 127;
+    CHECK(lo);
+    compat_net_quit();
 }
 
 int main(void)
 {
+    test_compat();
     test_term_basics();
     test_term_geometry();
     test_term_keys();

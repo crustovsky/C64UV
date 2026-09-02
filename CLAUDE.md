@@ -17,7 +17,16 @@ src/discover.c  /v1/info sweep of the local /24s (SDL-free, curl multi)
 src/video.c  VIC frame assembly (SDL-free, unit-tested)
 src/term.c   minimal VT100 emulator matched to the firmware's remote screen
 src/font8x8.h  public-domain 8x8 bitmap font (rendering for term.c)
+src/compat.h   platform layer: sockets, interface list, neighbor (ARP)
+               table, ARP prime; compat_posix.c is the Linux reference
+               implementation (a port swaps the file in the Makefile)
 ```
+
+Nothing outside compat_posix.c includes a socket or network header: main.c
+and discover.c are C11 + SDL3 + libcurl + compat.h. Sockets are
+`compat_sock` compared against `COMPAT_BAD_SOCK` (never `< 0`, Winsock
+handles are unsigned). SDL wrappers stand in for the POSIX string/env
+calls (`SDL_strcasecmp`, `SDL_setenv_unsafe`).
 
 Packaging: `make install` (DESTDIR/PREFIX) installs the binary plus
 `assets/c64uv.desktop` and `assets/c64uv.svg` (icon; regenerate with
@@ -52,7 +61,10 @@ end (frame geometry, palette, nibble order) plus REST-level tests against
 Discovery is testable hermetically via env hooks: `C64U_DISCOVER_NET`
 (sweep exactly that /24, loopback allowed) and `C64U_DISCOVER_PORT`
 (override port 80; the chosen host then keeps `:port` for the REST calls
-too). The suite listens on port 21000 so a viewer the user left running
+too) and `C64U_ARP_TABLE` (neighbor-table file the wired-interface check
+reads instead of `/proc/net/arp`). The unit tests also exercise the compat
+layer itself with loopback sockets (ports 21098/21099). The suite listens
+on port 21000 so a viewer the user left running
 cannot collide, and the windowed no-host path is exercised headless via
 `SDL_VIDEODRIVER=dummy`. CI (GitHub Actions, Arch container) runs build +
 both on every push and PR.
@@ -91,7 +103,16 @@ both on every push and PR.
   mechanism. Works only for KERNAL-read input, not matrix-scanning games.
 - **`machine:input` (CIA1 matrix-level)**: probed with a side-effect-free
   `GET /v1/machine:input` by the keepalive thread (404 on official firmware
-  1.1.0, verified; upstream 3.15 beta has it). When capable, key events POST
+  1.1.0, re-verified 2026-09-02; the docs specify 501 for hardware without
+  it). Commodore's 1.0.0 = upstream v3.14, 1.1.0 = a 3.14-based build 165;
+  the input API (upstream PR #698, June 2026) first appears in the v3.15
+  release candidate, so it needs a newer Commodore release. Documented
+  limits: 1-64 events and <= 4096 bytes per POST, 1-8 keyboard names per
+  event; joystick events take `port` 1|2 and up/down/left/right/fire/
+  fire2/fire3. The same firmware adds `GET /v1/machine:menu_screen` (2000
+  bytes: 40x25 chars + 40x25 colour attrs, reverse video = bit 7) and
+  routes keyboard events to the menu while it is open, which would make a
+  REST menu view possible without telnet. When capable, key events POST
   JSON batches (`{"events":[{"kind":"keyboard","inputs":[...],"transition":
   "press"|"release"|"tap"}]}`); mapping lives in keys.c
   (`key_to_c64_matrix`): cursor up/left and F2/4/6/8 are shift chords,
@@ -134,18 +155,18 @@ both on every push and PR.
 The six 2026-08 milestones (discovery, multicast, machine:input, machine
 control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
 
-1. **Platform compat layer** (next up): isolate the POSIX-specific pieces
-   behind one small compat header - sockets (init/close, nonblocking,
-   `MSG_NOSIGNAL`, poll), interface enumeration (`getifaddrs`), neighbor/ARP
-   lookup (`/proc/net/arp`), and the ARP-prime command (`ping -I`; the
-   plain UDP prime likely suffices off Linux, the ping trick exists for
-   Linux policy routing). Linux stays the reference implementation and
-   sole CI target for now. Gated follow-ups, not commitments: a Windows
-   port (Winsock/`GetAdaptersAddresses`/`GetIpNetTable`, CMake or dual
-   build, CI job, zip-with-DLLs release) only when there is a test machine
-   or a motivated tester with real hardware - the community is
-   Windows-heavy, but an unverifiable port rots; a macOS port (mostly
-   builds as-is, BSD sockets + `getifaddrs`) only on request.
+1. **Platform compat layer** (done 2026-09): `src/compat.h` +
+   `compat_posix.c` hold sockets, interface enumeration, neighbor/ARP
+   lookup, and the ARP prime (`ping -I` on Linux for policy routing; a
+   plain datagram likely suffices elsewhere). Linux stays the reference
+   implementation and sole CI target. Gated follow-ups, not commitments:
+   a Windows port (`compat_win32.c`: Winsock, `GetAdaptersAddresses`,
+   `GetIpNetTable`; CMake or dual build, CI job, zip-with-DLLs release)
+   only when there is a test machine or a motivated tester with real
+   hardware - the community is Windows-heavy, but an unverifiable port
+   rots; a macOS port (compat_posix.c mostly builds as-is: BSD sockets +
+   `getifaddrs`, but `/proc/net/arp` and `ping -I` need `arp -n` /
+   `ping -b` equivalents) only on request.
 2. **Gamepad -> machine:input joysticks**: SDL_Gamepad (SDL_INIT_GAMEPAD,
    hotplug), d-pad + digitalized left stick -> directions, A = fire, B = up
    as an option (platformers jump via up), events POSTed as
