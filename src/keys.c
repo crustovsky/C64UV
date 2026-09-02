@@ -51,6 +51,27 @@ int key_to_c64_matrix(SDL_Keycode key, const char *names[2])
         case SDLK_ESCAPE: one = "run_stop"; break;
         case SDLK_HOME: one = "clr_home"; break;
         case SDLK_PAGEUP: one = "restore"; break; // tap-only
+        // The C64's top row ends "+ - £ CLR/HOME INST/DEL"; a PC has no
+        // unshifted + or £ key, so both live in the nav cluster next to
+        // Home and Delete (Shift+= would reach the machine as shift+plus,
+        // a graphic character, because Shift is a real held key there).
+        case SDLK_INSERT: one = "pound"; break;
+        case SDLK_END:
+        case SDLK_KP_PLUS: one = "plus"; break;
+        case SDLK_KP_MINUS: one = "minus"; break;
+        case SDLK_KP_MULTIPLY: one = "star"; break;
+        case SDLK_KP_DIVIDE: one = "slash"; break;
+        case SDLK_KP_PERIOD: one = "period"; break;
+        case SDLK_KP_0: one = "0"; break;
+        case SDLK_KP_1: one = "1"; break;
+        case SDLK_KP_2: one = "2"; break;
+        case SDLK_KP_3: one = "3"; break;
+        case SDLK_KP_4: one = "4"; break;
+        case SDLK_KP_5: one = "5"; break;
+        case SDLK_KP_6: one = "6"; break;
+        case SDLK_KP_7: one = "7"; break;
+        case SDLK_KP_8: one = "8"; break;
+        case SDLK_KP_9: one = "9"; break;
         case SDLK_COMMA: one = "comma"; break;
         case SDLK_PERIOD: one = "period"; break;
         case SDLK_SLASH: one = "slash"; break;
@@ -109,7 +130,8 @@ const struct viewer_binding viewer_bindings[] = {
     {.label = "Esc", .desc = "RUN/STOP", .action = VA_INFO},
     {.label = "F1-F8, cursors, Home", .desc = "the matching C64 keys",
      .action = VA_INFO},
-    {.label = "Tab / PgUp", .desc = "C64 CTRL / RESTORE (matrix mode)",
+    // ASCII only: the overlay renders through the 8x8 basic font
+    {.label = "Tab, PgUp, Ins, End", .desc = "CTRL, RESTORE, pound, + (matrix)",
      .action = VA_INFO, .gap = true},
     {.label = "file drop", .desc = "run a .prg/.crt/.sid on the machine",
      .action = VA_INFO},

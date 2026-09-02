@@ -140,8 +140,9 @@ terminal.
   viewer probes for the hardware-level `machine:input` API (in upstream
   firmware betas) on every start and switches to true matrix-level
   press/release automatically once your firmware has it; games, chords, and
-  held keys then work, with Tab acting as the C64 CTRL key and PageUp as
-  RESTORE.
+  held keys then work, with Tab acting as the C64 CTRL key, PageUp as
+  RESTORE, Insert as £ and End as + (both also on the numeric keypad; a PC
+  has no unshifted key for either).
 - The Ultimate's menu overlay is not part of the VIC stream - that's what the
   F9 telnet view is for.
 - IPv4 only. The device streams to one destination, so it's one viewer per
