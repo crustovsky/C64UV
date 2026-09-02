@@ -58,7 +58,7 @@ echo "mock stream test passed"
 # A fake Ultimate on one loopback address must be found; a plain web server
 # on another must be rejected (real subnets are full of port-80 responders).
 
-python3 tests/fakeultimate.py 127.0.0.42 8064 "$out/disc.log" &
+python3 tests/fakeultimate.py 127.0.0.42 8064 "$out/disc.log" 8065 &
 pids+=($!)
 python3 -m http.server 8064 --bind 127.0.0.99 >/dev/null 2>&1 &
 pids+=($!)
@@ -142,6 +142,43 @@ grep -q "POST /v1/runners:sidplay body=32" "$out/disc.log"
 touch "$out/note.txt"
 ./c64uv --host 127.0.0.42:8064 --run "$out/note.txt" 2>/dev/null && exit 1
 echo "file run test passed"
+
+# ------------------------------------------------------------- disk images
+# A .d64 goes out as one RUN_IMG frame on the DMA socket (24-bit length),
+# with the same cartridge parking and readiness gate as a program run; with
+# a password set the connection authenticates first. Other image types are
+# mounted over REST without touching the machine.
+
+head -c 174848 /dev/urandom > "$out/disk.d64"
+: > "$out/disc.log"
+C64U_DMA_PORT=8065 timeout 30 ./c64uv --host 127.0.0.42:8064 --run "$out/disk.d64"
+python3 - "$out/disc.log" <<'EOF'
+import sys
+log = open(sys.argv[1]).read().splitlines()
+want = ["PUT /v1/configs/C64%20and%20Cartridge%20Settings/Cartridge?value=",
+        "DMA cmd=FF0B len=174848",
+        "GET /v1/machine:readmem?address=00CC&length=1",
+        "PUT /v1/configs/C64%20and%20Cartridge%20Settings/Cartridge?value=Retro%20Replay"]
+i = 0
+for line in log:
+    if i < len(want) and line == want[i]:
+        i += 1
+assert i == len(want), f"missing/mis-ordered step {i}: {want[i]}\nlog: {log}"
+assert not any("drives" in l for l in log), log
+EOF
+: > "$out/disc.log"
+C64U_DMA_PORT=8065 C64U_PASSWORD=envpw timeout 30 ./c64uv --host 127.0.0.42:8064 --run "$out/disk.d64"
+python3 - "$out/disc.log" <<'EOF'
+import sys
+log = open(sys.argv[1]).read().splitlines()
+assert log.index("DMA cmd=FF1F pw=envpw") < log.index("DMA cmd=FF0B len=174848"), log
+EOF
+head -c 819200 /dev/urandom > "$out/disk.d81"
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --run "$out/disk.d81"
+grep -q "POST /v1/drives/a:mount?type=d81 body=819200" "$out/disc.log"
+grep -q "Cartridge" "$out/disc.log" && exit 1 # a plain mount parks nothing
+echo "disk image test passed"
 
 # ---------------------------------------------------------------------- help
 # --help must print the shared binding table (same rows the F10 overlay

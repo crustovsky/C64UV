@@ -89,11 +89,18 @@ refuses to start a stream toward an address missing from its ARP table.
 | Ctrl+M | press the Ultimate's menu button (the on-screen menu then answers the physical keyboard only; use F9 to drive a menu from the viewer) |
 | Ctrl+Q | quit |
 
-**Drop a `.prg`, `.crt`, or `.sid` file onto the window** and the Ultimate
-runs it (DMA program run, cartridge run, or SID player). If a cartridge is
-configured on the machine, it is parked for the run and restored afterwards,
-so a freezer cart won't hijack the program's reset; the cart is back on your
-next manual reset. The same works headless: `c64uv --run game.prg`.
+**Drop a `.prg`, `.crt`, `.sid`, or `.d64` file onto the window** and the
+Ultimate runs it (DMA program run, cartridge run, SID player, or for a
+`.d64`: mount on drive A, reset, `LOAD"*",8,1` and `RUN`, all done by the
+firmware over the DMA socket). If a cartridge is configured on the machine,
+it is parked for the run and restored afterwards, so a freezer cart won't
+hijack the program's reset; the cart is back on your next manual reset. The
+same works headless: `c64uv --run game.prg`.
+
+Other disk images (`.g64`, `.d71`, `.g71`, `.d81`) are mounted on drive A
+without touching the machine; type `LOAD"*",8,1` yourself. Every image is
+copied to the Ultimate's temp area first, so writes never reach the file you
+dropped.
 
 The same machine controls work headless: `c64uv --do reset` (also `reboot`,
 `pause`, `resume`, `menu`, `poweroff`) issues one REST call and exits. If

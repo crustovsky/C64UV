@@ -6,11 +6,68 @@ one line per request to a log file so tests can assert on what was called:
 
     METHOD PATH?QUERY [pw=<X-Password>] [body=<len>]
 
-Usage: fakeultimate.py <bind-ip> <port> <logfile>
+With a fourth argument it also serves the firmware's DMA socket protocol on
+that TCP port (c64uv reads C64U_DMA_PORT), logging every frame as
+
+    DMA cmd=FFxx len=<payload length>      (AUTHENTICATE logs pw=<password>)
+
+Usage: fakeultimate.py <bind-ip> <port> <logfile> [dma-port]
 """
 import http.server
 import json
+import socket
 import sys
+import threading
+
+LEN24_CMDS = (0xFF0A, 0xFF0B, 0xFF0D)  # MOUNT_IMG, RUN_IMG, RUN_CRT
+
+
+def _log_line(line):
+    with open(sys.argv[3], "a") as f:
+        f.write(line + "\n")
+
+
+def _recv_exact(conn, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _dma_client(conn):
+    with conn:
+        while True:
+            hdr = _recv_exact(conn, 4)
+            if not hdr:
+                return
+            cmd = hdr[0] | hdr[1] << 8
+            n = hdr[2] | hdr[3] << 8
+            if cmd in LEN24_CMDS:
+                extra = _recv_exact(conn, 1)
+                if extra is None:
+                    return
+                n |= extra[0] << 16
+            payload = _recv_exact(conn, n) if n else b""
+            if payload is None:
+                return
+            if cmd == 0xFF1F:  # AUTHENTICATE: the firmware answers one byte
+                _log_line(f"DMA cmd=FF1F pw={payload.decode(errors='replace')}")
+                conn.sendall(b"\x01")
+            else:
+                _log_line(f"DMA cmd={cmd:04X} len={n}")
+
+
+def _dma_server(ip, port):
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((ip, port))
+    srv.listen()
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=_dma_client, args=(conn,), daemon=True).start()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -67,5 +124,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 4:
+        threading.Thread(target=_dma_server,
+                         args=(sys.argv[1], int(sys.argv[4])),
+                         daemon=True).start()
     http.server.HTTPServer((sys.argv[1], int(sys.argv[2])),
                            Handler).serve_forever()

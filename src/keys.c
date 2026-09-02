@@ -133,7 +133,7 @@ const struct viewer_binding viewer_bindings[] = {
     // ASCII only: the overlay renders through the 8x8 basic font
     {.label = "Tab, PgUp, Ins, End", .desc = "CTRL, RESTORE, pound, + (matrix)",
      .action = VA_INFO, .gap = true},
-    {.label = "file drop", .desc = "run a .prg/.crt/.sid on the machine",
+    {.label = "file drop", .desc = "run .prg/.crt/.sid/.d64 on the C64",
      .action = VA_INFO},
     {.key = SDLK_F9, .label = "F9", .desc = "toggle the Ultimate menu view",
      .action = VA_MENU_VIEW},

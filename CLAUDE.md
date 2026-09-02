@@ -146,6 +146,21 @@ both on every push and PR.
   programs that never return to the prompt). `run_crt` runs the posted cart
   on purpose, so no parking there. `$CC` reads 0x00 at the READY prompt,
   verified.
+- **Disk images (verified on 1.1.0)**: the DMA socket's `RUN_IMG` (0xFF0B,
+  header `0B FF <len16 LE> <len bits 16-23>` then the image) saves the
+  payload as `/temp/tcpimage.d64`, mounts it on drive A and runs
+  `C64_DRIVE_LOAD` with `RUNCODE_MOUNT_LOAD_RUN`: the firmware resets,
+  types `LOAD"*",8,1` and `RUN` itself (screen RAM confirms). Payload cap
+  is `SOCKET_BUFFER_SIZE` = 200000 bytes (every .d64 variant fits; the
+  firmware silently truncates beyond). Always saved as .d64, so only that
+  type autostarts; `POST /v1/drives/a:mount?type=<d64|g64|d71|g71|d81>`
+  with the image as the body mounts the others (lands as `/Temp/temp0000`).
+  `MOUNT_IMG` (0xFF0A) is the socket twin of that mount. With a network
+  password the socket needs `AUTHENTICATE` (0xFF1F, password as payload,
+  one-byte reply 1/0, 1 s throttle on failure) before any other command,
+  or the firmware drops the connection; `dma_connect` does it for both
+  the keyboard channel and image runs. `C64U_DMA_PORT` redirects port 64
+  for tests (fakeultimate.py logs `DMA cmd=FFxx len=N`).
 
 ## Dev workflow (no hardware needed)
 
