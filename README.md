@@ -86,7 +86,7 @@ refuses to start a stream toward an address missing from its ARP table.
 | **F10** | in-window key reference (same table as `--help`) |
 | Ctrl+R / Ctrl+Shift+R | reset / reboot the machine |
 | Ctrl+P | pause / resume the machine |
-| Ctrl+M | press the Ultimate's menu button |
+| Ctrl+M | press the Ultimate's menu button (the on-screen menu then answers the physical keyboard only; use F9 to drive a menu from the viewer) |
 | Ctrl+Q | quit |
 
 **Drop a `.prg`, `.crt`, or `.sid` file onto the window** and the Ultimate
@@ -144,7 +144,12 @@ terminal.
   RESTORE, Insert as £ and End as + (both also on the numeric keypad; a PC
   has no unshifted key for either).
 - The Ultimate's menu overlay is not part of the VIC stream - that's what the
-  F9 telnet view is for.
+  F9 telnet view is for. The on-screen menu (Ctrl+M) cannot be driven from
+  the viewer on current firmware: every remote keystroke is a DMA write into
+  C64 memory, and the firmware closes its menu before any DMA write, so the
+  first key you press kicks the menu out. Newer firmware with the
+  `machine:input` API routes keys into the menu; the viewer switches to it
+  automatically once your machine has it.
 - IPv4 only. The device streams to one destination, so it's one viewer per
   Ultimate unless everyone uses `--multicast`.
 

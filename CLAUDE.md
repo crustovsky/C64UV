@@ -101,6 +101,12 @@ both on every push and PR.
   against the KERNAL restoring it (the vendor web UI does the same). The
   vendor web UI itself types via `writemem $0277`, so this is the sanctioned
   mechanism. Works only for KERNAL-read input, not matrix-scanning games.
+  **Every raw DMA write evicts the on-screen menu**: the firmware's
+  `dma_load_raw_buffer` (c64_subsys.cc) releases the user-interface client
+  before touching memory, so a KEYB or DMAWRITE while the Ctrl+M menu is
+  open closes it (verified on 1.1.0: any key kicks the user out). Hence
+  the help copy points at F9; with `machine:input` the firmware routes
+  keys into the menu instead.
 - **`machine:input` (CIA1 matrix-level)**: probed with a side-effect-free
   `GET /v1/machine:input` by the keepalive thread (404 on official firmware
   1.1.0, re-verified 2026-09-02; the docs specify 501 for hardware without
