@@ -6,7 +6,7 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.2.6"
+#define C64UV_VERSION "0.2.7"
 
 #include "compat.h"
 #include "discover.h"
