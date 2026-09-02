@@ -102,6 +102,11 @@ it is parked for the run and restored afterwards, so a freezer cart won't
 hijack the program's reset; the cart is back on your next manual reset. The
 same works headless: `c64uv --run game.prg`.
 
+The window title shows the transfer progress ("sending game.d64 42%").
+The Ultimate serves one DMA-socket client at a time, so the viewer drops its
+keyboard connection for the duration and reconnects it on your next keypress;
+a second drop while one is in flight is refused.
+
 Other disk images (`.g64`, `.d71`, `.g71`, `.d81`) are mounted on drive A
 without touching the machine; type `LOAD"*",8,1` yourself. Every image is
 copied to the Ultimate's temp area first, so writes never reach the file you

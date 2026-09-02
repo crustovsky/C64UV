@@ -160,7 +160,13 @@ both on every push and PR.
   one-byte reply 1/0, 1 s throttle on failure) before any other command,
   or the firmware drops the connection; `dma_connect` does it for both
   the keyboard channel and image runs. `C64U_DMA_PORT` redirects port 64
-  for tests (fakeultimate.py logs `DMA cmd=FFxx len=N`).
+  for tests (fakeultimate.py logs `DMA cmd=FFxx len=N`). **One DMA client
+  at a time**: `dmaThread` accepts a connection and serves it until it
+  closes before accepting the next, so the viewer's open keyboard
+  connection stalls an image transfer behind it (seen as a 30 s stall then
+  EAGAIN; a bare socket takes 0.1 s for a .d64 whether or not the stream
+  runs or the C64 is loading). Hence `run_file_async` closes the keyboard
+  socket and `keyb_try_connect` stays off port 64 while `g_run_busy`.
 
 ## Dev workflow (no hardware needed)
 

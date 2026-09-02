@@ -40,6 +40,14 @@ struct config {
 };
 
 static atomic_bool g_quit;
+// Drag-and-drop transfer state shared between the run thread and the event
+// loop. g_run_busy blocks a second drop and keeps the keyboard channel off
+// port 64 while a transfer runs: the firmware serves one DMA client at a
+// time, so an open keyboard connection would stall the image behind it.
+// g_run_pct (-1 idle, else 0-100) drives the window title.
+static atomic_bool g_run_busy;
+static atomic_int g_run_pct = -1;
+static char g_run_name[64]; // written before the run thread starts
 // machine:input capability (probed once per session): -1 unknown, 0 no, 1 yes
 static atomic_int g_minput = -1;
 // Network password (firmware 3.12+), sent as X-Password on every REST call.
@@ -373,7 +381,9 @@ static compat_sock dma_connect_raw(const char *host, int timeout_s)
 // out or nothing moved for DMA_STALL_MS.
 #define DMA_STALL_MS 30000
 
-static bool send_all(compat_sock s, const void *data, size_t len)
+// A non-zero `total` publishes progress in g_run_pct (image transfers).
+static bool send_all(compat_sock s, const void *data, size_t len,
+                     size_t total)
 {
     const uint8_t *p = data;
     Uint64 last_progress = SDL_GetTicks();
@@ -383,6 +393,8 @@ static bool send_all(compat_sock s, const void *data, size_t len)
             p += n;
             len -= (size_t)n;
             last_progress = SDL_GetTicks();
+            if (total)
+                atomic_store(&g_run_pct, (int)((total - len) * 100 / total));
         } else if (n < 0 && compat_neterr_transient() &&
                    SDL_GetTicks() - last_progress < DMA_STALL_MS) {
             compat_wait_writable(s, 1000);
@@ -399,7 +411,8 @@ static bool dma_send(compat_sock s, uint16_t cmd, const void *data,
 {
     uint8_t hdr[5] = {cmd & 0xFF, cmd >> 8, len & 0xFF, (len >> 8) & 0xFF,
                       (len >> 16) & 0xFF};
-    return send_all(s, hdr, len24 ? 5 : 4) && send_all(s, data, len);
+    return send_all(s, hdr, len24 ? 5 : 4, 0) &&
+           send_all(s, data, len, len24 ? len : 0);
 }
 
 // Connects and, when a password is set, authenticates. COMPAT_BAD_SOCK on
@@ -438,6 +451,7 @@ struct keyb {
 static void keyb_try_connect(struct keyb *k)
 {
     if (!k->enabled || k->fd != COMPAT_BAD_SOCK ||
+        atomic_load(&g_run_busy) || // a transfer owns port 64 right now
         (k->last_try != 0 && SDL_GetTicks() - k->last_try < 3000))
         return;
     k->last_try = SDL_GetTicks();
@@ -670,6 +684,7 @@ static bool run_file(const char *host, const char *path)
                         compat_neterr());
             compat_close(s);
         }
+        atomic_store(&g_run_pct, -1); // the title stops saying "sending"
         if (code == 200)
             SDL_Log("%s mounted on drive A and started (%ld bytes)", path,
                     len);
@@ -707,7 +722,6 @@ static bool run_file(const char *host, const char *path)
 
 // Drag-and-drop runs on a worker thread: the whole sequence can take
 // seconds and must not freeze the viewer.
-static atomic_bool g_run_busy;
 struct runjob {
     char host[64];
     char path[1024];
@@ -718,16 +732,28 @@ static int run_thread(void *arg)
     struct runjob *j = arg;
     run_file(j->host, j->path);
     free(j);
+    atomic_store(&g_run_pct, -1);
     atomic_store(&g_run_busy, false);
     return 0;
 }
 
-static void run_file_async(const char *host, const char *path)
+// Called from the event loop; hands port 64 to the transfer by dropping
+// the keyboard connection (it reconnects on the next keypress after the
+// run). NULL kb for the headless --run path.
+static void run_file_async(const char *host, const char *path,
+                           struct keyb *kb)
 {
     if (atomic_exchange(&g_run_busy, true)) {
         SDL_Log("still busy with the previous file");
         return;
     }
+    if (kb && kb->fd != COMPAT_BAD_SOCK) {
+        compat_close(kb->fd);
+        kb->fd = COMPAT_BAD_SOCK;
+    }
+    const char *base = strrchr(path, '/');
+    snprintf(g_run_name, sizeof g_run_name, "%s", base ? base + 1 : path);
+    atomic_store(&g_run_pct, 0);
     struct runjob *j = malloc(sizeof *j);
     snprintf(j->host, sizeof j->host, "%s", host);
     snprintf(j->path, sizeof j->path, "%s", path);
@@ -1179,6 +1205,7 @@ int main(int argc, char **argv)
         dthr = SDL_CreateThread(discover_thread, "discover", &da);
     }
     compat_sock tfd = COMPAT_BAD_SOCK;
+    int shown_pct = -1; // drop progress currently in the window title
     Uint64 tfd_last_try = 0;
     SDL_Texture *term_tex = NULL;
     Uint32 *term_px = calloc(TERM_PX_W * TERM_PX_H, sizeof(Uint32));
@@ -1322,7 +1349,7 @@ int main(int argc, char **argv)
                     term_present = true;
                 } else if (ev.type == SDL_EVENT_DROP_FILE) {
                     if (!cfg.no_start && cfg.host && ev.drop.data)
-                        run_file_async(cfg.host, ev.drop.data);
+                        run_file_async(cfg.host, ev.drop.data, &kb);
                 } else if (ev.type == SDL_EVENT_TEXT_INPUT && !help_active) {
                     for (const char *p = ev.text.text; *p; p++) {
                         if (term_active) {
@@ -1341,6 +1368,24 @@ int main(int argc, char **argv)
                         }
                     }
                 }
+            }
+        }
+
+        if (windowed) { // a running drop shows its progress in the title
+            int pct = atomic_load(&g_run_pct);
+            if (pct != shown_pct) {
+                shown_pct = pct;
+                char title[128];
+                if (pct >= 0)
+                    snprintf(title, sizeof title, "c64uv - sending %s %d%%",
+                             g_run_name, pct);
+                else
+                    snprintf(title, sizeof title, "%s",
+                             !got_any ? "c64uv - waiting for stream…"
+                             : kb.enabled
+                                 ? "c64uv - Esc = RUN/STOP, Ctrl+Q = quit"
+                                 : "c64uv");
+                SDL_SetWindowTitle(win, title);
             }
         }
 
