@@ -147,7 +147,10 @@ const struct viewer_binding viewer_bindings[] = {
     {.key = SDLK_P, .mod = SDL_KMOD_CTRL, .label = "Ctrl+P",
      .desc = "pause/resume the machine", .action = VA_PAUSE},
     {.key = SDLK_M, .mod = SDL_KMOD_CTRL, .label = "Ctrl+M",
-     .desc = "press the Ultimate's menu button", .action = VA_MENU_BTN,
+     // the on-screen menu only answers the physical keyboard on today's
+     // firmware: every remote keystroke is a DMA write, and the firmware
+     // evicts the menu before any DMA write (dma_load_raw_buffer)
+     .desc = "menu button; F9 drives the menu", .action = VA_MENU_BTN,
      .gap = true},
     {.key = SDLK_Q, .mod = SDL_KMOD_CTRL, .label = "Ctrl+Q", .desc = "quit",
      .action = VA_QUIT},
