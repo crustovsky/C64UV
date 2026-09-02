@@ -46,9 +46,14 @@ cable.
 
 | Service | Needed for |
 |---|---|
-| Web Remote Control Service (REST API) | starting/stopping the streams |
-| Ultimate DMA Service | keyboard input (port 64) |
-| Telnet Remote Menu Service | the F9 menu view (port 23) |
+| Web Remote Control Service (REST API, port 80) | discovery, starting/stopping the streams, the Ctrl+R/P/M machine controls and `--do`, running dropped `.prg`/`.crt`/`.sid` files, mounting `.g64`/`.d71`/`.g71`/`.d81` images, cartridge parking, and matrix-level typing on firmware that has `machine:input` |
+| Ultimate DMA Service (port 64) | typing into the C64 (KERNAL buffer), RUN/STOP, and mount-and-run of a dropped `.d64` |
+| Telnet Remote Menu Service (port 23) | the F9 menu view |
+
+Everything else the viewer does needs no service: the video/audio streams
+arrive on UDP 11000/11001 once started. The REST API alone gets you a
+picture and sound; add the DMA service to type, and telnet to browse the
+Ultimate's menu from the viewer.
 
 ### Wired Ethernet is required for the streams
 
