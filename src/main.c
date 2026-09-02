@@ -443,6 +443,7 @@ static compat_sock dma_connect(const char *host, int timeout_s)
 struct keyb {
     compat_sock fd; // COMPAT_BAD_SOCK when disconnected
     bool enabled;
+    bool reclaim; // reconnect as soon as the running drop releases port 64
     const char *host;
     Uint64 last_try;
 };
@@ -747,9 +748,10 @@ static void run_file_async(const char *host, const char *path,
         SDL_Log("still busy with the previous file");
         return;
     }
-    if (kb && kb->fd != COMPAT_BAD_SOCK) {
+    if (kb) {
         compat_close(kb->fd);
         kb->fd = COMPAT_BAD_SOCK;
+        kb->reclaim = kb->enabled;
     }
     const char *base = strrchr(path, '/');
     snprintf(g_run_name, sizeof g_run_name, "%s", base ? base + 1 : path);
@@ -1369,6 +1371,15 @@ int main(int argc, char **argv)
                     }
                 }
             }
+        }
+
+        // a drop hands port 64 to the transfer; take the keyboard channel
+        // back as soon as it ends so the next keystroke is not lost (only
+        // then: a blind retry every loop would block the render loop for
+        // the connect timeout whenever the Ultimate is unreachable)
+        if (kb.reclaim && !atomic_load(&g_run_busy)) {
+            kb.reclaim = false;
+            keyb_try_connect(&kb);
         }
 
         if (windowed) { // a running drop shows its progress in the title
