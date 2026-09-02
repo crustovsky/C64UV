@@ -75,8 +75,15 @@ int compat_wait_readable(const compat_sock *socks, int n, int timeout_ms);
 
 void compat_close(compat_sock s);
 
+// Waits until `s` can take more data or timeout_ms elapsed. 1 when
+// writable, 0 on timeout, -1 on error.
+int compat_wait_writable(compat_sock s, int timeout_ms);
+
 // Text for the last socket error (errno / WSAGetLastError).
 const char *compat_neterr(void);
+// True when the last socket error was a would-block / timeout (EAGAIN,
+// EWOULDBLOCK, EINTR; WSAEWOULDBLOCK, WSAETIMEDOUT), i.e. worth retrying.
+bool compat_neterr_transient(void);
 
 // Source address the OS would use to reach `ip` (UDP connect +
 // getsockname). Dotted quad in out (>= COMPAT_IP_STRLEN bytes).

@@ -288,7 +288,9 @@ static void test_compat(void)
           !strcmp(local, "127.0.0.1"));
     char buf[16];
     CHECK(compat_recv_nowait(rx, buf, sizeof buf) < 0); // nothing yet
+    CHECK(compat_neterr_transient()); // ...which is a would-block, not an error
     CHECK(compat_wait_readable(&rx, 1, 0) == 0);
+    CHECK(compat_wait_writable(tx, 0) == 1); // an idle socket has room
     // the bound port is the one detail the layer has no getter for, so the
     // loopback test uses a fixed high port for the receiver instead
     compat_close(rx);

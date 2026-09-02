@@ -367,15 +367,28 @@ static compat_sock dma_connect_raw(const char *host, int timeout_s)
                               timeout_s);
 }
 
+// The socket's send timeout (the connect timeout, 1-3 s) caps a single
+// send() call, and the Ultimate's TCP stack drains a disk image slowly, so
+// a would-block only means "wait for room": keep going until the data is
+// out or nothing moved for DMA_STALL_MS.
+#define DMA_STALL_MS 30000
+
 static bool send_all(compat_sock s, const void *data, size_t len)
 {
     const uint8_t *p = data;
+    Uint64 last_progress = SDL_GetTicks();
     while (len > 0) {
         int n = compat_send(s, p, len);
-        if (n <= 0)
+        if (n > 0) {
+            p += n;
+            len -= (size_t)n;
+            last_progress = SDL_GetTicks();
+        } else if (n < 0 && compat_neterr_transient() &&
+                   SDL_GetTicks() - last_progress < DMA_STALL_MS) {
+            compat_wait_writable(s, 1000);
+        } else {
             return false;
-        p += n;
-        len -= (size_t)n;
+        }
     }
     return true;
 }
