@@ -134,6 +134,12 @@ int compat_wait_readable(const compat_sock *socks, int n, int timeout_ms)
     return poll(pfd, (nfds_t)n, timeout_ms); // negative fds are ignored
 }
 
+int compat_wait_writable(compat_sock s, int timeout_ms)
+{
+    struct pollfd pfd = {.fd = s, .events = POLLOUT};
+    return poll(&pfd, 1, timeout_ms);
+}
+
 void compat_close(compat_sock s)
 {
     if (s >= 0)
@@ -143,6 +149,11 @@ void compat_close(compat_sock s)
 const char *compat_neterr(void)
 {
     return strerror(errno);
+}
+
+bool compat_neterr_transient(void)
+{
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
 }
 
 bool compat_route_source_ip(const char *ip, char *out, size_t cap)

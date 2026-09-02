@@ -146,6 +146,27 @@ both on every push and PR.
   programs that never return to the prompt). `run_crt` runs the posted cart
   on purpose, so no parking there. `$CC` reads 0x00 at the READY prompt,
   verified.
+- **Disk images (verified on 1.1.0)**: the DMA socket's `RUN_IMG` (0xFF0B,
+  header `0B FF <len16 LE> <len bits 16-23>` then the image) saves the
+  payload as `/temp/tcpimage.d64`, mounts it on drive A and runs
+  `C64_DRIVE_LOAD` with `RUNCODE_MOUNT_LOAD_RUN`: the firmware resets,
+  types `LOAD"*",8,1` and `RUN` itself (screen RAM confirms). Payload cap
+  is `SOCKET_BUFFER_SIZE` = 200000 bytes (every .d64 variant fits; the
+  firmware silently truncates beyond). Always saved as .d64, so only that
+  type autostarts; `POST /v1/drives/a:mount?type=<d64|g64|d71|g71|d81>`
+  with the image as the body mounts the others (lands as `/Temp/temp0000`).
+  `MOUNT_IMG` (0xFF0A) is the socket twin of that mount. With a network
+  password the socket needs `AUTHENTICATE` (0xFF1F, password as payload,
+  one-byte reply 1/0, 1 s throttle on failure) before any other command,
+  or the firmware drops the connection; `dma_connect` does it for both
+  the keyboard channel and image runs. `C64U_DMA_PORT` redirects port 64
+  for tests (fakeultimate.py logs `DMA cmd=FFxx len=N`). **One DMA client
+  at a time**: `dmaThread` accepts a connection and serves it until it
+  closes before accepting the next, so the viewer's open keyboard
+  connection stalls an image transfer behind it (seen as a 30 s stall then
+  EAGAIN; a bare socket takes 0.1 s for a .d64 whether or not the stream
+  runs or the C64 is loading). Hence `run_file_async` closes the keyboard
+  socket and `keyb_try_connect` stays off port 64 while `g_run_busy`.
 
 ## Dev workflow (no hardware needed)
 
@@ -185,6 +206,25 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    for synthetic input. The new Steam Controller is SDL's job: support
    comes from SDL3's HIDAPI drivers + mapping db (worst case Steam udev
    rules or SDL_GAMECONTROLLERCONFIG); code against generic SDL_Gamepad.
+
+3. **Persistent drop storage** (agreed 2026-09-02, not started): the drop
+   path keeps the firmware's temp area (RAM disk, gone at power-off) as
+   the fast default; a `--store <folder>` flag and/or a modifier held
+   during the drop switch to FTP-upload-then-mount-by-path. FTP is the
+   only upload route: the REST files API has no upload on any firmware
+   (verified: `curl -T` to `ftp://<ult>/Temp/` works, `files/<path>:info`
+   then sees the file, the FTP service is on by default on 1.1.0). Sequence:
+   check `files/<path>:info` (refuse to overwrite), `curl -T` the file,
+   `PUT drives/a:mount?image=<path>&mode=readwrite`, then for autostart
+   `machine:reset` + readiness gate + `LOAD"*",8,1` / `RUN` over the
+   keyboard channel (no firmware autostart for a path mount). Michal's
+   preference: upload to `/Temp` and move the file from the Ultimate menu
+   himself. Open questions: whether SDL reports a modifier held during a
+   drag on Wayland (`SDL_GetKeyboardState` at drop time; if not, flag
+   only), and the static release build needs curl rebuilt with FTP
+   (`--disable-ftp` today in release.yml). Follow-up on top of it: in the
+   F9 view, upload into the folder the menu currently shows (path line
+   parse; truncated long paths need a fallback).
 
 Dormant follow-up: when official firmware ships `machine:input`, re-verify
 the matrix-keyboard mapping against real hardware and activate the gamepad

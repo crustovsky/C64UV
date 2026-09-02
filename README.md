@@ -46,9 +46,14 @@ cable.
 
 | Service | Needed for |
 |---|---|
-| Web Remote Control Service (REST API) | starting/stopping the streams |
-| Ultimate DMA Service | keyboard input (port 64) |
-| Telnet Remote Menu Service | the F9 menu view (port 23) |
+| Web Remote Control Service (REST API, port 80) | discovery, starting/stopping the streams, the Ctrl+R/P/M machine controls and `--do`, running dropped `.prg`/`.crt`/`.sid` files, mounting `.g64`/`.d71`/`.g71`/`.d81` images, cartridge parking, and matrix-level typing on firmware that has `machine:input` |
+| Ultimate DMA Service (port 64) | typing into the C64 (KERNAL buffer), RUN/STOP, and mount-and-run of a dropped `.d64` |
+| Telnet Remote Menu Service (port 23) | the F9 menu view |
+
+Everything else the viewer does needs no service: the video/audio streams
+arrive on UDP 11000/11001 once started. The REST API alone gets you a
+picture and sound; add the DMA service to type, and telnet to browse the
+Ultimate's menu from the viewer.
 
 ### Wired Ethernet is required for the streams
 
@@ -89,11 +94,23 @@ refuses to start a stream toward an address missing from its ARP table.
 | Ctrl+M | press the Ultimate's menu button (the on-screen menu then answers the physical keyboard only; use F9 to drive a menu from the viewer) |
 | Ctrl+Q | quit |
 
-**Drop a `.prg`, `.crt`, or `.sid` file onto the window** and the Ultimate
-runs it (DMA program run, cartridge run, or SID player). If a cartridge is
-configured on the machine, it is parked for the run and restored afterwards,
-so a freezer cart won't hijack the program's reset; the cart is back on your
-next manual reset. The same works headless: `c64uv --run game.prg`.
+**Drop a `.prg`, `.crt`, `.sid`, or `.d64` file onto the window** and the
+Ultimate runs it (DMA program run, cartridge run, SID player, or for a
+`.d64`: mount on drive A, reset, `LOAD"*",8,1` and `RUN`, all done by the
+firmware over the DMA socket). If a cartridge is configured on the machine,
+it is parked for the run and restored afterwards, so a freezer cart won't
+hijack the program's reset; the cart is back on your next manual reset. The
+same works headless: `c64uv --run game.prg`.
+
+The window title shows the transfer progress ("sending game.d64 42%").
+The Ultimate serves one DMA-socket client at a time, so the viewer drops its
+keyboard connection for the duration and reconnects it on your next keypress;
+a second drop while one is in flight is refused.
+
+Other disk images (`.g64`, `.d71`, `.g71`, `.d81`) are mounted on drive A
+without touching the machine; type `LOAD"*",8,1` yourself. Every image is
+copied to the Ultimate's temp area first, so writes never reach the file you
+dropped.
 
 The same machine controls work headless: `c64uv --do reset` (also `reboot`,
 `pause`, `resume`, `menu`, `poweroff`) issues one REST call and exits. If

@@ -6,7 +6,7 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.2.6"
+#define C64UV_VERSION "0.2.7"
 
 #include "compat.h"
 #include "discover.h"
@@ -25,7 +25,7 @@ struct config {
     const char *host;       // Ultimate hostname/IP for REST
     const char *password;   // network password -> X-Password header
     const char *do_action;  // one-shot machine control, then exit
-    const char *run_path;   // one-shot: run this .prg/.crt/.sid, then exit
+    const char *run_path;   // one-shot: run this .prg/.crt/.sid/.d64, then exit
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
     int listen_port;        // video; audio uses listen_port + 1
     int scale;
@@ -40,6 +40,14 @@ struct config {
 };
 
 static atomic_bool g_quit;
+// Drag-and-drop transfer state shared between the run thread and the event
+// loop. g_run_busy blocks a second drop and keeps the keyboard channel off
+// port 64 while a transfer runs: the firmware serves one DMA client at a
+// time, so an open keyboard connection would stall the image behind it.
+// g_run_pct (-1 idle, else 0-100) drives the window title.
+static atomic_bool g_run_busy;
+static atomic_int g_run_pct = -1;
+static char g_run_name[64]; // written before the run thread starts
 // machine:input capability (probed once per session): -1 unknown, 0 no, 1 yes
 static atomic_int g_minput = -1;
 // Network password (firmware 3.12+), sent as X-Password on every REST call.
@@ -339,17 +347,103 @@ static int discover_thread(void *arg)
     return 0;
 }
 
+// ------------------------------------------------------ DMA socket (port 64)
+//
+// Firmware "socket DMA" service: little-endian command word, u16 payload
+// length (the image and cartridge commands carry a third length byte),
+// payload. With a network password set the first frame must be
+// AUTHENTICATE, answered with one byte (1 = accepted); anything else on an
+// unauthenticated connection makes the firmware drop it.
+
+#define DMA_CMD_KEYB 0xFF03
+#define DMA_CMD_DMAWRITE 0xFF06
+#define DMA_CMD_RUN_IMG 0xFF0B // mount a .d64 on drive A, reset, LOAD"*",8,1, RUN
+#define DMA_CMD_AUTHENTICATE 0xFF1F
+#define DMA_MAX_PAYLOAD 200000 // firmware SOCKET_BUFFER_SIZE; longer is truncated
+
+// The REST host may carry a :port (discovery test hook); the DMA socket
+// wants the bare address. C64U_DMA_PORT overrides port 64 for tests.
+static compat_sock dma_connect_raw(const char *host, int timeout_s)
+{
+    char ip[64];
+    snprintf(ip, sizeof ip, "%s", host);
+    char *colon = strchr(ip, ':');
+    if (colon)
+        *colon = '\0';
+    const char *penv = getenv("C64U_DMA_PORT");
+    return compat_tcp_connect(ip, penv ? (uint16_t)atoi(penv) : 64,
+                              timeout_s);
+}
+
+// The socket's send timeout (the connect timeout, 1-3 s) caps a single
+// send() call, and the Ultimate's TCP stack drains a disk image slowly, so
+// a would-block only means "wait for room": keep going until the data is
+// out or nothing moved for DMA_STALL_MS.
+#define DMA_STALL_MS 30000
+
+// A non-zero `total` publishes progress in g_run_pct (image transfers).
+static bool send_all(compat_sock s, const void *data, size_t len,
+                     size_t total)
+{
+    const uint8_t *p = data;
+    Uint64 last_progress = SDL_GetTicks();
+    while (len > 0) {
+        int n = compat_send(s, p, len);
+        if (n > 0) {
+            p += n;
+            len -= (size_t)n;
+            last_progress = SDL_GetTicks();
+            if (total)
+                atomic_store(&g_run_pct, (int)((total - len) * 100 / total));
+        } else if (n < 0 && compat_neterr_transient() &&
+                   SDL_GetTicks() - last_progress < DMA_STALL_MS) {
+            compat_wait_writable(s, 1000);
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+// One frame; len24 adds the third length byte (RUN_IMG, MOUNT_IMG, RUN_CRT).
+static bool dma_send(compat_sock s, uint16_t cmd, const void *data,
+                     size_t len, bool len24)
+{
+    uint8_t hdr[5] = {cmd & 0xFF, cmd >> 8, len & 0xFF, (len >> 8) & 0xFF,
+                      (len >> 16) & 0xFF};
+    return send_all(s, hdr, len24 ? 5 : 4, 0) &&
+           send_all(s, data, len, len24 ? len : 0);
+}
+
+// Connects and, when a password is set, authenticates. COMPAT_BAD_SOCK on
+// failure (logged when the password was refused).
+static compat_sock dma_connect(const char *host, int timeout_s)
+{
+    compat_sock s = dma_connect_raw(host, timeout_s);
+    if (s == COMPAT_BAD_SOCK || !g_password)
+        return s;
+    uint8_t ok = 0;
+    if (dma_send(s, DMA_CMD_AUTHENTICATE, g_password, strlen(g_password),
+                 false) &&
+        compat_wait_readable(&s, 1, 3000) > 0 &&
+        compat_recv_nowait(s, &ok, 1) == 1 && ok == 1)
+        return s;
+    SDL_Log("DMA socket: the Ultimate refused the network password");
+    compat_close(s);
+    return COMPAT_BAD_SOCK;
+}
+
 // ------------------------------------------------------- keyboard passthrough
 //
-// TCP port 64, firmware "socket DMA" protocol: little-endian command word,
-// u16 payload length, payload. KEYB (0xFF03) drops chars into the KERNAL
-// keyboard buffer ($0277/$C6) - works for BASIC and anything else that reads
-// input the normal way; games polling the matrix won't see it (needs the
-// machine:input firmware feature, not shipped yet).
+// KEYB (0xFF03) drops chars into the KERNAL keyboard buffer ($0277/$C6) -
+// works for BASIC and anything else that reads input the normal way; games
+// polling the matrix won't see it (needs the machine:input firmware
+// feature, not shipped yet).
 
 struct keyb {
     compat_sock fd; // COMPAT_BAD_SOCK when disconnected
     bool enabled;
+    bool reclaim; // reconnect as soon as the running drop releases port 64
     const char *host;
     Uint64 last_try;
 };
@@ -358,10 +452,11 @@ struct keyb {
 static void keyb_try_connect(struct keyb *k)
 {
     if (!k->enabled || k->fd != COMPAT_BAD_SOCK ||
+        atomic_load(&g_run_busy) || // a transfer owns port 64 right now
         (k->last_try != 0 && SDL_GetTicks() - k->last_try < 3000))
         return;
     k->last_try = SDL_GetTicks();
-    k->fd = compat_tcp_connect(k->host, 64, 1);
+    k->fd = dma_connect(k->host, 1);
     if (k->fd != COMPAT_BAD_SOCK)
         SDL_Log("keyboard channel connected (port 64)");
 }
@@ -371,13 +466,7 @@ static void keyb_raw(struct keyb *k, Uint16 cmd, const Uint8 *data, int n)
     keyb_try_connect(k);
     if (k->fd == COMPAT_BAD_SOCK)
         return;
-    Uint8 frame[4 + 16];
-    frame[0] = cmd & 0xFF;
-    frame[1] = cmd >> 8;
-    frame[2] = (Uint8)n;
-    frame[3] = 0;
-    memcpy(frame + 4, data, (size_t)n);
-    if (compat_send(k->fd, frame, 4 + (size_t)n) < 0) {
+    if (!dma_send(k->fd, cmd, data, (size_t)n, false)) {
         compat_close(k->fd);
         k->fd = COMPAT_BAD_SOCK; // reconnect on next keypress
     }
@@ -450,6 +539,23 @@ static const char *runner_for(const char *path)
     return NULL;
 }
 
+// Disk images. A .d64 goes through the DMA socket's RUN_IMG, which mounts
+// it on drive A and has the firmware reset the machine, type LOAD"*",8,1
+// and RUN (verified on 1.1.0; the image lands as /temp/tcpimage.d64, so
+// writes never reach the dropped file). The other types the mount API
+// accepts have no firmware autostart and are only mounted.
+static const char *image_type_for(const char *path)
+{
+    static const char *const types[] = {"d64", "g64", "d71", "g71", "d81"};
+    const char *dot = strrchr(path, '.');
+    if (!dot)
+        return NULL;
+    for (size_t i = 0; i < sizeof types / sizeof types[0]; i++)
+        if (!SDL_strcasecmp(dot + 1, types[i]))
+            return types[i];
+    return NULL;
+}
+
 struct binbuf {
     uint8_t data[16];
     int len;
@@ -501,10 +607,15 @@ static void wait_kernal_ready(CURL *curl, const char *host, int max_ms)
 static bool run_file(const char *host, const char *path)
 {
     const char *ep = runner_for(path);
-    if (!ep) {
-        SDL_Log("%s: only .prg, .crt and .sid files can be run", path);
+    const char *img = ep ? NULL : image_type_for(path);
+    if (!ep && !img) {
+        SDL_Log("%s: only .prg, .crt, .sid and disk images (.d64, .g64, "
+                ".d71, .g71, .d81) can be run", path);
         return false;
     }
+    // the machine resets for a runner or a .d64 autostart; a plain mount
+    // leaves it alone
+    bool resets = ep || !strcmp(img, "d64");
     FILE *f = fopen(path, "rb");
     if (!f) {
         SDL_Log("%s: %s", path, strerror(errno));
@@ -532,7 +643,7 @@ static bool run_file(const char *host, const char *path)
     // cartridge parking (not for .crt: that one runs a cart on purpose)
     char cart[128];
     bool parked = false;
-    if (strcmp(ep, "run_crt") != 0) {
+    if (resets && (!ep || strcmp(ep, "run_crt") != 0)) {
         snprintf(url, sizeof url, "http://%s/v1/%s", host, CART_CFG_PATH);
         if (rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp) == 200 &&
             json_find_str(resp, "current", cart, sizeof cart) && cart[0]) {
@@ -544,17 +655,55 @@ static bool run_file(const char *host, const char *path)
         }
     }
 
-    snprintf(url, sizeof url, "http://%s/v1/runners:%s", host, ep);
-    // generous timeout: the firmware saves the file before answering
-    long code = rest_req(curl, "POST", url, data, len, "application/octet-stream",
-                         15000, resp);
+    long code;
+    if (ep) {
+        snprintf(url, sizeof url, "http://%s/v1/runners:%s", host, ep);
+        // generous timeout: the firmware saves the file before answering
+        code = rest_req(curl, "POST", url, data, len,
+                        "application/octet-stream", 15000, resp);
+        if (code == 200)
+            SDL_Log("runners:%s %s OK (%ld bytes)", ep, path, len);
+        else if (code == -1)
+            SDL_Log("runners:%s: no response from Ultimate", ep);
+        else
+            SDL_Log("runners:%s HTTP %ld: %s", ep, code, resp);
+    } else if (resets) {
+        // .d64: the firmware mounts and autostarts it (DMA socket RUN_IMG)
+        code = -1;
+        if (len > DMA_MAX_PAYLOAD) {
+            SDL_Log("%s: %ld bytes exceeds the DMA socket's %d byte limit",
+                    path, len, DMA_MAX_PAYLOAD);
+        } else {
+            compat_sock s = dma_connect(host, 3);
+            if (s == COMPAT_BAD_SOCK)
+                SDL_Log("%s: DMA socket (port 64) unreachable; is the "
+                        "Ultimate DMA Service enabled?", path);
+            else if (dma_send(s, DMA_CMD_RUN_IMG, data, (size_t)len, true))
+                code = 200;
+            else
+                SDL_Log("%s: DMA socket send failed: %s", path,
+                        compat_neterr());
+            compat_close(s);
+        }
+        atomic_store(&g_run_pct, -1); // the title stops saying "sending"
+        if (code == 200)
+            SDL_Log("%s mounted on drive A and started (%ld bytes)", path,
+                    len);
+    } else {
+        // other image types: mount only, the machine keeps running
+        snprintf(url, sizeof url, "http://%s/v1/drives/a:mount?type=%s", host,
+                 img);
+        code = rest_req(curl, "POST", url, data, len,
+                        "application/octet-stream", 15000, resp);
+        if (code == 200)
+            SDL_Log("%s mounted on drive A (%ld bytes); no autostart for "
+                    ".%s, type LOAD\"*\",8,1 yourself", path, len, img);
+        else if (code == -1)
+            SDL_Log("drives/a:mount: no response from Ultimate");
+        else
+            SDL_Log("drives/a:mount HTTP %ld: %s", code, resp);
+    }
     free(data);
-    if (code == 200)
-        SDL_Log("runners:%s %s OK (%ld bytes)", ep, path, len);
-    else if (code == -1)
-        SDL_Log("runners:%s: no response from Ultimate", ep);
-    else
-        SDL_Log("runners:%s HTTP %ld: %s", ep, code, resp);
 
     if (parked) {
         wait_kernal_ready(curl, host, 10000);
@@ -574,7 +723,6 @@ static bool run_file(const char *host, const char *path)
 
 // Drag-and-drop runs on a worker thread: the whole sequence can take
 // seconds and must not freeze the viewer.
-static atomic_bool g_run_busy;
 struct runjob {
     char host[64];
     char path[1024];
@@ -585,16 +733,29 @@ static int run_thread(void *arg)
     struct runjob *j = arg;
     run_file(j->host, j->path);
     free(j);
+    atomic_store(&g_run_pct, -1);
     atomic_store(&g_run_busy, false);
     return 0;
 }
 
-static void run_file_async(const char *host, const char *path)
+// Called from the event loop; hands port 64 to the transfer by dropping
+// the keyboard connection (it reconnects on the next keypress after the
+// run). NULL kb for the headless --run path.
+static void run_file_async(const char *host, const char *path,
+                           struct keyb *kb)
 {
     if (atomic_exchange(&g_run_busy, true)) {
         SDL_Log("still busy with the previous file");
         return;
     }
+    if (kb) {
+        compat_close(kb->fd);
+        kb->fd = COMPAT_BAD_SOCK;
+        kb->reclaim = kb->enabled;
+    }
+    const char *base = strrchr(path, '/');
+    snprintf(g_run_name, sizeof g_run_name, "%s", base ? base + 1 : path);
+    atomic_store(&g_run_pct, 0);
     struct runjob *j = malloc(sizeof *j);
     snprintf(j->host, sizeof j->host, "%s", host);
     snprintf(j->path, sizeof j->path, "%s", path);
@@ -762,7 +923,8 @@ static void usage(const char *argv0)
             "  --password  network password (or set C64U_PASSWORD)\n"
             "  --do      one machine action, then exit: reset reboot pause\n"
             "            resume menu poweroff\n"
-            "  --run     run a .prg/.crt/.sid on the machine, then exit\n"
+            "  --run     run a .prg/.crt/.sid/.d64 on the machine, then exit\n"
+            "            (.g64/.d71/.g71/.d81 are mounted without autostart)\n"
             "            (in the window: drop the file onto it instead)\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
@@ -1045,6 +1207,7 @@ int main(int argc, char **argv)
         dthr = SDL_CreateThread(discover_thread, "discover", &da);
     }
     compat_sock tfd = COMPAT_BAD_SOCK;
+    int shown_pct = -1; // drop progress currently in the window title
     Uint64 tfd_last_try = 0;
     SDL_Texture *term_tex = NULL;
     Uint32 *term_px = calloc(TERM_PX_W * TERM_PX_H, sizeof(Uint32));
@@ -1188,7 +1351,7 @@ int main(int argc, char **argv)
                     term_present = true;
                 } else if (ev.type == SDL_EVENT_DROP_FILE) {
                     if (!cfg.no_start && cfg.host && ev.drop.data)
-                        run_file_async(cfg.host, ev.drop.data);
+                        run_file_async(cfg.host, ev.drop.data, &kb);
                 } else if (ev.type == SDL_EVENT_TEXT_INPUT && !help_active) {
                     for (const char *p = ev.text.text; *p; p++) {
                         if (term_active) {
@@ -1207,6 +1370,33 @@ int main(int argc, char **argv)
                         }
                     }
                 }
+            }
+        }
+
+        // a drop hands port 64 to the transfer; take the keyboard channel
+        // back as soon as it ends so the next keystroke is not lost (only
+        // then: a blind retry every loop would block the render loop for
+        // the connect timeout whenever the Ultimate is unreachable)
+        if (kb.reclaim && !atomic_load(&g_run_busy)) {
+            kb.reclaim = false;
+            keyb_try_connect(&kb);
+        }
+
+        if (windowed) { // a running drop shows its progress in the title
+            int pct = atomic_load(&g_run_pct);
+            if (pct != shown_pct) {
+                shown_pct = pct;
+                char title[128];
+                if (pct >= 0)
+                    snprintf(title, sizeof title, "c64uv - sending %s %d%%",
+                             g_run_name, pct);
+                else
+                    snprintf(title, sizeof title, "%s",
+                             !got_any ? "c64uv - waiting for stream…"
+                             : kb.enabled
+                                 ? "c64uv - Esc = RUN/STOP, Ctrl+Q = quit"
+                                 : "c64uv");
+                SDL_SetWindowTitle(win, title);
             }
         }
 
