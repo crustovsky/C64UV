@@ -207,6 +207,25 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    comes from SDL3's HIDAPI drivers + mapping db (worst case Steam udev
    rules or SDL_GAMECONTROLLERCONFIG); code against generic SDL_Gamepad.
 
+3. **Persistent drop storage** (agreed 2026-09-02, not started): the drop
+   path keeps the firmware's temp area (RAM disk, gone at power-off) as
+   the fast default; a `--store <folder>` flag and/or a modifier held
+   during the drop switch to FTP-upload-then-mount-by-path. FTP is the
+   only upload route: the REST files API has no upload on any firmware
+   (verified: `curl -T` to `ftp://<ult>/Temp/` works, `files/<path>:info`
+   then sees the file, the FTP service is on by default on 1.1.0). Sequence:
+   check `files/<path>:info` (refuse to overwrite), `curl -T` the file,
+   `PUT drives/a:mount?image=<path>&mode=readwrite`, then for autostart
+   `machine:reset` + readiness gate + `LOAD"*",8,1` / `RUN` over the
+   keyboard channel (no firmware autostart for a path mount). Michal's
+   preference: upload to `/Temp` and move the file from the Ultimate menu
+   himself. Open questions: whether SDL reports a modifier held during a
+   drag on Wayland (`SDL_GetKeyboardState` at drop time; if not, flag
+   only), and the static release build needs curl rebuilt with FTP
+   (`--disable-ftp` today in release.yml). Follow-up on top of it: in the
+   F9 view, upload into the folder the menu currently shows (path line
+   parse; truncated long paths need a fallback).
+
 Dormant follow-up: when official firmware ships `machine:input`, re-verify
 the matrix-keyboard mapping against real hardware and activate the gamepad
 path alongside it.
