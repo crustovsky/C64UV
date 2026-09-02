@@ -175,6 +175,12 @@ static void test_matrix_keys(void)
           !strcmp(n[0], "left_shift") && !strcmp(n[1], "f1"));
     CHECK(key_to_c64_matrix(SDLK_ESCAPE, n) == 1 && !strcmp(n[0], "run_stop"));
     CHECK(key_to_c64_matrix(SDLK_PAGEUP, n) == 1 && !strcmp(n[0], "restore"));
+    // + and £ have no unshifted PC key: nav cluster and numeric keypad
+    CHECK(key_to_c64_matrix(SDLK_END, n) == 1 && !strcmp(n[0], "plus"));
+    CHECK(key_to_c64_matrix(SDLK_KP_PLUS, n) == 1 && !strcmp(n[0], "plus"));
+    CHECK(key_to_c64_matrix(SDLK_INSERT, n) == 1 && !strcmp(n[0], "pound"));
+    CHECK(key_to_c64_matrix(SDLK_KP_MULTIPLY, n) == 1 && !strcmp(n[0], "star"));
+    CHECK(key_to_c64_matrix(SDLK_KP_7, n) == 1 && !strcmp(n[0], "7"));
     CHECK(key_to_c64_matrix(SDLK_F9, n) == 0);   // viewer keys stay local
     CHECK(key_to_c64_matrix(SDLK_LCTRL, n) == 0); // reserved for hotkeys
 
