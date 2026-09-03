@@ -16,7 +16,8 @@ cable.
 
 - **Video** - the raw VIC stream (PAL 384×272 @ 50 Hz or NTSC 384×240 @ 60 Hz),
   decoded losslessly and pixel-scaled; latency is roughly one frame on a wired
-  LAN.
+  LAN. If the stream stops (machine switched off, cable out) the window says
+  so and picks the picture up again by itself when it returns.
 - **Audio** - the SID output as 48 kHz stereo PCM, with an adaptive latency
   servo that holds the pipeline at ~60 ms.
 - **Keyboard** - what you type lands in the C64's keyboard buffer: full

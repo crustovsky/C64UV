@@ -66,8 +66,10 @@ reads instead of `/proc/net/arp`). The unit tests also exercise the compat
 layer itself with loopback sockets (ports 21098/21099). The suite listens
 on port 21000 so a viewer the user left running
 cannot collide, and the windowed no-host path is exercised headless via
-`SDL_VIDEODRIVER=dummy`. CI (GitHub Actions, Arch container) runs build +
-both on every push and PR.
+`SDL_VIDEODRIVER=dummy`. A tarpit server (accepts, never answers) stands in
+for a powered-off Ultimate: quitting (SIGTERM = `SDL_EVENT_QUIT`) must
+finish within 3 s while the keepalive thread is stuck in a REST call. CI
+(GitHub Actions, Arch container) runs build + both on every push and PR.
 
 ## Protocol facts (hard-won, verified on real hardware)
 
@@ -176,6 +178,20 @@ both on every push and PR.
 - `./c64uv --dump f.ppm` (headless single-frame grab) and `--term-test`
   (headless menu-screen dump) are the two self-verification modes.
 - `--verbose` logs fps / packet counts / gaps / audio queue depth every 5 s.
+- **Machine vanishing mid-session** (power-off) reproduces without root:
+  `unshare -Urn`, a veth pair between that netns and a second one
+  (`unshare -n sleep inf` + `ip link set vB netns <pid>`), the fakes
+  (fakeultimate.py, a telnet stub, mockstream.py) on the far end, the
+  windowed viewer on the near end (the Wayland socket works across
+  netns), then `ip addr del` on the far end: packets go unanswered exactly
+  like a dead box on the LAN, unlike killing a fake (which sends FIN/RST).
+  Hyprland can press keys in the window without focusing it:
+  `hyprctl dispatch 'hl.dsp.send_shortcut({ mods = "", key = "F9", window
+  = "class:c64uv" })'`. Found this way (2026-09-03): the main thread must
+  never block for long, Hyprland shows its "Application Not Responding"
+  dialog after about 8 s of unanswered pings, and the old exit path joined
+  the keepalive thread through up to 13 s of REST timeouts; hence the
+  cancellable keepalive calls and the event-pumping join at exit.
 
 ## Roadmap
 

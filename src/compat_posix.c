@@ -1,4 +1,6 @@
-// POSIX (Linux reference) implementation of compat.h.
+// POSIX (Linux reference) implementation of compat.h. Sockets are opened
+// close-on-exec: the ARP prime spawns ping, which must not inherit (and
+// hold open) the viewer's connections.
 #define _DEFAULT_SOURCE // struct ip_mreq, IFF_* with -std=c11
 
 #include "compat.h"
@@ -54,7 +56,7 @@ static bool sockaddr_from(const char *ip, uint16_t port,
 
 compat_sock compat_udp_bind(uint16_t port, int rcvbuf, bool reuse)
 {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (s < 0)
         return COMPAT_BAD_SOCK;
     int one = 1;
@@ -85,7 +87,7 @@ bool compat_mcast_join(compat_sock s, const char *group, const char *ifip)
 
 compat_sock compat_tcp_connect(const char *ip, uint16_t port, int timeout_s)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return COMPAT_BAD_SOCK;
     // SO_SNDTIMEO bounds connect() as well as later sends on Linux
@@ -158,7 +160,7 @@ bool compat_neterr_transient(void)
 
 bool compat_route_source_ip(const char *ip, char *out, size_t cap)
 {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (s < 0)
         return false;
     struct sockaddr_in sa;
