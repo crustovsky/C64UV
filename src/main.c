@@ -78,17 +78,37 @@ static size_t curl_sink(char *data, size_t size, size_t nmemb, void *userp)
     return n;
 }
 
-// Returns HTTP status, or -1 on transport error. Response body (truncated) in
-// resp. A non-NULL body of body_len bytes is sent with the given ctype.
+// curl polls this about once a second while a request is in flight, also
+// while it waits for a reply that never comes; a set flag aborts the call.
+static int rest_cancel_cb(void *flag, curl_off_t dlt, curl_off_t dln,
+                          curl_off_t ult, curl_off_t uln)
+{
+    (void)dlt; (void)dln; (void)ult; (void)uln;
+    return atomic_load((const atomic_bool *)flag) ? 1 : 0;
+}
+
+// Returns HTTP status, or -1 on transport error (a cancelled call included).
+// Response body (truncated) in resp. A non-NULL body of body_len bytes is
+// sent with the given ctype. A non-NULL cancel flag ends the call early
+// once it is set, so a background request cannot hold up an exit.
 static long rest_req(CURL *curl, const char *method, const char *url,
                      const void *body, long body_len, const char *ctype,
-                     long timeout_ms, char *resp)
+                     long timeout_ms, char *resp, const atomic_bool *cancel)
 {
     resp[0] = '\0';
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+    if (cancel) {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, rest_cancel_cb);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)cancel);
+        // the callback does not run while a SYN goes unanswered, so bound
+        // that part on its own (a LAN connect takes milliseconds; a
+        // background call is retried anyway)
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+    }
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_sink);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
     struct curl_slist *hdrs = NULL;
@@ -117,8 +137,12 @@ static long rest_req(CURL *curl, const char *method, const char *url,
 
 static long rest_put(CURL *curl, const char *url, char *resp)
 {
-    return rest_req(curl, "PUT", url, NULL, 0, NULL, 3000, resp);
+    return rest_req(curl, "PUT", url, NULL, 0, NULL, 3000, resp, NULL);
 }
+
+// Set by the keepalive thread on its way out, so the main thread can keep
+// the window responsive while it waits instead of blocking in a join.
+static atomic_bool g_ka_done;
 
 // Keepalive thread: re-issue the start command every 5 s so the stream survives
 // machine resets and menu excursions. The command is idempotent.
@@ -141,7 +165,9 @@ static int keepalive_thread(void *arg)
         // machine gives an HTTP answer, then cached for the session.
         if (rc->input_url[0] && atomic_load(&g_minput) < 0) {
             long code = rest_req(curl, "GET", rc->input_url, NULL, 0, NULL,
-                                 3000, resp);
+                                 3000, resp, &g_quit);
+            if (atomic_load(&g_quit))
+                break;
             if (code == 200) {
                 atomic_store(&g_minput, 1);
                 SDL_Log("machine:input available: matrix-level keyboard");
@@ -151,8 +177,11 @@ static int keepalive_thread(void *arg)
                         "via the KERNAL buffer", code);
             }
         }
-        for (int i = 0; i < rc->nstreams; i++) {
-            long code = rest_put(curl, rc->start_url[i], resp);
+        for (int i = 0; i < rc->nstreams && !atomic_load(&g_quit); i++) {
+            long code = rest_req(curl, "PUT", rc->start_url[i], NULL, 0,
+                                 NULL, 3000, resp, &g_quit);
+            if (atomic_load(&g_quit))
+                break; // cancelled: the result says nothing about the machine
             if (code != last_code[i]) { // log only on state change
                 if (code == 200)
                     SDL_Log("stream start OK (%s)", rc->start_url[i]);
@@ -170,9 +199,16 @@ static int keepalive_thread(void *arg)
         for (int i = 0; i < 50 && !atomic_load(&g_quit); i++)
             SDL_Delay(100);
     }
+    // Stop the streams on the way out, briefly: a machine that stopped
+    // answering (powered off) gets no stop calls at all, and one that is
+    // there answers well within a second. Anything longer would hold the
+    // exit, and the window with it, past the compositor's patience.
     for (int i = 0; i < rc->nstreams; i++)
-        rest_put(curl, rc->stop_url[i], resp);
+        if (last_code[i] != -1)
+            rest_req(curl, "PUT", rc->stop_url[i], NULL, 0, NULL, 1000, resp,
+                     NULL);
     curl_easy_cleanup(curl);
+    atomic_store(&g_ka_done, true);
     return 0;
 }
 
@@ -503,7 +539,7 @@ static bool machine_ctl(const char *host, const char *action)
         curl = curl_easy_init();
     char url[256], resp[512];
     snprintf(url, sizeof url, "http://%s/v1/machine:%s", host, action);
-    long code = rest_req(curl, "PUT", url, NULL, 0, NULL, 3000, resp);
+    long code = rest_req(curl, "PUT", url, NULL, 0, NULL, 3000, resp, NULL);
     if (code == 200)
         SDL_Log("machine:%s OK", action);
     else if (code == -1)
@@ -645,7 +681,8 @@ static bool run_file(const char *host, const char *path)
     bool parked = false;
     if (resets && (!ep || strcmp(ep, "run_crt") != 0)) {
         snprintf(url, sizeof url, "http://%s/v1/%s", host, CART_CFG_PATH);
-        if (rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp) == 200 &&
+        if (rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp, NULL) ==
+                200 &&
             json_find_str(resp, "current", cart, sizeof cart) && cart[0]) {
             char blank[560];
             snprintf(blank, sizeof blank, "%s?value=", url);
@@ -660,7 +697,7 @@ static bool run_file(const char *host, const char *path)
         snprintf(url, sizeof url, "http://%s/v1/runners:%s", host, ep);
         // generous timeout: the firmware saves the file before answering
         code = rest_req(curl, "POST", url, data, len,
-                        "application/octet-stream", 15000, resp);
+                        "application/octet-stream", 15000, resp, NULL);
         if (code == 200)
             SDL_Log("runners:%s %s OK (%ld bytes)", ep, path, len);
         else if (code == -1)
@@ -694,7 +731,7 @@ static bool run_file(const char *host, const char *path)
         snprintf(url, sizeof url, "http://%s/v1/drives/a:mount?type=%s", host,
                  img);
         code = rest_req(curl, "POST", url, data, len,
-                        "application/octet-stream", 15000, resp);
+                        "application/octet-stream", 15000, resp, NULL);
         if (code == 200)
             SDL_Log("%s mounted on drive A (%ld bytes); no autostart for "
                     ".%s, type LOAD\"*\",8,1 yourself", path, len, img);
@@ -782,7 +819,7 @@ static void minput_post(struct minput *mi, const char *body)
         mi->curl = curl_easy_init();
     char resp[512];
     if (rest_req(mi->curl, "POST", mi->url, body, (long)strlen(body),
-                 "application/json", 250, resp) == -1) {
+                 "application/json", 250, resp, NULL) == -1) {
         if (++mi->fails >= 3) {
             atomic_store(&g_minput, 0);
             SDL_Log("machine:input unreachable, falling back to the KERNAL "
@@ -1221,6 +1258,12 @@ int main(int argc, char **argv)
     Uint16 aseq_prev = 0;
     bool aseq_valid = false;
     bool got_any = false;
+    // A stream that stops (machine powered off, cable out) must not leave
+    // the last frame standing as if the viewer hung: after a moment the
+    // status screen says what is going on, and the stream view returns by
+    // itself with the next frame.
+    Uint64 last_frame = 0;
+    bool stream_lost = false;
     bool paused = false; // Ctrl+P toggle state (viewer-side best guess)
     // Audio latency control: startup fill and jitter leave a standing queue
     // that never drains on its own (input and output rates match). A servo on
@@ -1470,9 +1513,23 @@ int main(int argc, char **argv)
             SDL_RenderPresent(ren);
         }
 
+        if (got_any && !stream_lost && SDL_GetTicks() - last_frame > 2000) {
+            stream_lost = true;
+            char msg[TERM_COLS + 1];
+            if (cfg.host)
+                snprintf(msg, sizeof msg, "no stream from %s", cfg.host);
+            else
+                snprintf(msg, sizeof msg, "the stream stopped");
+            status_set(status, msg, "is the Ultimate powered on? waiting...");
+            term_present = true;
+            if (windowed)
+                SDL_SetWindowTitle(win, "c64uv - waiting for stream…");
+            SDL_Log("stream stopped");
+        }
+
         struct term *view = help_active ? NULL
                             : term_active ? trm
-                            : !got_any    ? status
+                            : !got_any || stream_lost ? status
                                           : NULL;
         if (windowed && view && (view->dirty || term_present)) {
             if (!term_tex) {
@@ -1499,9 +1556,14 @@ int main(int argc, char **argv)
 
         if (frame_done) {
             frames++;
-            if (!got_any) {
+            last_frame = SDL_GetTicks();
+            if (!got_any || stream_lost) {
+                if (got_any)
+                    SDL_Log("stream resumed");
+                else
+                    SDL_Log("receiving: %dx%d", fb->width, fb->height);
                 got_any = true;
-                SDL_Log("receiving: %dx%d", fb->width, fb->height);
+                stream_lost = false;
                 if (windowed)
                     SDL_SetWindowTitle(
                         win, kb.enabled
@@ -1554,10 +1616,26 @@ int main(int argc, char **argv)
     atomic_store(&g_quit, true);
     if (atomic_load(&g_minput) == 1 && mi.url[0])
         minput_release_all(&mi);
-    if (dthr) // a sweep may still be running; it must not outlive curl
+    // The background threads must not outlive curl, but a blocking join
+    // would leave the compositor's pings unanswered: with the Ultimate
+    // powered off, the old 3 s REST timeouts added up to a ten-second
+    // "application not responding" hang on Ctrl+Q. Keep pumping events
+    // until they are done (a sweep in progress, the keepalive's cancelled
+    // request or its quick stop calls).
+    if (dthr) { // sweep still running
+        while (windowed && atomic_load(&da.n) < 0) {
+            SDL_PumpEvents();
+            SDL_Delay(10);
+        }
         SDL_WaitThread(dthr, NULL);
-    if (ka)
+    }
+    if (ka) {
+        while (windowed && !atomic_load(&g_ka_done)) {
+            SDL_PumpEvents();
+            SDL_Delay(10);
+        }
         SDL_WaitThread(ka, NULL);
+    }
     if (mi.curl)
         curl_easy_cleanup(mi.curl);
     curl_global_cleanup();

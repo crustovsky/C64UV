@@ -180,6 +180,36 @@ grep -q "POST /v1/drives/a:mount?type=d81 body=819200" "$out/disc.log"
 grep -q "Cartridge" "$out/disc.log" && exit 1 # a plain mount parks nothing
 echo "disk image test passed"
 
+# ------------------------------------------------------- exit with host gone
+# A powered-off Ultimate answers nothing: the tarpit accepts connections and
+# never replies, which leaves the keepalive thread inside a REST call. A
+# quit (SIGTERM = SDL_EVENT_QUIT) must still finish within a couple of
+# seconds, or the compositor flags the window as not responding.
+
+python3 - <<'EOF' &
+import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.43", 8066)); s.listen()
+held = []
+while True:
+    c, _ = s.accept()
+    held.append(c)  # keep it open, say nothing
+EOF
+pids+=($!)
+sleep 0.3
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+    ./c64uv --host 127.0.0.43:8066 --dest 127.0.0.1 --port "$VPORT" \
+    --no-audio 2> "$out/tarpit.err" &
+cpid=$!
+sleep 2 # the keepalive is now waiting on the tarpit
+t0=$(date +%s%N)
+kill "$cpid"
+wait "$cpid" 2>/dev/null || true
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+echo "exit with the host gone took $ms ms"
+[ "$ms" -lt 3000 ]
+echo "exit with host gone test passed"
+
 # ---------------------------------------------------------------------- help
 # --help must print the shared binding table (same rows the F10 overlay
 # renders), so a missing row here means the overlay lost it too.
