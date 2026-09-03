@@ -941,6 +941,18 @@ static void status_set(struct term *t, const char *l1, const char *l2)
     t->dirty = true;
 }
 
+// The stream-lost screen; re-issued whenever a short notice has used the
+// status grid in the meantime.
+static void status_stream_lost(struct term *t, const char *host)
+{
+    char msg[TERM_COLS + 1];
+    if (host)
+        snprintf(msg, sizeof msg, "no stream from %s", host);
+    else
+        snprintf(msg, sizeof msg, "the stream stopped");
+    status_set(t, msg, "is the Ultimate powered on? waiting...");
+}
+
 // ---------------------------------------------------------------- main
 
 static void usage(const char *argv0)
@@ -1264,6 +1276,9 @@ int main(int argc, char **argv)
     // itself with the next frame.
     Uint64 last_frame = 0;
     bool stream_lost = false;
+    // A short notice on the status grid (menu unreachable, link lost)
+    // shows until this tick, then the regular status text comes back.
+    Uint64 notice_until = 0;
     bool paused = false; // Ctrl+P toggle state (viewer-side best guess)
     // Audio latency control: startup fill and jitter leave a standing queue
     // that never drains on its own (input and output rates match). A servo on
@@ -1343,20 +1358,36 @@ int main(int argc, char **argv)
                         machine_ctl(cfg.host, "menu_button");
                     } else if (va == VA_MENU_VIEW && !cfg.no_start &&
                                cfg.host) {
-                        term_active = !term_active;
-                        term_present = true; // repaint whichever view we enter
-                        if (term_active && atomic_load(&g_minput) == 1)
-                            minput_release_all(&mi); // no keys stay held
-                        if (term_active && tfd == COMPAT_BAD_SOCK &&
-                            (tfd_last_try == 0 ||
-                             SDL_GetTicks() - tfd_last_try > 3000)) {
-                            tfd_last_try = SDL_GetTicks();
-                            tfd = compat_tcp_connect(cfg.host, 23, 1);
+                        term_present = true; // repaint whichever view we land in
+                        if (term_active) {
+                            term_active = false;
+                        } else {
+                            if (tfd == COMPAT_BAD_SOCK &&
+                                (tfd_last_try == 0 ||
+                                 SDL_GetTicks() - tfd_last_try > 3000)) {
+                                tfd_last_try = SDL_GetTicks();
+                                tfd = compat_tcp_connect(cfg.host, 23, 1);
+                                if (tfd != COMPAT_BAD_SOCK) {
+                                    term_init(trm);
+                                    SDL_Log("menu terminal connected "
+                                            "(port 23)");
+                                } else
+                                    SDL_Log("menu terminal: connect failed");
+                            }
+                            // no connection, no menu view: a blank or stale
+                            // grid would pass for the machine's own screen
                             if (tfd != COMPAT_BAD_SOCK) {
-                                term_init(trm);
-                                SDL_Log("menu terminal connected (port 23)");
-                            } else
-                                SDL_Log("menu terminal: connect failed");
+                                term_active = true;
+                                if (atomic_load(&g_minput) == 1)
+                                    minput_release_all(&mi); // no keys held
+                            } else {
+                                status_set(status,
+                                           "cannot reach the Ultimate menu "
+                                           "(telnet, port 23)",
+                                           "is it powered on? is telnet "
+                                           "enabled?");
+                                notice_until = SDL_GetTicks() + 3000;
+                            }
                         }
                     } else if (term_active) {
                         Uint8 seq[8];
@@ -1455,6 +1486,14 @@ int main(int argc, char **argv)
                 tfd = COMPAT_BAD_SOCK;
             }
         }
+        if (term_active && tfd == COMPAT_BAD_SOCK) { // closed or send failed
+            term_active = false;
+            term_present = true;
+            status_set(status, "the Ultimate menu connection was lost",
+                       "F9 reconnects");
+            notice_until = SDL_GetTicks() + 3000;
+            SDL_Log("menu terminal: connection lost");
+        }
 
         if (asock != COMPAT_BAD_SOCK) {
             int n;
@@ -1515,22 +1554,38 @@ int main(int argc, char **argv)
 
         if (got_any && !stream_lost && SDL_GetTicks() - last_frame > 2000) {
             stream_lost = true;
-            char msg[TERM_COLS + 1];
-            if (cfg.host)
-                snprintf(msg, sizeof msg, "no stream from %s", cfg.host);
-            else
-                snprintf(msg, sizeof msg, "the stream stopped");
-            status_set(status, msg, "is the Ultimate powered on? waiting...");
+            status_stream_lost(status, cfg.host);
+            notice_until = 0;
             term_present = true;
             if (windowed)
                 SDL_SetWindowTitle(win, "c64uv - waiting for stream…");
+            // a silent power-off never closes the menu link, so its last
+            // screen would stay up as if live; F9 reconnects later
+            if (tfd != COMPAT_BAD_SOCK) {
+                compat_close(tfd);
+                tfd = COMPAT_BAD_SOCK;
+                term_active = false;
+            }
             SDL_Log("stream stopped");
+        }
+        if (notice_until && SDL_GetTicks() >= notice_until) {
+            notice_until = 0;
+            if (stream_lost)
+                status_stream_lost(status, cfg.host);
+            else if (!got_any && !discovering && cfg.host) {
+                char msg[TERM_COLS + 1];
+                snprintf(msg, sizeof msg, "waiting for the stream from %s",
+                         cfg.host);
+                status_set(status, msg, NULL);
+            }
+            term_present = true;
         }
 
         struct term *view = help_active ? NULL
                             : term_active ? trm
-                            : !got_any || stream_lost ? status
-                                          : NULL;
+                            : !got_any || stream_lost || notice_until
+                                ? status
+                                : NULL;
         if (windowed && view && (view->dirty || term_present)) {
             if (!term_tex) {
                 term_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
