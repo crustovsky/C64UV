@@ -12,6 +12,10 @@ cable.
 ./c64uv --host <ultimate-ip>
 ```
 
+<p align="center">
+  <img src="assets/screenshots/stream.png" width="768" alt="The C64 screen in the viewer window: a one-line BASIC maze program typed from the PC keyboard, running">
+</p>
+
 ## What you get
 
 - **Video** - the raw VIC stream (PAL 384×272 @ 50 Hz or NTSC 384×240 @ 60 Hz),
@@ -34,6 +38,12 @@ cable.
   reference.
 - **Shareable streams** - `--multicast` lets any number of viewers watch
   the same machine.
+
+<p align="center">
+  <img src="assets/screenshots/menu.png" width="49%" alt="F9: the Ultimate's file browser mirrored in the viewer window">
+  <img src="assets/screenshots/help.png" width="49%" alt="F10: the in-window key reference">
+</p>
+<p align="center"><sub>F9 shows the Ultimate's own menu; F10 the key reference.</sub></p>
 
 ## Requirements
 
