@@ -255,8 +255,9 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    comes from SDL3's HIDAPI drivers + mapping db (worst case Steam udev
    rules or SDL_GAMECONTROLLERCONFIG); code against generic SDL_Gamepad.
 
-3. **Persistent drop storage** (implemented 2026-09-27, awaiting a real
-   hardware run): `--store <folder>` / `C64U_STORE` switches image drops
+3. **Persistent drop storage** (implemented and verified on hardware
+   2026-09-27, Windows client against firmware 1.1.0: upload, path mount,
+   reset and typed autostart all went through): `--store <folder>` / `C64U_STORE` switches image drops
    from the firmware's temp area (RAM disk, gone at power-off) to
    FTP-upload-then-mount-by-path, see `store_image` in main.c. FTP is the
    only upload route: the REST files API has no upload on any firmware
@@ -271,9 +272,9 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    preference: upload to `/Temp` and move the file from the Ultimate menu
    himself. Still open: whether SDL reports a modifier held during a drag
    on Wayland (`--verbose` logs the Shift state at drop time to find out;
-   a modifier-selected store would build on that), and hardware
-   verification of the `:info` reply for a missing file (assumed non-200)
-   and of `image=` taking a literal `/`-separated path. Follow-up on top
+   a modifier-selected store would build on that). Verified: `:info`
+   answers non-200 for a missing file and `image=` takes a literal
+   `/`-separated path. Follow-up on top
    of it: in the F9 view, upload into the folder the menu currently shows
    (path line parse; truncated long paths need a fallback). Test hooks:
    `C64U_FTP_PORT` (fakeultimate.py serves a passive-mode FTP stub as its
