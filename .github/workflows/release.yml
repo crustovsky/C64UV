@@ -43,7 +43,7 @@ jobs:
           cmake --build sdl3-build -j"$(nproc)"
           cmake --install sdl3-build
 
-      - name: Build static libcurl (HTTP only)
+      - name: Build static libcurl (HTTP + FTP, for --store uploads)
         run: |
           curl -sLO https://curl.se/download/curl-8.11.1.tar.gz
           tar xzf curl-8.11.1.tar.gz
@@ -53,7 +53,7 @@ jobs:
             --without-nghttp2 --without-libidn2 --disable-ldap --disable-ldaps \
             --disable-rtsp --disable-dict --disable-telnet --disable-tftp \
             --disable-pop3 --disable-imap --disable-smb --disable-smtp \
-            --disable-gopher --disable-mqtt --disable-ftp --disable-file \
+            --disable-gopher --disable-mqtt --disable-file \
             --disable-docs --disable-manual --prefix="$GITHUB_WORKSPACE/staticlibs"
           make -j"$(nproc)"
           make install
@@ -77,7 +77,7 @@ jobs:
           mkdir -p dist
           cp c64uv dist/
           strip dist/c64uv
-          tar -C dist -czf "c64uv-${GITHUB_REF_NAME:-dev}-linux-x86_64.tar.gz" c64uv
+          tar -C dist -czf "c64uv-${GITHUB_REF_NAME//\//-}-linux-x86_64.tar.gz" c64uv
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
@@ -94,6 +94,72 @@ jobs:
         with:
           name: c64uv-linux-x86_64
           path: c64uv-*-linux-x86_64.tar.gz
+
+  # Cross-built with MinGW on Linux: the same static libcurl recipe as
+  # above, SDL3 from its official MinGW development package (shipped as a
+  # DLL next to the exe). Unverified on real hardware until a Windows
+  # tester reports back; see CLAUDE.md roadmap 1.
+  windows:
+    if: ${{ !inputs.tag }}
+    runs-on: ubuntu-latest
+    env:
+      SDL_VER: 3.2.20
+      CURL_VER: 8.11.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 zip
+
+      - name: Fetch SDL3 MinGW development package
+        run: |
+          curl -sLO "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VER/SDL3-devel-$SDL_VER-mingw.tar.gz"
+          tar xzf "SDL3-devel-$SDL_VER-mingw.tar.gz"
+
+      - name: Build static libcurl (HTTP + FTP)
+        run: |
+          curl -sLO "https://github.com/curl/curl/releases/download/curl-${CURL_VER//./_}/curl-$CURL_VER.tar.gz"
+          tar xzf "curl-$CURL_VER.tar.gz"
+          cd "curl-$CURL_VER"
+          ./configure --host=x86_64-w64-mingw32 --disable-shared --enable-static \
+            --without-ssl --without-libpsl --without-zlib --without-brotli \
+            --without-zstd --without-nghttp2 --without-libidn2 --disable-ldap \
+            --disable-ldaps --disable-rtsp --disable-dict --disable-telnet \
+            --disable-tftp --disable-pop3 --disable-imap --disable-smb \
+            --disable-smtp --disable-gopher --disable-mqtt --disable-file \
+            --disable-docs --disable-manual --prefix="$GITHUB_WORKSPACE/wincurl"
+          make -j"$(nproc)"
+          make install
+
+      - name: Build c64uv.exe
+        run: |
+          PKG_CONFIG_PATH="$PWD/SDL3-$SDL_VER/x86_64-w64-mingw32/lib/pkgconfig:$PWD/wincurl/lib/pkgconfig" \
+            make TARGET=win32
+          x86_64-w64-mingw32-strip c64uv.exe
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp c64uv.exe "SDL3-$SDL_VER/x86_64-w64-mingw32/bin/SDL3.dll" README.md LICENSE dist/
+          (cd dist && zip -q "../c64uv-${GITHUB_REF_NAME//\//-}-windows-x86_64.zip" ./*)
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" \
+            "c64uv-$GITHUB_REF_NAME-windows-x86_64.zip" --clobber
+
+      - name: Upload artifact (non-tag runs)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: c64uv-windows-x86_64
+          path: c64uv-*-windows-x86_64.zip
 
   arch-package:
     runs-on: ubuntu-latest

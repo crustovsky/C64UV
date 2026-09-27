@@ -6,7 +6,7 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.2.8"
+#define C64UV_VERSION "0.2.9"
 
 #include "compat.h"
 #include "discover.h"
@@ -14,7 +14,6 @@
 #include "term.h"
 #include "video.h"
 
-#include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -26,6 +25,8 @@ struct config {
     const char *password;   // network password -> X-Password header
     const char *do_action;  // one-shot machine control, then exit
     const char *run_path;   // one-shot: run this .prg/.crt/.sid/.d64, then exit
+    const char *type_text;  // one-shot: type this into the C64, then exit
+    bool screen;            // one-shot: print the C64 text screen, then exit
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
     int listen_port;        // video; audio uses listen_port + 1
     int scale;
@@ -53,6 +54,9 @@ static atomic_int g_minput = -1;
 // Network password (firmware 3.12+), sent as X-Password on every REST call.
 // Set once at startup, before any thread starts.
 static const char *g_password;
+// --store folder on the Ultimate: dropped disk images are uploaded there
+// (FTP) and mounted by path instead of going to the firmware's temp area.
+static const char *g_store;
 
 // ---------------------------------------------------------------- REST control
 
@@ -190,8 +194,9 @@ static int keepalive_thread(void *arg)
                 else
                     SDL_Log("stream start HTTP %ld: %s%s", code, resp,
                             strstr(resp, "No Operational Network Interface")
-                                ? " -> plug the Ultimate into wired Ethernet; "
-                                  "streams don't work over its WiFi"
+                                ? " -> the Ultimate's wired port has no link: "
+                                  "check the cable and its link LED; streams "
+                                  "don't work over its WiFi"
                                 : "");
                 last_code[i] = code;
             }
@@ -397,15 +402,21 @@ static int discover_thread(void *arg)
 #define DMA_CMD_AUTHENTICATE 0xFF1F
 #define DMA_MAX_PAYLOAD 200000 // firmware SOCKET_BUFFER_SIZE; longer is truncated
 
-// The REST host may carry a :port (discovery test hook); the DMA socket
-// wants the bare address. C64U_DMA_PORT overrides port 64 for tests.
-static compat_sock dma_connect_raw(const char *host, int timeout_s)
+// The REST host may carry a :port (discovery test hook); the DMA socket and
+// FTP want the bare address.
+static void host_ip(const char *host, char *ip, size_t size)
 {
-    char ip[64];
-    snprintf(ip, sizeof ip, "%s", host);
+    snprintf(ip, size, "%s", host);
     char *colon = strchr(ip, ':');
     if (colon)
         *colon = '\0';
+}
+
+// C64U_DMA_PORT overrides port 64 for tests.
+static compat_sock dma_connect_raw(const char *host, int timeout_s)
+{
+    char ip[64];
+    host_ip(host, ip, sizeof ip);
     const char *penv = getenv("C64U_DMA_PORT");
     return compat_tcp_connect(ip, penv ? (uint16_t)atoi(penv) : 64,
                               timeout_s);
@@ -593,7 +604,7 @@ static const char *image_type_for(const char *path)
 }
 
 struct binbuf {
-    uint8_t data[16];
+    uint8_t data[1000]; // a full 40x25 text screen
     int len;
 };
 
@@ -606,38 +617,245 @@ static size_t bin_sink(char *d, size_t size, size_t nmemb, void *userp)
     return n;
 }
 
+// GET machine:readmem: `len` bytes from hex address `addr` into b (capped
+// at the buffer). False on a transport error.
+static bool readmem(CURL *curl, const char *host, const char *addr, int len,
+                    struct binbuf *b)
+{
+    char url[256];
+    snprintf(url, sizeof url,
+             "http://%s/v1/machine:readmem?address=%s&length=%d", host, addr,
+             len);
+    b->len = 0;
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, bin_sink);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, b);
+    struct curl_slist *hdrs = NULL;
+    if (g_password) {
+        char pwhdr[160];
+        snprintf(pwhdr, sizeof pwhdr, "X-Password: %s", g_password);
+        hdrs = curl_slist_append(NULL, pwhdr);
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    }
+    bool ok = curl_easy_perform(curl) == CURLE_OK;
+    curl_slist_free_all(hdrs);
+    return ok;
+}
+
 // Readiness gate: the KERNAL zeroes $CC when it sits at a prompt with the
 // cursor flashing. Two consecutive ready reads guard against sampling a
 // transient zero mid-boot; the timeout covers programs that never return
 // to the prompt (games) - by then the internal reset is long done.
 static void wait_kernal_ready(CURL *curl, const char *host, int max_ms)
 {
-    char url[256];
-    snprintf(url, sizeof url,
-             "http://%s/v1/machine:readmem?address=00CC&length=1", host);
     int ready = 0;
     for (int t = 0; t < max_ms && ready < 2; t += 500) {
-        struct binbuf b = {.len = 0};
-        curl_easy_reset(curl);
-        curl_easy_setopt(curl, CURLOPT_URL, url);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 1000L);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, bin_sink);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
-        struct curl_slist *hdrs = NULL;
-        if (g_password) {
-            char pwhdr[160];
-            snprintf(pwhdr, sizeof pwhdr, "X-Password: %s", g_password);
-            hdrs = curl_slist_append(NULL, pwhdr);
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-        }
-        bool ok = curl_easy_perform(curl) == CURLE_OK;
-        curl_slist_free_all(hdrs);
-        if (ok && b.len >= 1 && b.data[0] == 0)
+        struct binbuf b;
+        if (readmem(curl, host, "00CC", 1, &b) && b.len >= 1 &&
+            b.data[0] == 0)
             ready++;
         else
             ready = 0;
         SDL_Delay(500);
     }
+}
+
+// The opposite wait: until the KERNAL is busy ($CC != 0), i.e. a typed
+// LOAD has started; a load that fails at once never gets there, hence the
+// short timeout.
+static void wait_kernal_busy(CURL *curl, const char *host, int max_ms)
+{
+    for (int t = 0; t < max_ms; t += 250) {
+        struct binbuf b;
+        if (readmem(curl, host, "00CC", 1, &b) && b.len >= 1 && b.data[0])
+            return;
+        SDL_Delay(250);
+    }
+}
+
+// File name part of a dropped path; SDL hands over native separators.
+static const char *path_base(const char *path)
+{
+    const char *b = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/' || *p == '\\')
+            b = p + 1;
+    return b;
+}
+
+// ------------------------------------------------ persistent images (--store)
+//
+// The firmware's temp area is a RAM disk, gone at power-off, and RUN_IMG
+// always lands there. With --store the image is uploaded into a folder on
+// the Ultimate over FTP instead (the only upload route: the REST files API
+// cannot write on any firmware; the FTP service is on by default), mounted
+// from there read-write, and autostarted by the viewer itself: a path mount
+// has no firmware autostart, so it resets the machine and types
+// LOAD"*",8,1 / RUN over the keyboard channel behind the readiness gate.
+// A file of the same name is replaced (FTP STOR overwrites).
+
+static bool curl_has_ftp(void)
+{
+    curl_version_info_data *v = curl_version_info(CURLVERSION_NOW);
+    for (const char *const *p = v->protocols; *p; p++)
+        if (!strcmp(*p, "ftp"))
+            return true;
+    return false;
+}
+
+// Percent-encodes an Ultimate path for a URL one segment at a time, so the
+// slashes survive; leading slashes are dropped (callers add the root).
+static void url_path(CURL *curl, char *out, size_t size, const char *path)
+{
+    size_t n = 0;
+    out[0] = '\0';
+    while (*path) {
+        while (*path == '/')
+            path++;
+        const char *end = strchr(path, '/');
+        size_t seg = end ? (size_t)(end - path) : strlen(path);
+        if (!seg)
+            break;
+        char *esc = curl_easy_escape(curl, path, (int)seg);
+        n += (size_t)snprintf(out + n, n < size ? size - n : 0, "%s%s",
+                              n ? "/" : "", esc ? esc : "");
+        curl_free(esc);
+        path += seg;
+    }
+}
+
+struct memsrc {
+    const uint8_t *p;
+    size_t left;
+};
+
+static size_t mem_read(char *buf, size_t size, size_t nmemb, void *userp)
+{
+    struct memsrc *m = userp;
+    size_t n = size * nmemb < m->left ? size * nmemb : m->left;
+    memcpy(buf, m->p, n);
+    m->p += n;
+    m->left -= n;
+    return n;
+}
+
+// Upload progress feeds the window title; a quit aborts the transfer.
+static int ftp_progress_cb(void *unused, curl_off_t dlt, curl_off_t dln,
+                           curl_off_t ult, curl_off_t uln)
+{
+    (void)unused; (void)dlt; (void)dln;
+    if (ult > 0)
+        atomic_store(&g_run_pct, (int)(uln * 100 / ult));
+    return atomic_load(&g_quit) ? 1 : 0;
+}
+
+// C64U_FTP_PORT overrides port 21 for tests. Anonymous login, as the
+// firmware's FTP service expects.
+static bool ftp_upload(CURL *curl, const char *host, const char *rpath,
+                       const uint8_t *data, size_t len)
+{
+    char ip[64], url[1024];
+    host_ip(host, ip, sizeof ip);
+    const char *penv = getenv("C64U_FTP_PORT");
+    snprintf(url, sizeof url, "ftp://%s:%s/%s", ip, penv ? penv : "21",
+             rpath);
+    struct memsrc src = {data, len};
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(curl, CURLOPT_READFUNCTION, mem_read);
+    curl_easy_setopt(curl, CURLOPT_READDATA, &src);
+    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)len);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, ftp_progress_cb);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK)
+        SDL_Log("FTP upload to %s failed: %s", url, curl_easy_strerror(res));
+    return res == CURLE_OK;
+}
+
+// Types text into the KERNAL keyboard buffer over a DMA connection. The
+// buffer holds 10 bytes and the firmware does not chunk; batches of
+// exactly 10 went missing twice on hardware (tail batch delivered, first
+// one gone), so 8 leaves room for a key already sitting in the buffer.
+#define KEYB_BATCH 8
+static bool dma_type(compat_sock s, const char *text)
+{
+    size_t len = strlen(text);
+    for (size_t i = 0; i < len; i += KEYB_BATCH) {
+        size_t n = len - i < KEYB_BATCH ? len - i : KEYB_BATCH;
+        if (!dma_send(s, DMA_CMD_KEYB, text + i, n, false))
+            return false;
+        SDL_Delay(100); // let BASIC drain the buffer
+    }
+    return true;
+}
+
+// Returns 200 on success, -1 otherwise (already logged). The machine has
+// been reset by then, so the caller's cartridge parking applies.
+static long store_image(CURL *curl, const char *host, const char *path,
+                        const uint8_t *data, long len, char *resp)
+{
+    if (!curl_has_ftp()) {
+        SDL_Log("--store needs libcurl with FTP support");
+        return -1;
+    }
+    const char *name = path_base(path);
+    char shown[512], rpath[512], folder[256]; // shown: for the log lines
+    snprintf(shown, sizeof shown, "%s/%s", g_store, name);
+    url_path(curl, folder, sizeof folder, g_store);
+    char *esc = curl_easy_escape(curl, name, 0);
+    snprintf(rpath, sizeof rpath, "%s%s%s", folder, folder[0] ? "/" : "",
+             esc ? esc : "");
+    curl_free(esc);
+
+    char url[1024];
+    if (!ftp_upload(curl, host, rpath, data, (size_t)len))
+        return -1;
+    atomic_store(&g_run_pct, -1);
+    SDL_Log("stored as %s (%ld bytes, replacing any old file)", shown, len);
+
+    snprintf(url, sizeof url,
+             "http://%s/v1/drives/a:mount?image=/%s&mode=readwrite", host,
+             rpath);
+    long code = rest_put(curl, url, resp);
+    if (code != 200) {
+        SDL_Log("drives/a:mount HTTP %ld: %s", code, resp);
+        return -1;
+    }
+    if (!machine_ctl(host, "reset"))
+        return -1;
+    // reset zeroes the zero page, so $CC reads 0 mid-boot and the gate
+    // alone can pass before the KERNAL has set up (and wiped) the keyboard
+    // buffer: typed text vanished that way (verified 2026-09-27). The C64
+    // boots in about 1.5 s; let it.
+    SDL_Delay(2500);
+    wait_kernal_ready(curl, host, 10000);
+    compat_sock s = dma_connect(host, 3);
+    if (s == COMPAT_BAD_SOCK) {
+        SDL_Log("mounted on drive A, but the DMA socket (port 64) is "
+                "unreachable: type LOAD\"*\",8,1 yourself");
+        return -1;
+    }
+    bool typed = dma_type(s, "LOAD\"*\",8,1\r");
+    if (typed) {
+        // the cursor is off while the drive works ($CC != 0): wait for
+        // the load to start, then for READY.; a KERNAL load runs at about
+        // 400 bytes/s
+        wait_kernal_busy(curl, host, 3000);
+        wait_kernal_ready(curl, host, 120000);
+        typed = dma_type(s, "RUN\r");
+    }
+    compat_close(s);
+    if (!typed)
+        SDL_Log("keyboard channel dropped mid-autostart: %s", compat_neterr());
+    else
+        SDL_Log("%s mounted read-write on drive A and started", shown);
+    return typed ? 200 : -1;
 }
 
 static bool run_file(const char *host, const char *path)
@@ -649,28 +867,20 @@ static bool run_file(const char *host, const char *path)
                 ".d71, .g71, .d81) can be run", path);
         return false;
     }
-    // the machine resets for a runner or a .d64 autostart; a plain mount
-    // leaves it alone
-    bool resets = ep || !strcmp(img, "d64");
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        SDL_Log("%s: %s", path, strerror(errno));
+    bool store = img && g_store;
+    // the machine resets for a runner, a stored image or a .d64 autostart;
+    // a plain mount leaves it alone
+    bool resets = ep || store || !strcmp(img, "d64");
+    size_t size;
+    uint8_t *data = SDL_LoadFile(path, &size); // UTF-8 path on every OS
+    if (!data) {
+        SDL_Log("%s: %s", path, SDL_GetError());
         return false;
     }
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    long len = (long)size;
     if (len <= 0 || len > 2 << 20) { // largest sensible .crt is ~1 MB
         SDL_Log("%s: unreasonable file size (%ld)", path, len);
-        fclose(f);
-        return false;
-    }
-    uint8_t *data = malloc((size_t)len);
-    bool readok = data && fread(data, 1, (size_t)len, f) == (size_t)len;
-    fclose(f);
-    if (!readok) {
-        SDL_Log("%s: short read", path);
-        free(data);
+        SDL_free(data);
         return false;
     }
 
@@ -704,6 +914,8 @@ static bool run_file(const char *host, const char *path)
             SDL_Log("runners:%s: no response from Ultimate", ep);
         else
             SDL_Log("runners:%s HTTP %ld: %s", ep, code, resp);
+    } else if (store) {
+        code = store_image(curl, host, path, data, len, resp);
     } else if (resets) {
         // .d64: the firmware mounts and autostarts it (DMA socket RUN_IMG)
         code = -1;
@@ -740,7 +952,7 @@ static bool run_file(const char *host, const char *path)
         else
             SDL_Log("drives/a:mount HTTP %ld: %s", code, resp);
     }
-    free(data);
+    SDL_free(data);
 
     if (parked) {
         wait_kernal_ready(curl, host, 10000);
@@ -790,13 +1002,84 @@ static void run_file_async(const char *host, const char *path,
         kb->fd = COMPAT_BAD_SOCK;
         kb->reclaim = kb->enabled;
     }
-    const char *base = strrchr(path, '/');
-    snprintf(g_run_name, sizeof g_run_name, "%s", base ? base + 1 : path);
+    snprintf(g_run_name, sizeof g_run_name, "%s", path_base(path));
     atomic_store(&g_run_pct, 0);
     struct runjob *j = malloc(sizeof *j);
     snprintf(j->host, sizeof j->host, "%s", host);
     snprintf(j->path, sizeof j->path, "%s", path);
     SDL_DetachThread(SDL_CreateThread(run_thread, "runfile", j));
+}
+
+// ------------------------------------------------------ headless type/screen
+//
+// The scripting pair: --type puts text into the KERNAL buffer (the same
+// channel the window uses), --screen reads screen RAM back. Together they
+// let a script or an agent drive BASIC and check the result without a
+// window.
+
+static bool type_text(const char *host, const char *text)
+{
+    char buf[1024];
+    size_t n = 0;
+    for (const char *p = text; *p && n < sizeof buf - 1; p++) {
+        int c;
+        if (*p == '\\' && p[1] == 'n') { // "\n" in the argument = RETURN
+            c = 0x0D;
+            p++;
+        } else if (*p == '\n') {
+            c = 0x0D;
+        } else {
+            // plain letters either way: BASIC wants unshifted PETSCII, and
+            // the window's Shift-means-graphics convention has no use here
+            c = ascii_to_petscii((unsigned char)SDL_tolower(*p));
+        }
+        if (c > 0)
+            buf[n++] = (char)c;
+    }
+    buf[n] = '\0';
+    compat_sock s = dma_connect(host, 3);
+    if (s == COMPAT_BAD_SOCK) {
+        SDL_Log("DMA socket (port 64) unreachable; is the Ultimate DMA "
+                "Service enabled?");
+        return false;
+    }
+    bool ok = dma_type(s, buf);
+    if (!ok)
+        SDL_Log("typing failed: %s", compat_neterr());
+    compat_close(s);
+    return ok;
+}
+
+// Screen codes to text, upper-case/graphics set assumed (the default);
+// graphics symbols print as '#', reverse video is dropped.
+static char screen_char(uint8_t sc)
+{
+    sc &= 0x7F;
+    if (sc < 32)
+        return (char)(sc + 64); // @ A-Z [ pound ] arrows
+    if (sc < 64)
+        return (char)sc;        // space, punctuation, digits
+    return '#';
+}
+
+static bool print_screen(const char *host)
+{
+    CURL *curl = curl_easy_init();
+    struct binbuf b;
+    bool ok = readmem(curl, host, "0400", 1000, &b) && b.len == 1000;
+    curl_easy_cleanup(curl);
+    if (!ok) {
+        SDL_Log("machine:readmem failed (%d bytes)", b.len);
+        return false;
+    }
+    for (int row = 0; row < 25; row++) {
+        char line[41];
+        for (int col = 0; col < 40; col++)
+            line[col] = screen_char(b.data[row * 40 + col]);
+        line[40] = '\0';
+        puts(line);
+    }
+    return true;
 }
 
 // ----------------------------------------------- matrix keyboard (REST)
@@ -960,8 +1243,9 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
             "          [--multicast] [--no-start] [--no-audio] [--no-keyb]\n"
-            "          [--password PW] [--do ACTION] [--dump FILE.ppm]\n"
-            "          [--term-test] [--discover] [--verbose] [--version]\n"
+            "          [--password PW] [--do ACTION] [--run FILE] [--store DIR]\n"
+            "          [--type TEXT] [--screen] [--dump FILE.ppm] [--term-test]\n"
+            "          [--discover] [--verbose] [--version]\n"
             "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
             "auto-discover)\n"
             "  --dest    where the Ultimate should send the streams (default: auto;\n"
@@ -975,6 +1259,11 @@ static void usage(const char *argv0)
             "  --run     run a .prg/.crt/.sid/.d64 on the machine, then exit\n"
             "            (.g64/.d71/.g71/.d81 are mounted without autostart)\n"
             "            (in the window: drop the file onto it instead)\n"
+            "  --store   keep dropped disk images: upload them into this folder on\n"
+            "            the Ultimate (FTP, e.g. /Temp or /Usb0/games), mount from\n"
+            "            there read-write and autostart (or set C64U_STORE)\n"
+            "  --type    type TEXT into the C64 (\\n = RETURN), then exit\n"
+            "  --screen  print the C64 text screen (40x25), then exit\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
             "  --term-test  print the telnet menu screen as text, then exit\n"
@@ -1000,6 +1289,12 @@ int main(int argc, char **argv)
             cfg.do_action = argv[++i];
         else if (!strcmp(argv[i], "--run") && i + 1 < argc)
             cfg.run_path = argv[++i];
+        else if (!strcmp(argv[i], "--store") && i + 1 < argc)
+            g_store = argv[++i];
+        else if (!strcmp(argv[i], "--type") && i + 1 < argc)
+            cfg.type_text = argv[++i];
+        else if (!strcmp(argv[i], "--screen"))
+            cfg.screen = true;
         else if (!strcmp(argv[i], "--dest") && i + 1 < argc)
             cfg.dest = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc)
@@ -1036,6 +1331,10 @@ int main(int argc, char **argv)
     if (!cfg.password)
         cfg.password = getenv("C64U_PASSWORD");
     g_password = cfg.password;
+    if (!g_store)
+        g_store = getenv("C64U_STORE");
+    if (g_store && !*g_store)
+        g_store = NULL;
     if (g_password)
         // discovery reads the env; SDL wraps the C runtime setenv portably
         SDL_setenv_unsafe("C64U_PASSWORD", g_password, 1);
@@ -1078,7 +1377,7 @@ int main(int argc, char **argv)
     // immediately and discovers in the background instead.
     static char auto_host[46];
     bool headless = cfg.dump_path || cfg.term_test || cfg.do_action ||
-                    cfg.run_path;
+                    cfg.run_path || cfg.type_text || cfg.screen;
     if (!cfg.host && !cfg.no_start && headless) {
         struct discovered found[DISCOVER_MAX];
         fprintf(stderr, "no --host given, discovering...\n");
@@ -1103,6 +1402,13 @@ int main(int argc, char **argv)
 
     if (cfg.run_path)
         return run_file(cfg.host, cfg.run_path) ? 0 : 1;
+
+    if (cfg.type_text && !type_text(cfg.host, cfg.type_text))
+        return 1;
+    if (cfg.screen)
+        return print_screen(cfg.host) ? 0 : 1;
+    if (cfg.type_text)
+        return 0;
 
     if (cfg.term_test)
         return run_term_test(cfg.host);
@@ -1424,6 +1730,12 @@ int main(int argc, char **argv)
                     // a stale frame would be shown scaled and off-center
                     term_present = true;
                 } else if (ev.type == SDL_EVENT_DROP_FILE) {
+                    // open question for a modifier-selected store: does
+                    // Wayland report the modifier state during a drag?
+                    if (cfg.verbose)
+                        SDL_Log("drop: shift %s", (SDL_GetModState() &
+                                                   SDL_KMOD_SHIFT)
+                                                      ? "held" : "not held");
                     if (!cfg.no_start && cfg.host && ev.drop.data)
                         run_file_async(cfg.host, ev.drop.data, &kb);
                 } else if (ev.type == SDL_EVENT_TEXT_INPUT && !help_active) {

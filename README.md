@@ -57,9 +57,10 @@ cable.
 
 | Service | Needed for |
 |---|---|
-| Web Remote Control Service (REST API, port 80) | discovery, starting/stopping the streams, the Ctrl+R/P/M machine controls and `--do`, running dropped `.prg`/`.crt`/`.sid` files, mounting `.g64`/`.d71`/`.g71`/`.d81` images, cartridge parking, and matrix-level typing on firmware that has `machine:input` |
+| Web Remote Control Service (REST API, port 80) | discovery, starting/stopping the streams, the Ctrl+R/P/M machine controls and `--do`, running dropped `.prg`/`.crt`/`.sid` files, mounting `.g64`/`.d71`/`.g71`/`.d81` images, mounting stored images by path (`--store`), cartridge parking, and matrix-level typing on firmware that has `machine:input` |
 | Ultimate DMA Service (port 64) | typing into the C64 (KERNAL buffer), RUN/STOP, and mount-and-run of a dropped `.d64` |
 | Telnet Remote Menu Service (port 23) | the F9 menu view |
+| FTP Service (port 21, on by default) | uploading dropped images with `--store` |
 
 Everything else the viewer does needs no service: the video/audio streams
 arrive on UDP 11000/11001 once started. The REST API alone gets you a
@@ -121,10 +122,27 @@ a second drop while one is in flight is refused.
 Other disk images (`.g64`, `.d71`, `.g71`, `.d81`) are mounted on drive A
 without touching the machine; type `LOAD"*",8,1` yourself. Every image is
 copied to the Ultimate's temp area first, so writes never reach the file you
-dropped.
+dropped, and the temp area is a RAM disk that is gone at power-off.
+
+To keep dropped images, start the viewer with `--store FOLDER` (or set
+`C64U_STORE`), e.g. `--store /Temp` or `--store /Usb0/games`. A dropped
+image is then uploaded into that folder over FTP (the Ultimate's FTP service
+is on by default), mounted from there read-write, and autostarted by the
+viewer: it resets the machine and types `LOAD"*",8,1` and `RUN` once the
+READY prompt is back, for every image type. Dropping a file of the same
+name replaces the stored copy. `.prg`/`.crt`/`.sid` drops are unaffected
+by `--store`.
 
 The same machine controls work headless: `c64uv --do reset` (also `reboot`,
-`pause`, `resume`, `menu`, `poweroff`) issues one REST call and exits. If
+`pause`, `resume`, `menu`, `poweroff`) issues one REST call and exits.
+Every viewer action has a one-shot flag, so scripts and agents can drive the
+machine without a window: `--discover`, `--do`, `--run` (with `--store`),
+`--type 'LOAD"*",8,1\n'` (types into the C64, `\n` = RETURN),
+`--screen` (prints the 40x25 text screen read from screen RAM, the way to
+check what a typed command did), `--dump frame.ppm` (one video frame) and
+`--term-test` (the Ultimate menu as text). After `--do reset` give the C64
+about three seconds to boot before typing. Exit status is 0 on success, 1
+when the Ultimate refused or did not answer, 2 for a usage error. If
 your Ultimate has a network password set (firmware 3.12+), pass it with
 `--password` or the `C64U_PASSWORD` environment variable; it is sent as the
 `X-Password` header on every request, discovery included.
@@ -158,6 +176,13 @@ binary, a desktop entry, and the icon. Prebuilt static binaries are on the
 [releases page](https://github.com/crustovsky/C64UV/releases). Set `C64U_HOST`
 in your environment if you launch it from the desktop menu rather than a
 terminal.
+
+**Windows** (x86_64): unzip `c64uv-<version>-windows-x86_64.zip`
+from the release and run `c64uv.exe` from a terminal (`c64uv.exe --host
+<ip>`); `SDL3.dll` must stay next to it. Everything in this README applies,
+except that a VPN claiming the LAN route may need to be off (the Linux
+build pins the stream's ARP prime to the LAN interface; Windows sends a
+plain ping).
 
 On Arch (x86_64), download `c64uv-<version>-1-x86_64.pkg.tar.zst` from the
 [latest release](https://github.com/crustovsky/C64UV/releases/latest) and

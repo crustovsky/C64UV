@@ -17,8 +17,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef int compat_sock; // SOCKET on Winsock
+#ifdef _WIN32
+typedef uintptr_t compat_sock; // Winsock SOCKET
+#define COMPAT_BAD_SOCK ((compat_sock)~0) // INVALID_SOCKET
+#else
+typedef int compat_sock;
 #define COMPAT_BAD_SOCK (-1)
+#endif
 
 #define COMPAT_IP_STRLEN 16 // "255.255.255.255" + NUL
 #define COMPAT_MAC_STRLEN 18 // "aa:bb:cc:dd:ee:ff" + NUL
@@ -109,11 +114,12 @@ int compat_ifaces(struct compat_iface *out, int max);
 // Linux reads /proc/net/arp; C64U_ARP_TABLE overrides the path for tests.
 bool compat_neighbor_mac(const char *ip, char *out, size_t cap);
 
-// Makes the Ultimate hear from us so `ip` lands in its ARP table (the
-// firmware never ARPs on demand). With a non-empty `ifname` the traffic is
-// forced out of that interface, which on Linux needs `ping -I` because
-// policy routing (VPN accept-routes) can otherwise detour LAN traffic; an
-// empty name sends one datagram from `s` and lets the OS route it.
+// Makes the Ultimate answer us so `ip` lands in its ARP table (the
+// firmware never ARPs on demand, and only fills the table for packets it
+// replies to, so this is an ICMP echo, never a bare datagram). With a
+// non-empty `ifname` the traffic is forced out of that interface, which on
+// Linux needs `ping -I` because policy routing (VPN accept-routes) can
+// otherwise detour LAN traffic. `s` is unused today.
 void compat_arp_prime(compat_sock s, const char *ip, const char *ifname);
 
 #endif

@@ -58,7 +58,7 @@ echo "mock stream test passed"
 # A fake Ultimate on one loopback address must be found; a plain web server
 # on another must be rejected (real subnets are full of port-80 responders).
 
-python3 tests/fakeultimate.py 127.0.0.42 8064 "$out/disc.log" 8065 &
+python3 tests/fakeultimate.py 127.0.0.42 8064 "$out/disc.log" 8065 8067 &
 pids+=($!)
 python3 -m http.server 8064 --bind 127.0.0.99 >/dev/null 2>&1 &
 pids+=($!)
@@ -179,6 +179,50 @@ timeout 10 ./c64uv --host 127.0.0.42:8064 --run "$out/disk.d81"
 grep -q "POST /v1/drives/a:mount?type=d81 body=819200" "$out/disc.log"
 grep -q "Cartridge" "$out/disc.log" && exit 1 # a plain mount parks nothing
 echo "disk image test passed"
+
+# ------------------------------------------------------------ stored images
+# With --store the image is FTP-uploaded into the folder (replacing a
+# same-named file), mounted by path read-write, and autostarted by the
+# viewer: reset (with cartridge parking), readiness gate, LOAD"*",8,1 and
+# RUN typed in <= 8-byte KEYB batches.
+
+: > "$out/disc.log"
+C64U_DMA_PORT=8065 C64U_FTP_PORT=8067 timeout 60 \
+    ./c64uv --host 127.0.0.42:8064 --store "/Usb0/my games" --run "$out/disk.d64"
+python3 - "$out/disc.log" <<'EOF'
+import sys
+log = open(sys.argv[1]).read().splitlines()
+want = ["PUT /v1/configs/C64%20and%20Cartridge%20Settings/Cartridge?value=",
+        "FTP STOR /Usb0/my games/disk.d64 len=174848",
+        "PUT /v1/drives/a:mount?image=/Usb0/my%20games/disk.d64&mode=readwrite",
+        "PUT /v1/machine:reset",
+        "GET /v1/machine:readmem?address=00CC&length=1",
+        "DMA cmd=FF03 len=8",
+        "DMA cmd=FF03 len=4",
+        "GET /v1/machine:readmem?address=00CC&length=1",
+        "DMA cmd=FF03 len=4",
+        "PUT /v1/configs/C64%20and%20Cartridge%20Settings/Cartridge?value=Retro%20Replay"]
+i = 0
+for line in log:
+    if i < len(want) and line == want[i]:
+        i += 1
+assert i == len(want), f"missing/mis-ordered step {i}: {want[i]}\nlog: {log}"
+assert not any("FF0B" in l for l in log), log
+EOF
+echo "stored image test passed"
+
+# ------------------------------------------------------------ type + screen
+# --type goes out as KEYB frames in <= 8-byte batches with \n as RETURN;
+# --screen prints the 40x25 text screen read from $0400.
+
+: > "$out/disc.log"
+C64U_DMA_PORT=8065 timeout 10 ./c64uv --host 127.0.0.42:8064 --type 'PRINT "HI"\n'
+grep -c "DMA cmd=FF03 len=8" "$out/disc.log" | grep -q '^1$'
+grep -q "DMA cmd=FF03 len=3$" "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --screen > "$out/screen.txt"
+test "$(wc -l < "$out/screen.txt")" = 25
+head -1 "$out/screen.txt" | grep -q '^READY\. *$'
+echo "type/screen test passed"
 
 # ------------------------------------------------------- exit with host gone
 # A powered-off Ultimate answers nothing: the tarpit accepts connections and

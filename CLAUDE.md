@@ -19,7 +19,8 @@ src/term.c   minimal VT100 emulator matched to the firmware's remote screen
 src/font8x8.h  public-domain 8x8 bitmap font (rendering for term.c)
 src/compat.h   platform layer: sockets, interface list, neighbor (ARP)
                table, ARP prime; compat_posix.c is the Linux reference
-               implementation (a port swaps the file in the Makefile)
+               implementation, compat_win32.c the Winsock port
+               (`make TARGET=win32`, MinGW cross build in release.yml)
 ```
 
 Nothing outside compat_posix.c includes a socket or network header: main.c
@@ -30,7 +31,11 @@ calls (`SDL_strcasecmp`, `SDL_setenv_unsafe`).
 
 Packaging: `make install` (DESTDIR/PREFIX) installs the binary plus
 `assets/c64uv.desktop` and `assets/c64uv.svg` (icon; regenerate with
-`tools/genicon.py`, which rasterises font8x8.h - never hand-edit the SVG).
+`tools/genicon.py`, which rasterises font8x8.h and also wraps the PNGs
+into `assets/c64uv.ico` - never hand-edit the SVG). The Windows exe gets
+the icon and a version block from `assets/c64uv.rc` (windres, in the
+`TARGET=win32` Makefile branch; SDL uses the exe's first icon as the
+window icon on Windows).
 `packaging/aur/PKGBUILD` builds from the GitHub tag tarball, so it can only
 reference tags that already contain the packaging files; bump `pkgver` and
 `sha256sums` on release (the release workflow builds the .pkg.tar.zst from
@@ -49,7 +54,14 @@ keepalive thread -> ARP prime (ping -I) + PUT streams/{video,audio}:start / 5 s
                     + one-time GET machine:input capability probe
 no host -> discover_scan() /v1/info sweep   |   file drop/--run -> runners:*
 Ctrl hotkeys / --do -> PUT machine:{reset,reboot,pause,resume,menu_button}
+--type -> KEYB batches over TCP :64   |   --screen -> GET machine:readmem $0400
 ```
+
+Every in-window action has a headless one-shot flag (`--discover`, `--do`,
+`--run`/`--store`, `--type`, `--screen`, `--dump`, `--term-test`); keep it
+that way so scripts and agents can drive the machine. `--type` + `--screen`
+is the closed loop for checking typed input. Results go to stdout, logs to
+stderr; exit 0/1/2 = ok / refused or unreachable / usage.
 
 The hardware-independent pieces (video.c, term.c, keys.c, discover.c) are
 split out so tests can link them; main.c keeps everything socket- and
@@ -90,9 +102,13 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   5 s.
 - **The firmware never ARPs on demand**: `streams/*:start` returns HTTP 404
   "Network Host Resolve Error" unless the destination is already in its ARP
-  table. Hence the `ping -I <iface>` prime before every keepalive start - a
-  plain UDP send is not enough when policy routing (e.g. a VPN with
-  accept-routes covering the local subnet) sends LAN traffic through a
+  table, and the table only fills for packets the firmware *answers*: a
+  bare UDP datagram to the stream port leaves it empty (verified on
+  Windows 2026-09-27, 404 until the prime became an ICMP echo), a ping
+  works because the reply makes the firmware ARP for us. Hence the ping
+  prime before every keepalive start (`ping -I <iface>` on Linux,
+  `IcmpSendEcho` on Windows). `-I` matters when policy routing (e.g. a VPN
+  with accept-routes covering the local subnet) sends LAN traffic through a
   tunnel, making packets arrive from the wrong MAC. Interface selection is
   by subnet match (getifaddrs), preferring wired over `wl*`.
 - **Audio queue needs a servo, not a buffer**: input and output rates match,
@@ -101,7 +117,10 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   queue at the 60 ms target.
 - **Keyboard**: TCP :64 `KEYB` (0xFF03, frame `03 FF <len16 LE> <chars>`)
   DMA-writes into the KERNAL buffer `$0277` + count `$C6`. The firmware does
-  NOT chunk - keep batches <= 10 chars (buffer size). RUN/STOP is not a buffer
+  NOT chunk, and the buffer is 10 bytes; batches of exactly 10 were lost
+  twice on hardware (2026-09-27, Windows and Linux: the following short
+  batch arrived, the 10-byte one never showed), so `dma_type` sends 8 per
+  frame (`KEYB_BATCH`). RUN/STOP is not a buffer
   char: poke `$91 = $7F` via `DMAWRITE` (0xFF06), repeated to win the race
   against the KERNAL restoring it (the vendor web UI does the same). The
   vendor web UI itself types via `writemem $0277`, so this is the sanctioned
@@ -204,13 +223,26 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
 1. **Platform compat layer** (done 2026-09): `src/compat.h` +
    `compat_posix.c` hold sockets, interface enumeration, neighbor/ARP
    lookup, and the ARP prime (`ping -I` on Linux for policy routing; a
-   plain datagram likely suffices elsewhere). Linux stays the reference
-   implementation and sole CI target. Gated follow-ups, not commitments:
-   a Windows port (`compat_win32.c`: Winsock, `GetAdaptersAddresses`,
-   `GetIpNetTable`; CMake or dual build, CI job, zip-with-DLLs release)
-   only when there is a test machine or a motivated tester with real
-   hardware - the community is Windows-heavy, but an unverifiable port
-   rots; a macOS port (compat_posix.c mostly builds as-is: BSD sockets +
+   plain datagram does NOT suffice anywhere, see protocol facts). Linux stays the reference
+   implementation and sole CI target. Audit 2026-09-27: main.c and
+   discover.c are free of POSIX calls (file loading via `SDL_LoadFile`,
+   dropped paths split on both separators, no errno/unistd), so a port is
+   compat_win32.c (the ~240 lines of compat_posix.c: Winsock,
+   `GetAdaptersAddresses`, `GetIpNetTable`, prime = `ping -S` or a
+   datagram) plus `make COMPAT=src/compat_win32.c` under MSYS2 (SDL3 and
+   curl come from its pacman; `<stdatomic.h>` needs MinGW or VS 2022
+   17.5+). Windows port written 2026-09-27 on that basis:
+   `compat_win32.c` (Winsock, `WSAPoll`, non-blocking connect + select for
+   the connect timeout since `SO_SNDTIMEO` does not bound `connect()` on
+   Winsock, `GetAdaptersAddresses` with `OnLinkPrefixLength` for the mask,
+   `GetIpNetTable` for the neighbor MAC, prime = `IcmpSendEcho`), `compat_sock`
+   is `uintptr_t` there, `make TARGET=win32` cross-builds with MinGW and
+   release.yml ships `c64uv-<tag>-windows-x86_64.zip` (exe + SDL3.dll from
+   the official MinGW package + static curl, console subsystem so the CLI
+   flags work). Verified on Michal's Windows box 2026-09-27: discovery,
+   REST, DMA keyboard, video + audio streams (once the prime became an
+   ICMP echo, see protocol facts). Unit/integration tests stay Linux-only (bash + loopback). A macOS
+   port (compat_posix.c mostly builds as-is: BSD sockets +
    `getifaddrs`, but `/proc/net/arp` and `ping -I` need `arp -n` /
    `ping -b` equivalents) only on request.
 2. **Gamepad -> machine:input joysticks**: SDL_Gamepad (SDL_INIT_GAMEPAD,
@@ -226,24 +258,33 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    comes from SDL3's HIDAPI drivers + mapping db (worst case Steam udev
    rules or SDL_GAMECONTROLLERCONFIG); code against generic SDL_Gamepad.
 
-3. **Persistent drop storage** (agreed 2026-09-02, not started): the drop
-   path keeps the firmware's temp area (RAM disk, gone at power-off) as
-   the fast default; a `--store <folder>` flag and/or a modifier held
-   during the drop switch to FTP-upload-then-mount-by-path. FTP is the
+3. **Persistent drop storage** (implemented and verified on hardware
+   2026-09-27, Windows client against firmware 1.1.0: upload, path mount,
+   reset and typed autostart all went through): `--store <folder>` / `C64U_STORE` switches image drops
+   from the firmware's temp area (RAM disk, gone at power-off) to
+   FTP-upload-then-mount-by-path, see `store_image` in main.c. FTP is the
    only upload route: the REST files API has no upload on any firmware
    (verified: `curl -T` to `ftp://<ult>/Temp/` works, `files/<path>:info`
    then sees the file, the FTP service is on by default on 1.1.0). Sequence:
-   check `files/<path>:info` (refuse to overwrite), `curl -T` the file,
-   `PUT drives/a:mount?image=<path>&mode=readwrite`, then for autostart
-   `machine:reset` + readiness gate + `LOAD"*",8,1` / `RUN` over the
-   keyboard channel (no firmware autostart for a path mount). Michal's
+   libcurl FTP upload (anonymous; STOR replaces a same-named file, which
+   is what Michal wants for re-drops), `PUT drives/a:mount?image=<path>&mode=readwrite`, then
+   `machine:reset` + readiness gate + `LOAD"*",8,1` / `RUN` typed over the
+   keyboard channel in 8-byte batches (no firmware autostart for a
+   path mount; the KERNAL load runs at ~400 bytes/s, so the second gate
+   allows 120 s). The static release build now keeps FTP in curl. Michal's
    preference: upload to `/Temp` and move the file from the Ultimate menu
-   himself. Open questions: whether SDL reports a modifier held during a
-   drag on Wayland (`SDL_GetKeyboardState` at drop time; if not, flag
-   only), and the static release build needs curl rebuilt with FTP
-   (`--disable-ftp` today in release.yml). Follow-up on top of it: in the
-   F9 view, upload into the folder the menu currently shows (path line
-   parse; truncated long paths need a fallback).
+   himself. SDL does report a modifier held during a drag on Wayland
+   (Hyprland, verified 2026-09-27 via the `--verbose` drop log), so a
+   modifier-selected store is possible. Verified: `image=`
+   takes a literal `/`-separated path; `files/<path>:info` answers
+   non-200 for a missing file (no longer used). The typed autostart needs
+   a boot head start: reset zeroes the zero page, so the `$CC` gate can
+   pass mid-boot and the KERNAL init then wipes the typed buffer (seen as
+   "1", "RUN", READY with the first batch gone). Follow-up on top
+   of it: in the F9 view, upload into the folder the menu currently shows
+   (path line parse; truncated long paths need a fallback). Test hooks:
+   `C64U_FTP_PORT` (fakeultimate.py serves a passive-mode FTP stub as its
+   fifth argument and logs `FTP STOR <path> len=N`).
 
 Dormant follow-up: when official firmware ships `machine:input`, re-verify
 the matrix-keyboard mapping against real hardware and activate the gamepad
