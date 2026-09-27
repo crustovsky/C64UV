@@ -6,7 +6,7 @@
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.2.8"
+#define C64UV_VERSION "0.2.9"
 
 #include "compat.h"
 #include "discover.h"
@@ -778,13 +778,16 @@ static bool ftp_upload(CURL *curl, const char *host, const char *rpath,
     return res == CURLE_OK;
 }
 
-// Types text into the KERNAL keyboard buffer over a DMA connection, in the
-// 10-byte batches the buffer holds (the firmware does not chunk).
+// Types text into the KERNAL keyboard buffer over a DMA connection. The
+// buffer holds 10 bytes and the firmware does not chunk; batches of
+// exactly 10 went missing twice on hardware (tail batch delivered, first
+// one gone), so 8 leaves room for a key already sitting in the buffer.
+#define KEYB_BATCH 8
 static bool dma_type(compat_sock s, const char *text)
 {
     size_t len = strlen(text);
-    for (size_t i = 0; i < len; i += 10) {
-        size_t n = len - i < 10 ? len - i : 10;
+    for (size_t i = 0; i < len; i += KEYB_BATCH) {
+        size_t n = len - i < KEYB_BATCH ? len - i : KEYB_BATCH;
         if (!dma_send(s, DMA_CMD_KEYB, text + i, n, false))
             return false;
         SDL_Delay(100); // let BASIC drain the buffer

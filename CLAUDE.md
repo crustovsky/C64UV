@@ -117,7 +117,10 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   queue at the 60 ms target.
 - **Keyboard**: TCP :64 `KEYB` (0xFF03, frame `03 FF <len16 LE> <chars>`)
   DMA-writes into the KERNAL buffer `$0277` + count `$C6`. The firmware does
-  NOT chunk - keep batches <= 10 chars (buffer size). RUN/STOP is not a buffer
+  NOT chunk, and the buffer is 10 bytes; batches of exactly 10 were lost
+  twice on hardware (2026-09-27, Windows and Linux: the following short
+  batch arrived, the 10-byte one never showed), so `dma_type` sends 8 per
+  frame (`KEYB_BATCH`). RUN/STOP is not a buffer
   char: poke `$91 = $7F` via `DMAWRITE` (0xFF06), repeated to win the race
   against the KERNAL restoring it (the vendor web UI does the same). The
   vendor web UI itself types via `writemem $0277`, so this is the sanctioned
@@ -266,7 +269,7 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    libcurl FTP upload (anonymous; STOR replaces a same-named file, which
    is what Michal wants for re-drops), `PUT drives/a:mount?image=<path>&mode=readwrite`, then
    `machine:reset` + readiness gate + `LOAD"*",8,1` / `RUN` typed over the
-   keyboard channel in <= 10-byte batches (no firmware autostart for a
+   keyboard channel in 8-byte batches (no firmware autostart for a
    path mount; the KERNAL load runs at ~400 bytes/s, so the second gate
    allows 120 s). The static release build now keeps FTP in curl. Michal's
    preference: upload to `/Temp` and move the file from the Ultimate menu

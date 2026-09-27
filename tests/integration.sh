@@ -184,7 +184,7 @@ echo "disk image test passed"
 # With --store the image is FTP-uploaded into the folder (replacing a
 # same-named file), mounted by path read-write, and autostarted by the
 # viewer: reset (with cartridge parking), readiness gate, LOAD"*",8,1 and
-# RUN typed in <= 10-byte KEYB batches.
+# RUN typed in <= 8-byte KEYB batches.
 
 : > "$out/disc.log"
 C64U_DMA_PORT=8065 C64U_FTP_PORT=8067 timeout 60 \
@@ -197,8 +197,8 @@ want = ["PUT /v1/configs/C64%20and%20Cartridge%20Settings/Cartridge?value=",
         "PUT /v1/drives/a:mount?image=/Usb0/my%20games/disk.d64&mode=readwrite",
         "PUT /v1/machine:reset",
         "GET /v1/machine:readmem?address=00CC&length=1",
-        "DMA cmd=FF03 len=10",
-        "DMA cmd=FF03 len=2",
+        "DMA cmd=FF03 len=8",
+        "DMA cmd=FF03 len=4",
         "GET /v1/machine:readmem?address=00CC&length=1",
         "DMA cmd=FF03 len=4",
         "PUT /v1/configs/C64%20and%20Cartridge%20Settings/Cartridge?value=Retro%20Replay"]
@@ -212,13 +212,13 @@ EOF
 echo "stored image test passed"
 
 # ------------------------------------------------------------ type + screen
-# --type goes out as KEYB frames in <= 10-byte batches with \n as RETURN;
+# --type goes out as KEYB frames in <= 8-byte batches with \n as RETURN;
 # --screen prints the 40x25 text screen read from $0400.
 
 : > "$out/disc.log"
 C64U_DMA_PORT=8065 timeout 10 ./c64uv --host 127.0.0.42:8064 --type 'PRINT "HI"\n'
-grep -c "DMA cmd=FF03 len=10" "$out/disc.log" | grep -q '^1$'
-grep -q "DMA cmd=FF03 len=1$" "$out/disc.log"
+grep -c "DMA cmd=FF03 len=8" "$out/disc.log" | grep -q '^1$'
+grep -q "DMA cmd=FF03 len=3$" "$out/disc.log"
 timeout 10 ./c64uv --host 127.0.0.42:8064 --screen > "$out/screen.txt"
 test "$(wc -l < "$out/screen.txt")" = 25
 head -1 "$out/screen.txt" | grep -q '^READY\. *$'
