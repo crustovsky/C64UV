@@ -11,7 +11,12 @@ that TCP port (c64uv reads C64U_DMA_PORT), logging every frame as
 
     DMA cmd=FFxx len=<payload length>      (AUTHENTICATE logs pw=<password>)
 
-Usage: fakeultimate.py <bind-ip> <port> <logfile> [dma-port]
+With a fifth argument it also serves a minimal passive-mode FTP server on
+that port (c64uv reads C64U_FTP_PORT), logging every upload as
+
+    FTP STOR <path> len=<bytes>
+
+Usage: fakeultimate.py <bind-ip> <port> <logfile> [dma-port [ftp-port]]
 """
 import http.server
 import json
@@ -37,7 +42,7 @@ def _recv_exact(conn, n):
     return buf
 
 
-def _dma_client(conn):
+def _dma_client(conn, _ip):
     with conn:
         while True:
             hdr = _recv_exact(conn, 4)
@@ -60,14 +65,68 @@ def _dma_client(conn):
                 _log_line(f"DMA cmd={cmd:04X} len={n}")
 
 
-def _dma_server(ip, port):
+def _listen(ip, port):
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((ip, port))
     srv.listen()
+    return srv
+
+
+def _serve(ip, port, handler):
+    srv = _listen(ip, port)
     while True:
         conn, _ = srv.accept()
-        threading.Thread(target=_dma_client, args=(conn,), daemon=True).start()
+        threading.Thread(target=handler, args=(conn, ip), daemon=True).start()
+
+
+def _ftp_client(conn, ip):
+    """Just enough FTP for a libcurl anonymous upload: login, CWD, passive
+    data connection (EPSV or PASV), STOR."""
+    cwd = "/"
+    data_srv = None
+    with conn, conn.makefile("rwb", buffering=0) as f:
+        f.write(b"220 fakeultimate\r\n")
+        while True:
+            line = f.readline()
+            if not line:
+                return
+            cmd, _, arg = line.decode(errors="replace").strip().partition(" ")
+            cmd = cmd.upper()
+            if cmd in ("USER", ):
+                f.write(b"331 ok\r\n")
+            elif cmd in ("PASS", ):
+                f.write(b"230 ok\r\n")
+            elif cmd == "PWD":
+                f.write(f'257 "{cwd}"\r\n'.encode())
+            elif cmd == "CWD":
+                cwd = arg if arg.startswith("/") else cwd.rstrip("/") + "/" + arg
+                f.write(b"250 ok\r\n")
+            elif cmd in ("EPSV", "PASV"):
+                data_srv = _listen(ip, 0)
+                port = data_srv.getsockname()[1]
+                if cmd == "EPSV":
+                    f.write(f"229 ok (|||{port}|)\r\n".encode())
+                else:
+                    f.write(f"227 ok ({ip.replace('.', ',')},{port >> 8},"
+                            f"{port & 255})\r\n".encode())
+            elif cmd == "STOR":
+                f.write(b"150 ok\r\n")
+                data, _ = data_srv.accept()
+                data_srv.close()
+                n = 0
+                chunk = data.recv(65536)
+                while chunk:
+                    n += len(chunk)
+                    chunk = data.recv(65536)
+                data.close()
+                _log_line(f"FTP STOR {cwd.rstrip('/')}/{arg} len={n}")
+                f.write(b"226 ok\r\n")
+            elif cmd == "QUIT":
+                f.write(b"221 bye\r\n")
+                return
+            else:
+                f.write(b"200 ok\r\n")  # TYPE and friends
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -112,6 +171,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "joysticks": [{"port": 1, "inputs": []},
                                       {"port": 2, "inputs": []}],
                         "errors": []})
+        elif self.path.startswith("/v1/files/") and self.path.endswith(":info"):
+            # a name containing "exists" stands for a file already there
+            if "exists" in self.path:
+                self._json({"path": self.path[10:-5], "size": 174848,
+                            "errors": []})
+            else:
+                self._json({"errors": ["File not found"]}, 404)
         else:
             self._json({"errors": ["Unknown API Call"]}, 404)
 
@@ -124,9 +190,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 4:
-        threading.Thread(target=_dma_server,
-                         args=(sys.argv[1], int(sys.argv[4])),
-                         daemon=True).start()
+    for i, handler in ((4, _dma_client), (5, _ftp_client)):
+        if len(sys.argv) > i:
+            threading.Thread(target=_serve,
+                             args=(sys.argv[1], int(sys.argv[i]), handler),
+                             daemon=True).start()
     http.server.HTTPServer((sys.argv[1], int(sys.argv[2])),
                            Handler).serve_forever()
