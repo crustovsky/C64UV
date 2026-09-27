@@ -3,8 +3,8 @@
 <img src="assets/c64uv.svg" align="right" width="96" alt="c64uv icon">
 
 Use your [Commodore 64 Ultimate](https://www.commodore.net/) (or Ultimate 64)
-from a Linux desktop over the network: live video and audio streamed into an
-SDL window, your keystrokes typed straight into BASIC, and the Ultimate's menu
+from a Linux or Windows PC over the network: live video and audio streamed
+into an SDL window, your keystrokes typed straight into BASIC, and the Ultimate's menu
 one keypress away - no second monitor, no capture card, just the Ethernet
 cable.
 
@@ -31,8 +31,9 @@ cable.
   screen; F9 again returns to the C64.
 - **Discovery** - run it with no address and it finds the Ultimate on your
   LAN (preferring its wired interface, the one that can stream).
-- **Run files** - drop a `.prg`, `.crt`, or `.sid` onto the window (or
-  `--run file`) and the machine runs it, cartridge-safe.
+- **Run files** - drop a `.prg`, `.crt`, `.sid` or `.d64` onto the window
+  (or `--run file`) and the machine runs it, cartridge-safe; `--store`
+  keeps dropped disk images on the Ultimate.
 - **Machine control** - reset, reboot, pause/resume, and menu button as
   hotkeys or one-shot `--do` commands; F10 shows the in-window key
   reference.
@@ -47,8 +48,12 @@ cable.
 
 ## Requirements
 
-- Linux with SDL3 and libcurl (`pacman -S sdl3 curl` / `apt install
-  libsdl3-dev libcurl4-openssl-dev`), C compiler, `make`.
+- Linux or Windows, x86_64 (prebuilt on the [releases
+  page](https://github.com/crustovsky/C64UV/releases): static Linux binary,
+  Arch package, Windows zip). Building from source needs SDL3, libcurl, a C
+  compiler and `make` (`pacman -S sdl3 curl` / `apt install libsdl3-dev
+  libcurl4-openssl-dev`; Windows builds are cross-compiled with MinGW, see
+  the release workflow).
 - A C64 Ultimate / Ultimate 64 on your network. The viewer talks to its REST
   API (HTTP), streaming ports (UDP 11000/11001), DMA socket (TCP 64), and
   telnet menu (TCP 23).
@@ -171,29 +176,25 @@ only; pair with `tools/mockstream.py` to develop with no hardware).
 
 ### Installing
 
-`make install` (respects `DESTDIR` and `PREFIX`, default `/usr`) installs the
-binary, a desktop entry, and the icon. Prebuilt static binaries are on the
-[releases page](https://github.com/crustovsky/C64UV/releases). Set `C64U_HOST`
-in your environment if you launch it from the desktop menu rather than a
-terminal.
+Every release ships three builds; pick one from the [latest
+release](https://github.com/crustovsky/C64UV/releases/latest):
 
-**Windows** (x86_64): unzip `c64uv-<version>-windows-x86_64.zip`
-from the release and run `c64uv.exe` from a terminal (`c64uv.exe --host
-<ip>`); `SDL3.dll` must stay next to it. Everything in this README applies,
-except that a VPN claiming the LAN route may need to be off (the Linux
-build pins the stream's ARP prime to the LAN interface; Windows sends a
-plain ping).
+- **Arch Linux**: `c64uv-<version>-1-x86_64.pkg.tar.zst`, installed with
+  `sudo pacman -U <file>` (removed with `pacman -R c64uv`). Comes with the
+  desktop entry and icon.
+- **Other Linux**: `c64uv-<version>-linux-x86_64.tar.gz`, a static binary;
+  unpack it anywhere.
+- **Windows**: `c64uv-<version>-windows-x86_64.zip`; unzip and run
+  `c64uv.exe` from a terminal, keeping `SDL3.dll` next to it. Everything
+  in this README applies. A VPN claiming the LAN route may need to be off
+  (the Linux build pins the stream's ARP prime to the LAN interface;
+  Windows sends a plain ping).
 
-On Arch (x86_64), download `c64uv-<version>-1-x86_64.pkg.tar.zst` from the
-[latest release](https://github.com/crustovsky/C64UV/releases/latest) and
-install it with pacman:
-
-```sh
-sudo pacman -U c64uv-*-x86_64.pkg.tar.zst
-```
-
-`pacman -R c64uv` removes it. To build the package yourself instead (e.g. on
-aarch64), run `makepkg -si` in `packaging/aur`.
+From source: `make`, then `make install` (respects `DESTDIR` and `PREFIX`,
+default `/usr`) installs the binary, desktop entry and icon; `makepkg -si`
+in `packaging/aur` builds the Arch package locally (e.g. on aarch64). Set
+`C64U_HOST` in your environment if you launch it from the desktop menu
+rather than a terminal.
 
 ## Limitations
 
