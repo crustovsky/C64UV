@@ -263,8 +263,8 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    only upload route: the REST files API has no upload on any firmware
    (verified: `curl -T` to `ftp://<ult>/Temp/` works, `files/<path>:info`
    then sees the file, the FTP service is on by default on 1.1.0). Sequence:
-   `files/<path>:info` (200 = refuse to overwrite), libcurl FTP upload
-   (anonymous), `PUT drives/a:mount?image=<path>&mode=readwrite`, then
+   libcurl FTP upload (anonymous; STOR replaces a same-named file, which
+   is what Michal wants for re-drops), `PUT drives/a:mount?image=<path>&mode=readwrite`, then
    `machine:reset` + readiness gate + `LOAD"*",8,1` / `RUN` typed over the
    keyboard channel in <= 10-byte batches (no firmware autostart for a
    path mount; the KERNAL load runs at ~400 bytes/s, so the second gate
@@ -272,14 +272,16 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    preference: upload to `/Temp` and move the file from the Ultimate menu
    himself. Still open: whether SDL reports a modifier held during a drag
    on Wayland (`--verbose` logs the Shift state at drop time to find out;
-   a modifier-selected store would build on that). Verified: `:info`
-   answers non-200 for a missing file and `image=` takes a literal
-   `/`-separated path. Follow-up on top
+   a modifier-selected store would build on that). Verified: `image=`
+   takes a literal `/`-separated path; `files/<path>:info` answers
+   non-200 for a missing file (no longer used). The typed autostart needs
+   a boot head start: reset zeroes the zero page, so the `$CC` gate can
+   pass mid-boot and the KERNAL init then wipes the typed buffer (seen as
+   "1", "RUN", READY with the first batch gone). Follow-up on top
    of it: in the F9 view, upload into the folder the menu currently shows
    (path line parse; truncated long paths need a fallback). Test hooks:
    `C64U_FTP_PORT` (fakeultimate.py serves a passive-mode FTP stub as its
-   fifth argument and logs `FTP STOR <path> len=N`; a name containing
-   `exists` answers `:info` with 200).
+   fifth argument and logs `FTP STOR <path> len=N`).
 
 Dormant follow-up: when official firmware ships `machine:input`, re-verify
 the matrix-keyboard mapping against real hardware and activate the gamepad

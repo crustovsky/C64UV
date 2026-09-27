@@ -176,13 +176,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "joysticks": [{"port": 1, "inputs": []},
                                       {"port": 2, "inputs": []}],
                         "errors": []})
-        elif self.path.startswith("/v1/files/") and self.path.endswith(":info"):
-            # a name containing "exists" stands for a file already there
-            if "exists" in self.path:
-                self._json({"path": self.path[10:-5], "size": 174848,
-                            "errors": []})
-            else:
-                self._json({"errors": ["File not found"]}, 404)
         else:
             self._json({"errors": ["Unknown API Call"]}, 404)
 

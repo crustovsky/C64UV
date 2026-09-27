@@ -129,9 +129,9 @@ To keep dropped images, start the viewer with `--store FOLDER` (or set
 image is then uploaded into that folder over FTP (the Ultimate's FTP service
 is on by default), mounted from there read-write, and autostarted by the
 viewer: it resets the machine and types `LOAD"*",8,1` and `RUN` once the
-READY prompt is back, for every image type. A file with the same name is
-never overwritten; move or rename it from the Ultimate's menu first.
-`.prg`/`.crt`/`.sid` drops are unaffected by `--store`.
+READY prompt is back, for every image type. Dropping a file of the same
+name replaces the stored copy. `.prg`/`.crt`/`.sid` drops are unaffected
+by `--store`.
 
 The same machine controls work headless: `c64uv --do reset` (also `reboot`,
 `pause`, `resume`, `menu`, `poweroff`) issues one REST call and exits.

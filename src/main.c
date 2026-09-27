@@ -694,7 +694,7 @@ static const char *path_base(const char *path)
 // from there read-write, and autostarted by the viewer itself: a path mount
 // has no firmware autostart, so it resets the machine and types
 // LOAD"*",8,1 / RUN over the keyboard channel behind the readiness gate.
-// An existing file is never overwritten.
+// A file of the same name is replaced (FTP STOR overwrites).
 
 static bool curl_has_ftp(void)
 {
@@ -811,26 +811,15 @@ static long store_image(CURL *curl, const char *host, const char *path,
     curl_free(esc);
 
     char url[1024];
-    snprintf(url, sizeof url, "http://%s/v1/files/%s:info", host, rpath);
-    long code = rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp, NULL);
-    if (code == -1) {
-        SDL_Log("files:info: no response from Ultimate");
-        return -1;
-    }
-    if (code == 200 && strstr(resp, "\"size\"")) { // present: don't clobber
-        SDL_Log("%s already exists on the Ultimate, not overwriting "
-                "(files:info said: %s)", shown, resp);
-        return -1;
-    }
     if (!ftp_upload(curl, host, rpath, data, (size_t)len))
         return -1;
     atomic_store(&g_run_pct, -1);
-    SDL_Log("stored as %s (%ld bytes)", shown, len);
+    SDL_Log("stored as %s (%ld bytes, replacing any old file)", shown, len);
 
     snprintf(url, sizeof url,
              "http://%s/v1/drives/a:mount?image=/%s&mode=readwrite", host,
              rpath);
-    code = rest_put(curl, url, resp);
+    long code = rest_put(curl, url, resp);
     if (code != 200) {
         SDL_Log("drives/a:mount HTTP %ld: %s", code, resp);
         return -1;

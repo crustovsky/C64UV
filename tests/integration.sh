@@ -181,10 +181,10 @@ grep -q "Cartridge" "$out/disc.log" && exit 1 # a plain mount parks nothing
 echo "disk image test passed"
 
 # ------------------------------------------------------------ stored images
-# With --store the image is checked for a name clash, FTP-uploaded into the
-# folder, mounted by path read-write, and autostarted by the viewer: reset
-# (with cartridge parking), readiness gate, LOAD"*",8,1 and RUN typed in
-# <= 10-byte KEYB batches. An existing name refuses without uploading.
+# With --store the image is FTP-uploaded into the folder (replacing a
+# same-named file), mounted by path read-write, and autostarted by the
+# viewer: reset (with cartridge parking), readiness gate, LOAD"*",8,1 and
+# RUN typed in <= 10-byte KEYB batches.
 
 : > "$out/disc.log"
 C64U_DMA_PORT=8065 C64U_FTP_PORT=8067 timeout 60 \
@@ -193,7 +193,6 @@ python3 - "$out/disc.log" <<'EOF'
 import sys
 log = open(sys.argv[1]).read().splitlines()
 want = ["PUT /v1/configs/C64%20and%20Cartridge%20Settings/Cartridge?value=",
-        "GET /v1/files/Usb0/my%20games/disk.d64:info",
         "FTP STOR /Usb0/my games/disk.d64 len=174848",
         "PUT /v1/drives/a:mount?image=/Usb0/my%20games/disk.d64&mode=readwrite",
         "PUT /v1/machine:reset",
@@ -210,13 +209,6 @@ for line in log:
 assert i == len(want), f"missing/mis-ordered step {i}: {want[i]}\nlog: {log}"
 assert not any("FF0B" in l for l in log), log
 EOF
-cp "$out/disk.d64" "$out/exists.d64"
-: > "$out/disc.log"
-C64U_FTP_PORT=8067 timeout 30 ./c64uv --host 127.0.0.42:8064 --store /Temp \
-    --run "$out/exists.d64" 2> "$out/store.err" && exit 1
-grep -q "GET /v1/files/Temp/exists.d64:info" "$out/disc.log"
-! grep -q "FTP STOR\|drives\|machine:reset" "$out/disc.log"
-grep -q "already exists" "$out/store.err"
 echo "stored image test passed"
 
 # ------------------------------------------------------------ type + screen
