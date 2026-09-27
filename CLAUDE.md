@@ -102,9 +102,13 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   5 s.
 - **The firmware never ARPs on demand**: `streams/*:start` returns HTTP 404
   "Network Host Resolve Error" unless the destination is already in its ARP
-  table. Hence the `ping -I <iface>` prime before every keepalive start - a
-  plain UDP send is not enough when policy routing (e.g. a VPN with
-  accept-routes covering the local subnet) sends LAN traffic through a
+  table, and the table only fills for packets the firmware *answers*: a
+  bare UDP datagram to the stream port leaves it empty (verified on
+  Windows 2026-09-27, 404 until the prime became an ICMP echo), a ping
+  works because the reply makes the firmware ARP for us. Hence the ping
+  prime before every keepalive start (`ping -I <iface>` on Linux,
+  `IcmpSendEcho` on Windows). `-I` matters when policy routing (e.g. a VPN
+  with accept-routes covering the local subnet) sends LAN traffic through a
   tunnel, making packets arrive from the wrong MAC. Interface selection is
   by subnet match (getifaddrs), preferring wired over `wl*`.
 - **Audio queue needs a servo, not a buffer**: input and output rates match,
@@ -216,7 +220,7 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
 1. **Platform compat layer** (done 2026-09): `src/compat.h` +
    `compat_posix.c` hold sockets, interface enumeration, neighbor/ARP
    lookup, and the ARP prime (`ping -I` on Linux for policy routing; a
-   plain datagram likely suffices elsewhere). Linux stays the reference
+   plain datagram does NOT suffice anywhere, see protocol facts). Linux stays the reference
    implementation and sole CI target. Audit 2026-09-27: main.c and
    discover.c are free of POSIX calls (file loading via `SDL_LoadFile`,
    dropped paths split on both separators, no errno/unistd), so a port is
@@ -228,12 +232,12 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    `compat_win32.c` (Winsock, `WSAPoll`, non-blocking connect + select for
    the connect timeout since `SO_SNDTIMEO` does not bound `connect()` on
    Winsock, `GetAdaptersAddresses` with `OnLinkPrefixLength` for the mask,
-   `GetIpNetTable` for the neighbor MAC, prime = one datagram), `compat_sock`
+   `GetIpNetTable` for the neighbor MAC, prime = `IcmpSendEcho`), `compat_sock`
    is `uintptr_t` there, `make TARGET=win32` cross-builds with MinGW and
    release.yml ships `c64uv-<tag>-windows-x86_64.zip` (exe + SDL3.dll from
    the official MinGW package + static curl, console subsystem so the CLI
-   flags work). Compiles warning-free; awaiting Michal's run on a Windows
-   box. Unit/integration tests stay Linux-only (bash + loopback). A macOS
+   flags work). Michal's first Windows run (2026-09-27): discovery, REST,
+   DMA keyboard all worked; the stream needed the ICMP prime (above). Unit/integration tests stay Linux-only (bash + loopback). A macOS
    port (compat_posix.c mostly builds as-is: BSD sockets +
    `getifaddrs`, but `/proc/net/arp` and `ping -I` need `arp -n` /
    `ping -b` equivalents) only on request.

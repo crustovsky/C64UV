@@ -7,6 +7,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <icmpapi.h>
 #include <windows.h>
 
 #include <stdio.h>
@@ -272,12 +273,22 @@ bool compat_neighbor_mac(const char *ip, char *out, size_t cap)
     return found;
 }
 
-// One datagram is enough here: the Linux `ping -I` exists for policy
-// routing that detours LAN traffic, which Windows VPN clients do not do
-// in the same way (unverified; revisit if a Windows tester hits "Network
-// Host Resolve Error" with a VPN up).
+// The firmware fills its ARP table only when it has to answer us, so the
+// prime must be something it replies to: an ICMP echo (a bare datagram to
+// the stream port leaves the table empty, seen as "Network Host Resolve
+// Error" on Windows, 2026-09-27). IcmpSendEcho needs no process and no
+// privileges. The interface hint is unused: Windows has no equivalent of
+// the policy-routing detour that made Linux force the egress device.
 void compat_arp_prime(compat_sock s, const char *ip, const char *ifname)
 {
-    (void)ifname;
-    compat_sendto(s, "", 1, ip, 11000);
+    (void)s; (void)ifname;
+    uint32_t addr;
+    if (!compat_ipv4_parse(ip, &addr))
+        return;
+    HANDLE h = IcmpCreateFile();
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    char reply[sizeof(ICMP_ECHO_REPLY) + 8];
+    IcmpSendEcho(h, htonl(addr), "", 0, NULL, reply, sizeof reply, 1000);
+    IcmpCloseHandle(h);
 }

@@ -225,19 +225,21 @@ bool compat_neighbor_mac(const char *ip, char *out, size_t cap)
     return found;
 }
 
+// The firmware fills its ARP table only when it has to answer us, so the
+// prime is a ping, not a bare datagram (a datagram to the stream port gets
+// no reply and leaves the table empty: "Network Host Resolve Error").
+// ping may force the egress device (-I) without privileges.
 void compat_arp_prime(compat_sock s, const char *ip, const char *ifname)
 {
+    (void)s;
     uint32_t a;
     if (!compat_ipv4_parse(ip, &a))
         return; // hostnames never reach a shell
-    if (ifname && ifname[0]) {
-        // ping may force the egress device without privileges
-        char cmd[160];
-        snprintf(cmd, sizeof cmd,
-                 "ping -n -q -c 1 -W 1 -I '%s' '%s' >/dev/null 2>&1", ifname,
-                 ip);
-        (void)!system(cmd);
-    } else {
-        compat_sendto(s, "", 1, ip, 11000);
-    }
+    char dev[48] = "";
+    if (ifname && ifname[0])
+        snprintf(dev, sizeof dev, "-I '%s'", ifname);
+    char cmd[160];
+    snprintf(cmd, sizeof cmd, "ping -n -q -c 1 -W 1 %s '%s' >/dev/null 2>&1",
+             dev, ip);
+    (void)!system(cmd);
 }

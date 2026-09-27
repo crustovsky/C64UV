@@ -179,9 +179,9 @@ terminal.
 **Windows** (experimental, x86_64): unzip `c64uv-<version>-windows-x86_64.zip`
 from the release and run `c64uv.exe` from a terminal (`c64uv.exe --host
 <ip>`); `SDL3.dll` must stay next to it. Everything in this README applies,
-except that the stream's ARP prime is a plain packet rather than `ping -I`,
-so a VPN that claims the LAN route may need to be off. Tested only through
-the cross-compiler so far; reports welcome.
+except that a VPN claiming the LAN route may need to be off (the Linux
+build pins the stream's ARP prime to the LAN interface; Windows sends a
+plain ping).
 
 On Arch (x86_64), download `c64uv-<version>-1-x86_64.pkg.tar.zst` from the
 [latest release](https://github.com/crustovsky/C64UV/releases/latest) and

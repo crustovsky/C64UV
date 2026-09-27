@@ -114,11 +114,12 @@ int compat_ifaces(struct compat_iface *out, int max);
 // Linux reads /proc/net/arp; C64U_ARP_TABLE overrides the path for tests.
 bool compat_neighbor_mac(const char *ip, char *out, size_t cap);
 
-// Makes the Ultimate hear from us so `ip` lands in its ARP table (the
-// firmware never ARPs on demand). With a non-empty `ifname` the traffic is
-// forced out of that interface, which on Linux needs `ping -I` because
-// policy routing (VPN accept-routes) can otherwise detour LAN traffic; an
-// empty name sends one datagram from `s` and lets the OS route it.
+// Makes the Ultimate answer us so `ip` lands in its ARP table (the
+// firmware never ARPs on demand, and only fills the table for packets it
+// replies to, so this is an ICMP echo, never a bare datagram). With a
+// non-empty `ifname` the traffic is forced out of that interface, which on
+// Linux needs `ping -I` because policy routing (VPN accept-routes) can
+// otherwise detour LAN traffic. `s` is unused today.
 void compat_arp_prime(compat_sock s, const char *ip, const char *ifname);
 
 #endif
