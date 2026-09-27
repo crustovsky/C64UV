@@ -1,12 +1,13 @@
 // Windows resources for c64uv.exe (make TARGET=win32 compiles this with
 // windres): the Explorer/taskbar icon, which SDL also picks up as the
 // window icon (it extracts the exe's first icon), and the version block.
-// C64UV_VERSION comes from the Makefile (the string in src/main.c).
+// C64UV_VERSION ("0.2.9") and C64UV_VERSION_COMMAS (0,2,9,0) come from the
+// Makefile, derived from the string in src/main.c.
 1 ICON "c64uv.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,0,0,0
-PRODUCTVERSION 0,0,0,0
+FILEVERSION C64UV_VERSION_COMMAS
+PRODUCTVERSION C64UV_VERSION_COMMAS
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
