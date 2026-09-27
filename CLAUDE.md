@@ -36,7 +36,7 @@ reference tags that already contain the packaging files; bump `pkgver` and
 `sha256sums` on release (the release workflow builds the .pkg.tar.zst from
 the pushed tag itself, overriding pkgver, so a stale PKGBUILD never blocks
 it; a manual run with the `tag` input does the same for an existing
-release), plus the version in README's `pacman -U` URL. `SDL_SetAppMetadata` identifier and the desktop
+release). `SDL_SetAppMetadata` identifier and the desktop
 file basename must both stay `c64uv` or desktops lose the window icon.
 
 ```
