@@ -6,3 +6,4 @@ tests/run
 c64uv.exe
 *.zip
 c64uv.res.o
+*.d64
