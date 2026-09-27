@@ -89,3 +89,45 @@ jobs:
         with:
           name: c64uv-linux-x86_64
           path: c64uv-*-linux-x86_64.tar.gz
+
+  arch-package:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm base-devel github-cli sdl3 curl iputils hicolor-icon-theme
+
+      - uses: actions/checkout@v4
+
+      # On a tag, build that tag: the in-tree PKGBUILD still points at the
+      # previous release until it is bumped afterwards.
+      - name: Point PKGBUILD at the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: packaging/aur
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${GITHUB_REF_NAME#v}/; s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('SKIP')/" PKGBUILD
+
+      - name: Build package
+        working-directory: packaging/aur
+        run: |
+          useradd -m builder
+          chown -R builder .
+          su builder -c "makepkg --noconfirm"
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: packaging/aur
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" c64uv-*.pkg.tar.zst --clobber
+
+      - name: Upload artifact (non-tag runs)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: c64uv-arch-package
+          path: packaging/aur/c64uv-*.pkg.tar.zst

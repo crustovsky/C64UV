@@ -33,7 +33,9 @@ Packaging: `make install` (DESTDIR/PREFIX) installs the binary plus
 `tools/genicon.py`, which rasterises font8x8.h - never hand-edit the SVG).
 `packaging/aur/PKGBUILD` builds from the GitHub tag tarball, so it can only
 reference tags that already contain the packaging files; bump `pkgver` and
-`sha256sums` on release. `SDL_SetAppMetadata` identifier and the desktop
+`sha256sums` on release (the release workflow builds the .pkg.tar.zst from
+the pushed tag itself, overriding pkgver, so a stale PKGBUILD never blocks
+it). `SDL_SetAppMetadata` identifier and the desktop
 file basename must both stay `c64uv` or desktops lose the window icon.
 
 ```

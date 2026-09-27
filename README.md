@@ -159,17 +159,15 @@ binary, a desktop entry, and the icon. Prebuilt static binaries are on the
 in your environment if you launch it from the desktop menu rather than a
 terminal.
 
-On Arch, build a pacman package from the included PKGBUILD. It fetches the
-release tag it points at, runs the tests, and installs through pacman, so
-`pacman -R c64uv` removes it cleanly:
+On Arch, each release also ships a pacman package. Download
+`c64uv-<version>-1-x86_64.pkg.tar.zst` from the releases page and install it:
 
 ```sh
-git clone https://github.com/crustovsky/C64UV.git
-cd C64UV/packaging/aur
-makepkg -si
+sudo pacman -U c64uv-*-x86_64.pkg.tar.zst
 ```
 
-To upgrade, `git pull` and run `makepkg -si` again.
+`pacman -R c64uv` removes it. To build the package yourself instead (e.g. on
+aarch64), run `makepkg -si` in `packaging/aur`.
 
 ## Limitations
 
