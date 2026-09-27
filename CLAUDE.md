@@ -31,7 +31,11 @@ calls (`SDL_strcasecmp`, `SDL_setenv_unsafe`).
 
 Packaging: `make install` (DESTDIR/PREFIX) installs the binary plus
 `assets/c64uv.desktop` and `assets/c64uv.svg` (icon; regenerate with
-`tools/genicon.py`, which rasterises font8x8.h - never hand-edit the SVG).
+`tools/genicon.py`, which rasterises font8x8.h and also wraps the PNGs
+into `assets/c64uv.ico` - never hand-edit the SVG). The Windows exe gets
+the icon and a version block from `assets/c64uv.rc` (windres, in the
+`TARGET=win32` Makefile branch; SDL uses the exe's first icon as the
+window icon on Windows).
 `packaging/aur/PKGBUILD` builds from the GitHub tag tarball, so it can only
 reference tags that already contain the packaging files; bump `pkgver` and
 `sha256sums` on release (the release workflow builds the .pkg.tar.zst from

@@ -21,14 +21,19 @@ COMPAT = src/compat_win32.c
 LDLIBS += -lws2_32 -liphlpapi -mconsole # sdl3.pc says -mwindows; the CLI wants a console
 LDFLAGS += -static-libgcc
 EXE = .exe
+RES = c64uv.res.o # icon + version block, baked into the exe (rule below)
 endif
 SRC = src/main.c src/video.c src/term.c src/keys.c src/discover.c $(COMPAT)
 LIB = src/video.c src/term.c src/keys.c src/discover.c $(COMPAT)
 HDR = src/video.h src/term.h src/keys.h src/discover.h src/compat.h \
       src/font8x8.h
 
-c64uv$(EXE): $(SRC) $(HDR)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC) $(LDLIBS)
+c64uv$(EXE): $(SRC) $(HDR) $(RES)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC) $(RES) $(LDLIBS)
+
+VERSION = $(shell sed -n 's/^\#define C64UV_VERSION "\(.*\)"/\1/p' src/main.c)
+c64uv.res.o: assets/c64uv.rc assets/c64uv.ico
+	x86_64-w64-mingw32-windres -DC64UV_VERSION='\"$(VERSION)\"' -O coff -o $@ $<
 
 tests/run: tests/tests.c $(LIB) $(HDR)
 	$(CC) $(CFLAGS) -o $@ tests/tests.c $(LIB) $(LDLIBS)

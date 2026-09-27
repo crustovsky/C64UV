@@ -9,10 +9,13 @@ pixel), so the icon is reproducible from the sources alone:
     python3 tools/genicon.py
 
 writes assets/c64uv.svg and assets/c64uv-<size>.png (via rsvg-convert;
-the PNGs exist because some launchers only pick up bitmap icon themes).
+the PNGs exist because some launchers only pick up bitmap icon themes) and
+assets/c64uv.ico (the PNGs wrapped in an ICO container for the Windows
+exe; Vista+ reads PNG entries).
 """
 import pathlib
 import re
+import struct
 import subprocess
 
 PNG_SIZES = [16, 32, 48, 64, 128, 256]
@@ -52,6 +55,22 @@ def text_rects(font, s, x0, y0, scale):
     return rects
 
 
+def write_ico(assets):
+    """ICONDIR + one ICONDIRENTRY per size, each pointing at the PNG bytes."""
+    pngs = [(size, (assets / f"c64uv-{size}.png").read_bytes()) for size in PNG_SIZES]
+    header = struct.pack("<HHH", 0, 1, len(pngs))
+    offset = len(header) + 16 * len(pngs)
+    entries, blobs = [], []
+    for size, data in pngs:
+        dim = size if size < 256 else 0  # 0 encodes 256
+        entries.append(struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(data), offset))
+        blobs.append(data)
+        offset += len(data)
+    ico = assets / "c64uv.ico"
+    ico.write_bytes(header + b"".join(entries) + b"".join(blobs))
+    print(f"wrote {ico}")
+
+
 def main():
     font = load_font()
     parts = [
@@ -76,6 +95,7 @@ def main():
             check=True,
         )
         print(f"wrote {png}")
+    write_ico(assets)
 
 
 if __name__ == "__main__":

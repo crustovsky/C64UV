@@ -1,0 +1,27 @@
+// Windows resources for c64uv.exe (make TARGET=win32 compiles this with
+// windres): the Explorer/taskbar icon, which SDL also picks up as the
+// window icon (it extracts the exe's first icon), and the version block.
+// C64UV_VERSION comes from the Makefile (the string in src/main.c).
+1 ICON "c64uv.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,0,0,0
+PRODUCTVERSION 0,0,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Commodore 64 Ultimate Viewer"
+      VALUE "FileVersion", C64UV_VERSION
+      VALUE "ProductName", "c64uv"
+      VALUE "ProductVersion", C64UV_VERSION
+      VALUE "OriginalFilename", "c64uv.exe"
+      VALUE "LegalCopyright", "MIT License"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
