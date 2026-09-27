@@ -4,12 +4,17 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag: only build its pacman package and attach it to that release"
+        required: false
 
 permissions:
   contents: write
 
 jobs:
   linux-static:
+    if: ${{ !inputs.tag }}
     # oldest supported LTS runner = broadest glibc compatibility
     runs-on: ubuntu-22.04
     steps:
@@ -89,3 +94,47 @@ jobs:
         with:
           name: c64uv-linux-x86_64
           path: c64uv-*-linux-x86_64.tar.gz
+
+  arch-package:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name || '') }}
+    steps:
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm base-devel github-cli sdl3 curl iputils hicolor-icon-theme
+
+      - uses: actions/checkout@v4
+
+      # Build the tag itself: the in-tree PKGBUILD still points at the
+      # previous release until it is bumped afterwards.
+      - name: Point PKGBUILD at the tag
+        if: env.TAG != ''
+        working-directory: packaging/aur
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${TAG#v}/; s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('SKIP')/" PKGBUILD
+
+      - name: Build package
+        working-directory: packaging/aur
+        run: |
+          useradd -m builder
+          chown -R builder .
+          su builder -c "makepkg --noconfirm"
+
+      - name: Upload to release
+        if: env.TAG != ''
+        working-directory: packaging/aur
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$TAG" --generate-notes || true
+          gh release upload "$TAG" c64uv-*.pkg.tar.zst --clobber
+
+      - name: Upload artifact (non-tag runs)
+        if: env.TAG == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: c64uv-arch-package
+          path: packaging/aur/c64uv-*.pkg.tar.zst

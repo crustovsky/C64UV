@@ -154,11 +154,21 @@ only; pair with `tools/mockstream.py` to develop with no hardware).
 ### Installing
 
 `make install` (respects `DESTDIR` and `PREFIX`, default `/usr`) installs the
-binary, a desktop entry, and the icon. Arch users can build a package from
-`packaging/aur/PKGBUILD`; prebuilt static binaries are on the
+binary, a desktop entry, and the icon. Prebuilt static binaries are on the
 [releases page](https://github.com/crustovsky/C64UV/releases). Set `C64U_HOST`
 in your environment if you launch it from the desktop menu rather than a
 terminal.
+
+On Arch (x86_64), download `c64uv-<version>-1-x86_64.pkg.tar.zst` from the
+[latest release](https://github.com/crustovsky/C64UV/releases/latest) and
+install it with pacman:
+
+```sh
+sudo pacman -U c64uv-*-x86_64.pkg.tar.zst
+```
+
+`pacman -R c64uv` removes it. To build the package yourself instead (e.g. on
+aarch64), run `makepkg -si` in `packaging/aur`.
 
 ## Limitations
 

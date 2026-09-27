@@ -7,6 +7,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/crustovsky/C64UV"
 license=('MIT')
 depends=('sdl3' 'curl' 'iputils' 'hicolor-icon-theme')
+options=('!debug')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('3cb199684ff592404066105561e16236f8995d20d49c96dde73ef97edcf5d214')
 
