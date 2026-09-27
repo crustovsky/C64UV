@@ -270,9 +270,9 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    path mount; the KERNAL load runs at ~400 bytes/s, so the second gate
    allows 120 s). The static release build now keeps FTP in curl. Michal's
    preference: upload to `/Temp` and move the file from the Ultimate menu
-   himself. Still open: whether SDL reports a modifier held during a drag
-   on Wayland (`--verbose` logs the Shift state at drop time to find out;
-   a modifier-selected store would build on that). Verified: `image=`
+   himself. SDL does report a modifier held during a drag on Wayland
+   (Hyprland, verified 2026-09-27 via the `--verbose` drop log), so a
+   modifier-selected store is possible. Verified: `image=`
    takes a literal `/`-separated path; `files/<path>:info` answers
    non-200 for a missing file (no longer used). The typed autostart needs
    a boot head start: reset zeroes the zero page, so the `$CC` gate can
