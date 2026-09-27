@@ -12,14 +12,22 @@ LDLIBS  += $(shell pkg-config --libs sdl3 libcurl)
 endif
 
 # compat_posix.c is the Linux reference implementation of compat.h; a port
-# swaps in its own file here.
+# swaps in its own file here. `make TARGET=win32` cross-builds c64uv.exe
+# with MinGW against SDL3/libcurl found on PKG_CONFIG_PATH (release.yml).
 COMPAT = src/compat_posix.c
+ifeq ($(TARGET),win32)
+CC = x86_64-w64-mingw32-gcc
+COMPAT = src/compat_win32.c
+LDLIBS += -lws2_32 -liphlpapi -mconsole # sdl3.pc says -mwindows; the CLI wants a console
+LDFLAGS += -static-libgcc
+EXE = .exe
+endif
 SRC = src/main.c src/video.c src/term.c src/keys.c src/discover.c $(COMPAT)
 LIB = src/video.c src/term.c src/keys.c src/discover.c $(COMPAT)
 HDR = src/video.h src/term.h src/keys.h src/discover.h src/compat.h \
       src/font8x8.h
 
-c64uv: $(SRC) $(HDR)
+c64uv$(EXE): $(SRC) $(HDR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC) $(LDLIBS)
 
 tests/run: tests/tests.c $(LIB) $(HDR)

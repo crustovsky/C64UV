@@ -3,3 +3,5 @@ c64uv
 *.o
 .claude/settings.local.json*
 tests/run
+c64uv.exe
+*.zip

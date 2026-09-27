@@ -19,7 +19,8 @@ src/term.c   minimal VT100 emulator matched to the firmware's remote screen
 src/font8x8.h  public-domain 8x8 bitmap font (rendering for term.c)
 src/compat.h   platform layer: sockets, interface list, neighbor (ARP)
                table, ARP prime; compat_posix.c is the Linux reference
-               implementation (a port swaps the file in the Makefile)
+               implementation, compat_win32.c the Winsock port
+               (`make TARGET=win32`, MinGW cross build in release.yml)
 ```
 
 Nothing outside compat_posix.c includes a socket or network header: main.c
@@ -219,12 +220,17 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    `GetAdaptersAddresses`, `GetIpNetTable`, prime = `ping -S` or a
    datagram) plus `make COMPAT=src/compat_win32.c` under MSYS2 (SDL3 and
    curl come from its pacman; `<stdatomic.h>` needs MinGW or VS 2022
-   17.5+). Gated follow-ups, not commitments:
-   a Windows port (`compat_win32.c`: Winsock, `GetAdaptersAddresses`,
-   `GetIpNetTable`; CMake or dual build, CI job, zip-with-DLLs release)
-   only when there is a test machine or a motivated tester with real
-   hardware - the community is Windows-heavy, but an unverifiable port
-   rots; a macOS port (compat_posix.c mostly builds as-is: BSD sockets +
+   17.5+). Windows port written 2026-09-27 on that basis:
+   `compat_win32.c` (Winsock, `WSAPoll`, non-blocking connect + select for
+   the connect timeout since `SO_SNDTIMEO` does not bound `connect()` on
+   Winsock, `GetAdaptersAddresses` with `OnLinkPrefixLength` for the mask,
+   `GetIpNetTable` for the neighbor MAC, prime = one datagram), `compat_sock`
+   is `uintptr_t` there, `make TARGET=win32` cross-builds with MinGW and
+   release.yml ships `c64uv-<tag>-windows-x86_64.zip` (exe + SDL3.dll from
+   the official MinGW package + static curl, console subsystem so the CLI
+   flags work). Compiles warning-free; awaiting Michal's run on a Windows
+   box. Unit/integration tests stay Linux-only (bash + loopback). A macOS
+   port (compat_posix.c mostly builds as-is: BSD sockets +
    `getifaddrs`, but `/proc/net/arp` and `ping -I` need `arp -n` /
    `ping -b` equivalents) only on request.
 2. **Gamepad -> machine:input joysticks**: SDL_Gamepad (SDL_INIT_GAMEPAD,

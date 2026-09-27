@@ -17,8 +17,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef int compat_sock; // SOCKET on Winsock
+#ifdef _WIN32
+typedef uintptr_t compat_sock; // Winsock SOCKET
+#define COMPAT_BAD_SOCK ((compat_sock)~0) // INVALID_SOCKET
+#else
+typedef int compat_sock;
 #define COMPAT_BAD_SOCK (-1)
+#endif
 
 #define COMPAT_IP_STRLEN 16 // "255.255.255.255" + NUL
 #define COMPAT_MAC_STRLEN 18 // "aa:bb:cc:dd:ee:ff" + NUL

@@ -173,7 +173,7 @@ int discover_scan(struct discovered *out, int max, bool verbose)
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
             curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 4750L);
             curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, probe_sink);
-            curl_easy_setopt(h, CURLOPT_WRITEDATA, pr->resp);
+            curl_easy_setopt(h, CURLOPT_WRITEDATA, (void *)pr->resp);
             curl_easy_setopt(h, CURLOPT_PRIVATE, pr);
             if (pwhdr)
                 curl_easy_setopt(h, CURLOPT_HTTPHEADER, pwhdr);
