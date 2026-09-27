@@ -194,8 +194,9 @@ static int keepalive_thread(void *arg)
                 else
                     SDL_Log("stream start HTTP %ld: %s%s", code, resp,
                             strstr(resp, "No Operational Network Interface")
-                                ? " -> plug the Ultimate into wired Ethernet; "
-                                  "streams don't work over its WiFi"
+                                ? " -> the Ultimate's wired port has no link: "
+                                  "check the cable and its link LED; streams "
+                                  "don't work over its WiFi"
                                 : "");
                 last_code[i] = code;
             }

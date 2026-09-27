@@ -176,7 +176,7 @@ binary, a desktop entry, and the icon. Prebuilt static binaries are on the
 in your environment if you launch it from the desktop menu rather than a
 terminal.
 
-**Windows** (experimental, x86_64): unzip `c64uv-<version>-windows-x86_64.zip`
+**Windows** (x86_64): unzip `c64uv-<version>-windows-x86_64.zip`
 from the release and run `c64uv.exe` from a terminal (`c64uv.exe --host
 <ip>`); `SDL3.dll` must stay next to it. Everything in this README applies,
 except that a VPN claiming the LAN route may need to be off (the Linux

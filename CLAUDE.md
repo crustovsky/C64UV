@@ -236,8 +236,9 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    is `uintptr_t` there, `make TARGET=win32` cross-builds with MinGW and
    release.yml ships `c64uv-<tag>-windows-x86_64.zip` (exe + SDL3.dll from
    the official MinGW package + static curl, console subsystem so the CLI
-   flags work). Michal's first Windows run (2026-09-27): discovery, REST,
-   DMA keyboard all worked; the stream needed the ICMP prime (above). Unit/integration tests stay Linux-only (bash + loopback). A macOS
+   flags work). Verified on Michal's Windows box 2026-09-27: discovery,
+   REST, DMA keyboard, video + audio streams (once the prime became an
+   ICMP echo, see protocol facts). Unit/integration tests stay Linux-only (bash + loopback). A macOS
    port (compat_posix.c mostly builds as-is: BSD sockets +
    `getifaddrs`, but `/proc/net/arp` and `ping -I` need `arp -n` /
    `ping -b` equivalents) only on request.
