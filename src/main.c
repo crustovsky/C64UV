@@ -805,7 +805,8 @@ static long store_image(CURL *curl, const char *host, const char *path,
         return -1;
     }
     if (code == 200 && strstr(resp, "\"size\"")) { // present: don't clobber
-        SDL_Log("%s already exists on the Ultimate, not overwriting", shown);
+        SDL_Log("%s already exists on the Ultimate, not overwriting "
+                "(files:info said: %s)", shown, resp);
         return -1;
     }
     if (!ftp_upload(curl, host, rpath, data, (size_t)len))
