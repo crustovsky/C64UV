@@ -14,7 +14,6 @@
 #include "term.h"
 #include "video.h"
 
-#include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -26,6 +25,8 @@ struct config {
     const char *password;   // network password -> X-Password header
     const char *do_action;  // one-shot machine control, then exit
     const char *run_path;   // one-shot: run this .prg/.crt/.sid/.d64, then exit
+    const char *type_text;  // one-shot: type this into the C64, then exit
+    bool screen;            // one-shot: print the C64 text screen, then exit
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
     int listen_port;        // video; audio uses listen_port + 1
     int scale;
@@ -602,7 +603,7 @@ static const char *image_type_for(const char *path)
 }
 
 struct binbuf {
-    uint8_t data[16];
+    uint8_t data[1000]; // a full 40x25 text screen
     int len;
 };
 
@@ -615,38 +616,59 @@ static size_t bin_sink(char *d, size_t size, size_t nmemb, void *userp)
     return n;
 }
 
+// GET machine:readmem: `len` bytes from hex address `addr` into b (capped
+// at the buffer). False on a transport error.
+static bool readmem(CURL *curl, const char *host, const char *addr, int len,
+                    struct binbuf *b)
+{
+    char url[256];
+    snprintf(url, sizeof url,
+             "http://%s/v1/machine:readmem?address=%s&length=%d", host, addr,
+             len);
+    b->len = 0;
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, bin_sink);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, b);
+    struct curl_slist *hdrs = NULL;
+    if (g_password) {
+        char pwhdr[160];
+        snprintf(pwhdr, sizeof pwhdr, "X-Password: %s", g_password);
+        hdrs = curl_slist_append(NULL, pwhdr);
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    }
+    bool ok = curl_easy_perform(curl) == CURLE_OK;
+    curl_slist_free_all(hdrs);
+    return ok;
+}
+
 // Readiness gate: the KERNAL zeroes $CC when it sits at a prompt with the
 // cursor flashing. Two consecutive ready reads guard against sampling a
 // transient zero mid-boot; the timeout covers programs that never return
 // to the prompt (games) - by then the internal reset is long done.
 static void wait_kernal_ready(CURL *curl, const char *host, int max_ms)
 {
-    char url[256];
-    snprintf(url, sizeof url,
-             "http://%s/v1/machine:readmem?address=00CC&length=1", host);
     int ready = 0;
     for (int t = 0; t < max_ms && ready < 2; t += 500) {
-        struct binbuf b = {.len = 0};
-        curl_easy_reset(curl);
-        curl_easy_setopt(curl, CURLOPT_URL, url);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 1000L);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, bin_sink);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
-        struct curl_slist *hdrs = NULL;
-        if (g_password) {
-            char pwhdr[160];
-            snprintf(pwhdr, sizeof pwhdr, "X-Password: %s", g_password);
-            hdrs = curl_slist_append(NULL, pwhdr);
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-        }
-        bool ok = curl_easy_perform(curl) == CURLE_OK;
-        curl_slist_free_all(hdrs);
-        if (ok && b.len >= 1 && b.data[0] == 0)
+        struct binbuf b;
+        if (readmem(curl, host, "00CC", 1, &b) && b.len >= 1 &&
+            b.data[0] == 0)
             ready++;
         else
             ready = 0;
         SDL_Delay(500);
     }
+}
+
+// File name part of a dropped path; SDL hands over native separators.
+static const char *path_base(const char *path)
+{
+    const char *b = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/' || *p == '\\')
+            b = p + 1;
+    return b;
 }
 
 // ------------------------------------------------ persistent images (--store)
@@ -765,8 +787,7 @@ static long store_image(CURL *curl, const char *host, const char *path,
         SDL_Log("--store needs libcurl with FTP support");
         return -1;
     }
-    const char *base = strrchr(path, '/');
-    const char *name = base ? base + 1 : path;
+    const char *name = path_base(path);
     char shown[512], rpath[512], folder[256]; // shown: for the log lines
     snprintf(shown, sizeof shown, "%s/%s", g_store, name);
     url_path(curl, folder, sizeof folder, g_store);
@@ -837,25 +858,16 @@ static bool run_file(const char *host, const char *path)
     // the machine resets for a runner, a stored image or a .d64 autostart;
     // a plain mount leaves it alone
     bool resets = ep || store || !strcmp(img, "d64");
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        SDL_Log("%s: %s", path, strerror(errno));
+    size_t size;
+    uint8_t *data = SDL_LoadFile(path, &size); // UTF-8 path on every OS
+    if (!data) {
+        SDL_Log("%s: %s", path, SDL_GetError());
         return false;
     }
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    long len = (long)size;
     if (len <= 0 || len > 2 << 20) { // largest sensible .crt is ~1 MB
         SDL_Log("%s: unreasonable file size (%ld)", path, len);
-        fclose(f);
-        return false;
-    }
-    uint8_t *data = malloc((size_t)len);
-    bool readok = data && fread(data, 1, (size_t)len, f) == (size_t)len;
-    fclose(f);
-    if (!readok) {
-        SDL_Log("%s: short read", path);
-        free(data);
+        SDL_free(data);
         return false;
     }
 
@@ -927,7 +939,7 @@ static bool run_file(const char *host, const char *path)
         else
             SDL_Log("drives/a:mount HTTP %ld: %s", code, resp);
     }
-    free(data);
+    SDL_free(data);
 
     if (parked) {
         wait_kernal_ready(curl, host, 10000);
@@ -977,13 +989,82 @@ static void run_file_async(const char *host, const char *path,
         kb->fd = COMPAT_BAD_SOCK;
         kb->reclaim = kb->enabled;
     }
-    const char *base = strrchr(path, '/');
-    snprintf(g_run_name, sizeof g_run_name, "%s", base ? base + 1 : path);
+    snprintf(g_run_name, sizeof g_run_name, "%s", path_base(path));
     atomic_store(&g_run_pct, 0);
     struct runjob *j = malloc(sizeof *j);
     snprintf(j->host, sizeof j->host, "%s", host);
     snprintf(j->path, sizeof j->path, "%s", path);
     SDL_DetachThread(SDL_CreateThread(run_thread, "runfile", j));
+}
+
+// ------------------------------------------------------ headless type/screen
+//
+// The scripting pair: --type puts text into the KERNAL buffer (the same
+// channel the window uses), --screen reads screen RAM back. Together they
+// let a script or an agent drive BASIC and check the result without a
+// window.
+
+static bool type_text(const char *host, const char *text)
+{
+    char buf[1024];
+    size_t n = 0;
+    for (const char *p = text; *p && n < sizeof buf - 1; p++) {
+        int c;
+        if (*p == '\\' && p[1] == 'n') { // "\n" in the argument = RETURN
+            c = 0x0D;
+            p++;
+        } else if (*p == '\n') {
+            c = 0x0D;
+        } else {
+            c = ascii_to_petscii((unsigned char)*p);
+        }
+        if (c > 0)
+            buf[n++] = (char)c;
+    }
+    buf[n] = '\0';
+    compat_sock s = dma_connect(host, 3);
+    if (s == COMPAT_BAD_SOCK) {
+        SDL_Log("DMA socket (port 64) unreachable; is the Ultimate DMA "
+                "Service enabled?");
+        return false;
+    }
+    bool ok = dma_type(s, buf);
+    if (!ok)
+        SDL_Log("typing failed: %s", compat_neterr());
+    compat_close(s);
+    return ok;
+}
+
+// Screen codes to text, upper-case/graphics set assumed (the default);
+// graphics symbols print as '#', reverse video is dropped.
+static char screen_char(uint8_t sc)
+{
+    sc &= 0x7F;
+    if (sc < 32)
+        return (char)(sc + 64); // @ A-Z [ pound ] arrows
+    if (sc < 64)
+        return (char)sc;        // space, punctuation, digits
+    return '#';
+}
+
+static bool print_screen(const char *host)
+{
+    CURL *curl = curl_easy_init();
+    struct binbuf b;
+    bool ok = readmem(curl, host, "0400", 1000, &b) && b.len == 1000;
+    curl_easy_cleanup(curl);
+    if (!ok) {
+        SDL_Log("machine:readmem failed (%d bytes)", b.len);
+        return false;
+    }
+    for (int row = 0; row < 25; row++) {
+        char line[41];
+        for (int col = 0; col < 40; col++)
+            line[col] = screen_char(b.data[row * 40 + col]);
+        line[40] = '\0';
+        puts(line);
+    }
+    return true;
 }
 
 // ----------------------------------------------- matrix keyboard (REST)
@@ -1148,8 +1229,8 @@ static void usage(const char *argv0)
             "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
             "          [--multicast] [--no-start] [--no-audio] [--no-keyb]\n"
             "          [--password PW] [--do ACTION] [--run FILE] [--store DIR]\n"
-            "          [--dump FILE.ppm] [--term-test] [--discover] [--verbose]\n"
-            "          [--version]\n"
+            "          [--type TEXT] [--screen] [--dump FILE.ppm] [--term-test]\n"
+            "          [--discover] [--verbose] [--version]\n"
             "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
             "auto-discover)\n"
             "  --dest    where the Ultimate should send the streams (default: auto;\n"
@@ -1166,6 +1247,8 @@ static void usage(const char *argv0)
             "  --store   keep dropped disk images: upload them into this folder on\n"
             "            the Ultimate (FTP, e.g. /Temp or /Usb0/games), mount from\n"
             "            there read-write and autostart (or set C64U_STORE)\n"
+            "  --type    type TEXT into the C64 (\\n = RETURN), then exit\n"
+            "  --screen  print the C64 text screen (40x25), then exit\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
             "  --term-test  print the telnet menu screen as text, then exit\n"
@@ -1193,6 +1276,10 @@ int main(int argc, char **argv)
             cfg.run_path = argv[++i];
         else if (!strcmp(argv[i], "--store") && i + 1 < argc)
             g_store = argv[++i];
+        else if (!strcmp(argv[i], "--type") && i + 1 < argc)
+            cfg.type_text = argv[++i];
+        else if (!strcmp(argv[i], "--screen"))
+            cfg.screen = true;
         else if (!strcmp(argv[i], "--dest") && i + 1 < argc)
             cfg.dest = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc)
@@ -1275,7 +1362,7 @@ int main(int argc, char **argv)
     // immediately and discovers in the background instead.
     static char auto_host[46];
     bool headless = cfg.dump_path || cfg.term_test || cfg.do_action ||
-                    cfg.run_path;
+                    cfg.run_path || cfg.type_text || cfg.screen;
     if (!cfg.host && !cfg.no_start && headless) {
         struct discovered found[DISCOVER_MAX];
         fprintf(stderr, "no --host given, discovering...\n");
@@ -1300,6 +1387,13 @@ int main(int argc, char **argv)
 
     if (cfg.run_path)
         return run_file(cfg.host, cfg.run_path) ? 0 : 1;
+
+    if (cfg.type_text && !type_text(cfg.host, cfg.type_text))
+        return 1;
+    if (cfg.screen)
+        return print_screen(cfg.host) ? 0 : 1;
+    if (cfg.type_text)
+        return 0;
 
     if (cfg.term_test)
         return run_term_test(cfg.host);

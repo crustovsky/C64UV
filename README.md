@@ -134,7 +134,14 @@ never overwritten; move or rename it from the Ultimate's menu first.
 `.prg`/`.crt`/`.sid` drops are unaffected by `--store`.
 
 The same machine controls work headless: `c64uv --do reset` (also `reboot`,
-`pause`, `resume`, `menu`, `poweroff`) issues one REST call and exits. If
+`pause`, `resume`, `menu`, `poweroff`) issues one REST call and exits.
+Every viewer action has a one-shot flag, so scripts and agents can drive the
+machine without a window: `--discover`, `--do`, `--run` (with `--store`),
+`--type 'LOAD"*",8,1\n'` (types into the C64, `\n` = RETURN),
+`--screen` (prints the 40x25 text screen read from screen RAM, the way to
+check what a typed command did), `--dump frame.ppm` (one video frame) and
+`--term-test` (the Ultimate menu as text). Exit status is 0 on success, 1
+when the Ultimate refused or did not answer, 2 for a usage error. If
 your Ultimate has a network password set (firmware 3.12+), pass it with
 `--password` or the `C64U_PASSWORD` environment variable; it is sent as the
 `X-Password` header on every request, discovery included.

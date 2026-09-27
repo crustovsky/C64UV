@@ -164,6 +164,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "Cartridge": {"current": "Retro Replay",
                                       "presets": ["", "Retro Replay"],
                                       "default": ""}}, "errors": []})
+        elif self.path.startswith("/v1/machine:readmem?address=0400"):
+            # a text screen: READY. on row 0 (screen codes), blanks elsewhere
+            screen = bytearray(b"\x20" * 1000)
+            screen[0:6] = bytes(ord(c) - 64 for c in "READY") + b"\x2e"
+            self._reply(200, bytes(screen), "application/octet-stream")
         elif self.path.startswith("/v1/machine:readmem"):
             self._reply(200, b"\x00", "application/octet-stream")
         elif self.path == "/v1/machine:input":

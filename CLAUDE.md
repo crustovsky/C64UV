@@ -49,7 +49,14 @@ keepalive thread -> ARP prime (ping -I) + PUT streams/{video,audio}:start / 5 s
                     + one-time GET machine:input capability probe
 no host -> discover_scan() /v1/info sweep   |   file drop/--run -> runners:*
 Ctrl hotkeys / --do -> PUT machine:{reset,reboot,pause,resume,menu_button}
+--type -> KEYB batches over TCP :64   |   --screen -> GET machine:readmem $0400
 ```
+
+Every in-window action has a headless one-shot flag (`--discover`, `--do`,
+`--run`/`--store`, `--type`, `--screen`, `--dump`, `--term-test`); keep it
+that way so scripts and agents can drive the machine. `--type` + `--screen`
+is the closed loop for checking typed input. Results go to stdout, logs to
+stderr; exit 0/1/2 = ok / refused or unreachable / usage.
 
 The hardware-independent pieces (video.c, term.c, keys.c, discover.c) are
 split out so tests can link them; main.c keeps everything socket- and
@@ -205,7 +212,14 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    `compat_posix.c` hold sockets, interface enumeration, neighbor/ARP
    lookup, and the ARP prime (`ping -I` on Linux for policy routing; a
    plain datagram likely suffices elsewhere). Linux stays the reference
-   implementation and sole CI target. Gated follow-ups, not commitments:
+   implementation and sole CI target. Audit 2026-09-27: main.c and
+   discover.c are free of POSIX calls (file loading via `SDL_LoadFile`,
+   dropped paths split on both separators, no errno/unistd), so a port is
+   compat_win32.c (the ~240 lines of compat_posix.c: Winsock,
+   `GetAdaptersAddresses`, `GetIpNetTable`, prime = `ping -S` or a
+   datagram) plus `make COMPAT=src/compat_win32.c` under MSYS2 (SDL3 and
+   curl come from its pacman; `<stdatomic.h>` needs MinGW or VS 2022
+   17.5+). Gated follow-ups, not commitments:
    a Windows port (`compat_win32.c`: Winsock, `GetAdaptersAddresses`,
    `GetIpNetTable`; CMake or dual build, CI job, zip-with-DLLs release)
    only when there is a test machine or a motivated tester with real

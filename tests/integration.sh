@@ -219,6 +219,19 @@ grep -q "GET /v1/files/Temp/exists.d64:info" "$out/disc.log"
 grep -q "already exists" "$out/store.err"
 echo "stored image test passed"
 
+# ------------------------------------------------------------ type + screen
+# --type goes out as KEYB frames in <= 10-byte batches with \n as RETURN;
+# --screen prints the 40x25 text screen read from $0400.
+
+: > "$out/disc.log"
+C64U_DMA_PORT=8065 timeout 10 ./c64uv --host 127.0.0.42:8064 --type 'PRINT "HI"\n'
+grep -c "DMA cmd=FF03 len=10" "$out/disc.log" | grep -q '^1$'
+grep -q "DMA cmd=FF03 len=1$" "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --screen > "$out/screen.txt"
+test "$(wc -l < "$out/screen.txt")" = 25
+head -1 "$out/screen.txt" | grep -q '^READY\. *$'
+echo "type/screen test passed"
+
 # ------------------------------------------------------- exit with host gone
 # A powered-off Ultimate answers nothing: the tarpit accepts connections and
 # never replies, which leaves the keepalive thread inside a REST call. A
