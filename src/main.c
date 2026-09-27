@@ -1026,7 +1026,9 @@ static bool type_text(const char *host, const char *text)
         } else if (*p == '\n') {
             c = 0x0D;
         } else {
-            c = ascii_to_petscii((unsigned char)*p);
+            // plain letters either way: BASIC wants unshifted PETSCII, and
+            // the window's Shift-means-graphics convention has no use here
+            c = ascii_to_petscii((unsigned char)SDL_tolower(*p));
         }
         if (c > 0)
             buf[n++] = (char)c;
