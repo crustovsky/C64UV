@@ -662,6 +662,19 @@ static void wait_kernal_ready(CURL *curl, const char *host, int max_ms)
     }
 }
 
+// The opposite wait: until the KERNAL is busy ($CC != 0), i.e. a typed
+// LOAD has started; a load that fails at once never gets there, hence the
+// short timeout.
+static void wait_kernal_busy(CURL *curl, const char *host, int max_ms)
+{
+    for (int t = 0; t < max_ms; t += 250) {
+        struct binbuf b;
+        if (readmem(curl, host, "00CC", 1, &b) && b.len >= 1 && b.data[0])
+            return;
+        SDL_Delay(250);
+    }
+}
+
 // File name part of a dropped path; SDL hands over native separators.
 static const char *path_base(const char *path)
 {
@@ -824,6 +837,11 @@ static long store_image(CURL *curl, const char *host, const char *path,
     }
     if (!machine_ctl(host, "reset"))
         return -1;
+    // reset zeroes the zero page, so $CC reads 0 mid-boot and the gate
+    // alone can pass before the KERNAL has set up (and wiped) the keyboard
+    // buffer: typed text vanished that way (verified 2026-09-27). The C64
+    // boots in about 1.5 s; let it.
+    SDL_Delay(2500);
     wait_kernal_ready(curl, host, 10000);
     compat_sock s = dma_connect(host, 3);
     if (s == COMPAT_BAD_SOCK) {
@@ -833,9 +851,10 @@ static long store_image(CURL *curl, const char *host, const char *path,
     }
     bool typed = dma_type(s, "LOAD\"*\",8,1\r");
     if (typed) {
-        // the cursor is off while the drive works ($CC != 0), so the gate
-        // waits for READY.; a KERNAL load runs at about 400 bytes/s
-        SDL_Delay(1000);
+        // the cursor is off while the drive works ($CC != 0): wait for
+        // the load to start, then for READY.; a KERNAL load runs at about
+        // 400 bytes/s
+        wait_kernal_busy(curl, host, 3000);
         wait_kernal_ready(curl, host, 120000);
         typed = dma_type(s, "RUN\r");
     }
