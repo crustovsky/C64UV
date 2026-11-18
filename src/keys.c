@@ -1,6 +1,7 @@
 #include "keys.h"
 
 #include <stdio.h>
+#include <string.h>
 
 // Lowercase letters are the unshifted keys, uppercase are shifted (graphics
 // symbols in the default charset) - same feel as sitting at the machine.
@@ -123,6 +124,82 @@ bool matrix_event_json(const char *names[], int n, const char *transition,
     return w > 0 && (size_t)w < cap;
 }
 
+unsigned pad_button_joy(SDL_GamepadButton b)
+{
+    switch (b) {
+    case SDL_GAMEPAD_BUTTON_DPAD_UP: return JOY_UP;
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return JOY_DOWN;
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return JOY_LEFT;
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return JOY_RIGHT;
+    case SDL_GAMEPAD_BUTTON_SOUTH: return JOY_FIRE;
+    case SDL_GAMEPAD_BUTTON_EAST: return JOY_UP;
+    case SDL_GAMEPAD_BUTTON_WEST: return JOY_FIRE2;
+    case SDL_GAMEPAD_BUTTON_NORTH: return JOY_FIRE3;
+    default: return 0;
+    }
+}
+
+unsigned pad_stick_joy(int x, int y)
+{
+    const int dead = 16000; // of 32767: a digital stick wants a firm push
+    return (x < -dead ? JOY_LEFT : 0) | (x > dead ? JOY_RIGHT : 0) |
+           (y < -dead ? JOY_UP : 0) | (y > dead ? JOY_DOWN : 0);
+}
+
+static const char *const joy_names[] = {"up", "down", "left", "right",
+                                        "fire", "fire2", "fire3"};
+#define JOY_NAMES ((int)(sizeof joy_names / sizeof joy_names[0]))
+
+unsigned joy_parse(const char *list)
+{
+    unsigned mask = 0;
+    while (*list) {
+        size_t n = strcspn(list, ",");
+        int i;
+        for (i = 0; i < JOY_NAMES; i++)
+            if (strlen(joy_names[i]) == n && !strncmp(list, joy_names[i], n))
+                break;
+        if (i == JOY_NAMES)
+            return 0;
+        mask |= 1u << i;
+        list += n + (list[n] == ',');
+    }
+    return mask;
+}
+
+bool joy_event_json(int port, unsigned from, unsigned to, char *buf,
+                    size_t cap)
+{
+    const unsigned sets[2] = {from & ~to, to & ~from}; // release, press
+    if (!sets[0] && !sets[1])
+        return false;
+    int w = snprintf(buf, cap, "{\"events\":[");
+    bool first = true;
+    for (int e = 0; e < 2; e++) {
+        if (!sets[e])
+            continue;
+        if (w > 0 && (size_t)w < cap)
+            w += snprintf(buf + w, cap - (size_t)w,
+                          "%s{\"kind\":\"joystick\",\"port\":%d,"
+                          "\"inputs\":[", first ? "" : ",", port);
+        bool one = false;
+        for (int i = 0; i < JOY_NAMES; i++)
+            if ((sets[e] >> i & 1) && w > 0 && (size_t)w < cap) {
+                w += snprintf(buf + w, cap - (size_t)w, "%s\"%s\"",
+                              one ? "," : "", joy_names[i]);
+                one = true;
+            }
+        if (w > 0 && (size_t)w < cap)
+            w += snprintf(buf + w, cap - (size_t)w,
+                          "],\"transition\":\"%s\"}",
+                          e ? "press" : "release");
+        first = false;
+    }
+    if (w > 0 && (size_t)w < cap)
+        w += snprintf(buf + w, cap - (size_t)w, "]}");
+    return w > 0 && (size_t)w < cap;
+}
+
 // .gap groups the rows in the F10 overlay and --help with a blank line.
 const struct viewer_binding viewer_bindings[] = {
     {.label = "any typing", .desc = "typed into the C64; Shift graphics",
@@ -133,6 +210,11 @@ const struct viewer_binding viewer_bindings[] = {
     // ASCII only: the overlay renders through the 8x8 basic font
     {.label = "Tab, PgUp, Ins, End", .desc = "CTRL, RESTORE, pound, + (matrix)",
      .action = VA_INFO, .gap = true},
+    {.label = "gamepad", .desc = "C64 joystick: A fire, B up",
+     .action = VA_INFO},
+    {.key = SDLK_J, .mod = SDL_KMOD_CTRL, .label = "Ctrl+J",
+     .desc = "swap joystick port (pad: Back)",
+     .action = VA_JOY_PORT, .gap = true},
     {.label = "file drop", .desc = "run .prg/.crt/.sid/.d64 on the C64",
      .action = VA_INFO},
     {.key = SDLK_F9, .label = "F9", .desc = "toggle the Ultimate menu view",

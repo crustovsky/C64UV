@@ -26,6 +26,8 @@ struct config {
     const char *do_action;  // one-shot machine control, then exit
     const char *run_path;   // one-shot: run this .prg/.crt/.sid/.d64, then exit
     const char *type_text;  // one-shot: type this into the C64, then exit
+    const char *joy_spec;   // one-shot: tap these joystick inputs, then exit
+    int joy_port;           // control port the gamepad drives (1 or 2)
     bool screen;            // one-shot: print the C64 text screen, then exit
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
     int listen_port;        // video; audio uses listen_port + 1
@@ -1103,6 +1105,44 @@ static bool print_screen(const char *host)
     return true;
 }
 
+// --joy [PORT:]INPUTS: press, hold long enough for a game's frame loop to
+// see it, release. The scripted twin of the gamepad.
+static bool joy_tap(const char *host, const char *spec, int port)
+{
+    if (spec[0] && spec[1] == ':' && (spec[0] == '1' || spec[0] == '2')) {
+        port = spec[0] - '0';
+        spec += 2;
+    }
+    unsigned mask = joy_parse(spec);
+    if (!mask) {
+        SDL_Log("--joy: expected [PORT:]up,down,left,right,fire,fire2,fire3");
+        return false;
+    }
+    char url[256], body[320], resp[512];
+    snprintf(url, sizeof url, "http://%s/v1/machine:input", host);
+    CURL *curl = curl_easy_init();
+    long code = -1;
+    for (int pass = 0; pass < 2; pass++) { // press, then release
+        joy_event_json(port, pass ? mask : 0, pass ? 0 : mask, body,
+                       sizeof body);
+        code = rest_req(curl, "POST", url, body, (long)strlen(body),
+                        "application/json", 3000, resp, NULL);
+        if (code != 200)
+            break;
+        if (!pass)
+            SDL_Delay(150);
+    }
+    curl_easy_cleanup(curl);
+    if (code == 200)
+        SDL_Log("joystick port %d: %s OK", port, spec);
+    else if (code == -1)
+        SDL_Log("machine:input: no response from Ultimate");
+    else
+        SDL_Log("machine:input HTTP %ld: %s (joysticks need firmware 1.2.0 "
+                "or newer)", code, resp);
+    return code == 200;
+}
+
 // ----------------------------------------------- matrix keyboard (REST)
 //
 // When the firmware supports machine:input (probed by the keepalive thread),
@@ -1115,6 +1155,8 @@ struct minput {
     CURL *curl;
     char url[256];
     int fails;
+    int joy_port;      // control port the gamepad drives
+    unsigned joy_sent; // JOY_* bits the firmware holds for us
 };
 
 static void minput_post(struct minput *mi, const char *body)
@@ -1150,8 +1192,33 @@ static void minput_key(struct minput *mi, SDL_Keycode key, bool down)
 }
 
 // Fired on focus loss, view switches, and exit so no key stays held down.
+// Brings the firmware's joystick lines to `want` (JOY_* bits): one POST
+// with the releases and presses that differ from what it holds.
+static void minput_joy(struct minput *mi, unsigned want)
+{
+    char body[320];
+    if (joy_event_json(mi->joy_port, mi->joy_sent, want, body, sizeof body))
+        minput_post(mi, body);
+    mi->joy_sent = want;
+}
+
+// What the pad holds right now, as JOY_* bits. Polled as a whole instead
+// of tracked per event: d-pad up, the stick and the jump button all mean
+// "up", and letting go of one must not release the others.
+static unsigned pad_state(SDL_Gamepad *pad)
+{
+    unsigned m = pad_stick_joy(
+        SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX),
+        SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
+    for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++)
+        if (SDL_GetGamepadButton(pad, (SDL_GamepadButton)b))
+            m |= pad_button_joy((SDL_GamepadButton)b);
+    return m;
+}
+
 static void minput_release_all(struct minput *mi)
 {
+    mi->joy_sent = 0; // release_all drops the joystick lines too
     minput_post(mi, "{\"events\":[{\"kind\":\"release_all\"}]}");
 }
 
@@ -1195,7 +1262,7 @@ static int run_term_test(const char *host)
 // free. Same font, same colors.
 
 #define HELP_PX_W TERM_PX_W
-#define HELP_PX_H 232
+#define HELP_PX_H 256
 #define HELP_LINE 11 // 8 px glyphs + 3 px of air between rows
 #define HELP_BLUE 0xFF2E2C9Bu
 
@@ -1265,8 +1332,9 @@ static void usage(const char *argv0)
             "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
             "          [--multicast] [--no-start] [--no-audio] [--no-keyb]\n"
             "          [--password PW] [--do ACTION] [--run FILE] [--store DIR]\n"
-            "          [--type TEXT] [--screen] [--dump FILE.ppm] [--term-test]\n"
-            "          [--discover] [--verbose] [--version]\n"
+            "          [--type TEXT] [--screen] [--joy INPUTS] [--joy-port N]\n"
+            "          [--dump FILE.ppm] [--term-test] [--discover] [--verbose]\n"
+            "          [--version]\n"
             "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
             "auto-discover)\n"
             "  --dest    where the Ultimate should send the streams (default: auto;\n"
@@ -1285,6 +1353,10 @@ static void usage(const char *argv0)
             "            there read-write and autostart (or set C64U_STORE)\n"
             "  --type    type TEXT into the C64 (\\n = RETURN), then exit\n"
             "  --screen  print the C64 text screen (40x25), then exit\n"
+            "  --joy     tap joystick inputs, then exit: [PORT:]up,down,left,\n"
+            "            right,fire,fire2,fire3 (e.g. --joy 1:left,fire)\n"
+            "  --joy-port  control port the gamepad drives, 1 or 2 (default 2;\n"
+            "            Ctrl+J or the pad's Back button swaps it)\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
             "  --term-test  print the telnet menu screen as text, then exit\n"
@@ -1300,7 +1372,8 @@ int main(int argc, char **argv)
 {
     struct config cfg = {.host = getenv("C64U_HOST"),
                          .listen_port = 11000,
-                         .scale = 2};
+                         .scale = 2,
+                         .joy_port = 2}; // most games read port 2
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--host") && i + 1 < argc)
             cfg.host = argv[++i];
@@ -1330,6 +1403,16 @@ int main(int argc, char **argv)
             cfg.no_audio = true;
         else if (!strcmp(argv[i], "--no-keyb"))
             cfg.no_keyb = true;
+        else if (!strcmp(argv[i], "--joy") && i + 1 < argc)
+            cfg.joy_spec = argv[++i];
+        else if (!strcmp(argv[i], "--joy-port") && i + 1 < argc)
+{
+            cfg.joy_port = atoi(argv[++i]);
+            if (cfg.joy_port != 1 && cfg.joy_port != 2) {
+                fprintf(stderr, "--joy-port takes 1 or 2\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc)
             cfg.dump_path = argv[++i];
         else if (!strcmp(argv[i], "--term-test"))
@@ -1398,7 +1481,8 @@ int main(int argc, char **argv)
     // immediately and discovers in the background instead.
     static char auto_host[46];
     bool headless = cfg.dump_path || cfg.term_test || cfg.do_action ||
-                    cfg.run_path || cfg.type_text || cfg.screen;
+                    cfg.run_path || cfg.type_text || cfg.screen ||
+                    cfg.joy_spec;
     if (!cfg.host && !cfg.no_start && headless) {
         struct discovered found[DISCOVER_MAX];
         fprintf(stderr, "no --host given, discovering...\n");
@@ -1423,6 +1507,9 @@ int main(int argc, char **argv)
 
     if (cfg.run_path)
         return run_file(cfg.host, cfg.run_path) ? 0 : 1;
+
+    if (cfg.joy_spec)
+        return joy_tap(cfg.host, cfg.joy_spec, cfg.joy_port) ? 0 : 1;
 
     if (cfg.type_text && !type_text(cfg.host, cfg.type_text))
         return 1;
@@ -1510,7 +1597,7 @@ int main(int argc, char **argv)
         // the c64uv.desktop basename so desktops pair the window with its icon.
         SDL_SetAppMetadata("Commodore 64 Ultimate Viewer", C64UV_VERSION,
                            "c64uv");
-        if (!SDL_Init(SDL_INIT_VIDEO | (asock != COMPAT_BAD_SOCK ? SDL_INIT_AUDIO : 0))) {
+        if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | (asock != COMPAT_BAD_SOCK ? SDL_INIT_AUDIO : 0))) {
             fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
             return 1;
         }
@@ -1536,7 +1623,10 @@ int main(int argc, char **argv)
     }
 
     struct keyb kb = {.fd = COMPAT_BAD_SOCK, .host = cfg.host};
-    struct minput mi = {0};
+    struct minput mi = {.joy_port = cfg.joy_port};
+    // Gamepad -> joystick: the first pad that shows up, until it leaves.
+    SDL_Gamepad *pad = NULL;
+    bool pad_warned = false;
     bool want_keyb = windowed && !cfg.no_keyb && !cfg.no_start;
     if (want_keyb)
         SDL_StartTextInput(win);
@@ -1657,9 +1747,28 @@ int main(int argc, char **argv)
         }
         if (windowed) {
             SDL_Event ev;
+            bool pad_event = false, joy_swap = false;
             while (SDL_PollEvent(&ev)) {
                 if (ev.type == SDL_EVENT_QUIT) {
                     atomic_store(&g_quit, true);
+                } else if (ev.type == SDL_EVENT_GAMEPAD_ADDED) {
+                    if (!pad && (pad = SDL_OpenGamepad(ev.gdevice.which)))
+                        SDL_Log("gamepad '%s' drives joystick port %d",
+                                SDL_GetGamepadName(pad), mi.joy_port);
+                } else if (ev.type == SDL_EVENT_GAMEPAD_REMOVED) {
+                    if (pad && SDL_GetGamepadID(pad) == ev.gdevice.which) {
+                        SDL_CloseGamepad(pad);
+                        pad = NULL;
+                        pad_event = true; // let go of what it held
+                        SDL_Log("gamepad unplugged");
+                    }
+                } else if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+                           ev.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
+                           ev.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+                    pad_event = true;
+                    if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+                        ev.gbutton.button == SDL_GAMEPAD_BUTTON_BACK)
+                        joy_swap = true;
                 } else if (ev.type == SDL_EVENT_KEY_DOWN) {
                     enum viewer_action va =
                         viewer_binding_match(ev.key.key, ev.key.mod);
@@ -1683,6 +1792,8 @@ int main(int argc, char **argv)
                     } else if (va == VA_MENU_BTN && !cfg.no_start &&
                                cfg.host) {
                         machine_ctl(cfg.host, "menu_button");
+                    } else if (va == VA_JOY_PORT) {
+                        joy_swap = true;
                     } else if (va == VA_MENU_VIEW && !cfg.no_start &&
                                cfg.host) {
                         term_present = true; // repaint whichever view we land in
@@ -1777,6 +1888,30 @@ int main(int argc, char **argv)
                         }
                     }
                 }
+            }
+            // gamepad -> joystick lines, once per batch of events
+            bool joy_ok = kb.enabled && atomic_load(&g_minput) == 1;
+            if (joy_swap) {
+                if (joy_ok)
+                    minput_joy(&mi, 0); // nothing stays held on the old port
+                mi.joy_port = 3 - mi.joy_port;
+                pad_event = true;
+                SDL_Log("joystick on port %d", mi.joy_port);
+                status_set(status, mi.joy_port == 1 ? "joystick on port 1"
+                                                    : "joystick on port 2",
+                           "Ctrl+J or the pad's Back button swaps");
+                notice_until = SDL_GetTicks() + 1500;
+            }
+            if (pad_event && joy_ok) {
+                minput_joy(&mi, pad ? pad_state(pad) : 0);
+            } else if (pad_event && pad && !pad_warned &&
+                       atomic_load(&g_minput) == 0) {
+                pad_warned = true;
+                SDL_Log("gamepad ignored: joysticks need machine:input "
+                        "(firmware 1.2.0 or newer)");
+                status_set(status, "the gamepad needs firmware 1.2.0 or newer",
+                           "this Ultimate has no machine:input");
+                notice_until = SDL_GetTicks() + 3000;
             }
         }
 
@@ -2004,6 +2139,8 @@ int main(int argc, char **argv)
     atomic_store(&g_quit, true);
     if (atomic_load(&g_minput) == 1 && mi.url[0])
         minput_release_all(&mi);
+    if (pad)
+        SDL_CloseGamepad(pad);
     // The background threads must not outlive curl, but a blocking join
     // would leave the compositor's pings unanswered: with the Ultimate
     // powered off, the old 3 s REST timeouts added up to a ten-second

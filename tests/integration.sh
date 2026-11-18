@@ -224,6 +224,58 @@ test "$(wc -l < "$out/screen.txt")" = 25
 head -1 "$out/screen.txt" | grep -q '^READY\. *$'
 echo "type/screen test passed"
 
+# ---------------------------------------------------------------- joystick
+# --joy presses and releases the named inputs on the given control port
+# through machine:input; a bad input name is a usage-level refusal.
+
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --joy 1:left,fire
+grep -q 'POST /v1/machine:input' "$out/disc.log"
+grep -q '"port":1,"inputs":\["left","fire"\],"transition":"press"' "$out/disc.log"
+grep -q '"port":1,"inputs":\["left","fire"\],"transition":"release"' "$out/disc.log"
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --joy-port 1 --joy up
+grep -q '"port":1,"inputs":\["up"\],"transition":"press"' "$out/disc.log"
+: > "$out/disc.log"
+if timeout 10 ./c64uv --host 127.0.0.42:8064 --joy jump 2>/dev/null; then
+    echo "--joy accepted a bad input name"; exit 1
+fi
+! grep -q 'machine:input' "$out/disc.log"
+echo "joystick test passed"
+
+# ----------------------------------------------------------------- gamepad
+# The windowed path with a virtual pad (uinput; skipped where that is not
+# writable, e.g. CI containers): buttons, d-pad and stick become joystick
+# events on port 2, Back swaps to port 1, unplugging releases what is held.
+
+if [ -w /dev/uinput ]; then
+    : > "$out/disc.log"
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+        SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 \
+        timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
+        --port "$VPORT" --no-audio 2> "$out/pad.err" &
+    padpid=$!
+    pids+=($padpid)
+    for _ in $(seq 1 80); do # the keepalive thread probes machine:input
+        grep -q "machine:input available" "$out/pad.err" && break
+        sleep 0.25
+    done
+    python3 tests/virtualpad.py wait=1.5 a=1 a=0 left=1 a=1 a=0 left=0 \
+        stick=32767,0 b=1 stick=0,0 b=0 x=1 x=0 back=1 y=1 wait=0.3
+    kill -TERM $padpid; wait $padpid || true
+    j='{"kind":"joystick","port":%s,"inputs":\["%s"\],"transition":"%s"}'
+    for want in "2 fire press" "2 fire release" "2 left press" \
+        "2 left release" "2 right press" "2 up press" "2 right release" \
+        "2 up release" "2 fire2 press" "1 fire3 press" "1 fire3 release"; do
+        # shellcheck disable=SC2086,SC2059
+        grep -q "$(printf "$j" $want)" "$out/disc.log"
+    done
+    grep -q "joystick on port 1" "$out/pad.err"
+    echo "gamepad test passed"
+else
+    echo "gamepad test skipped (/dev/uinput not writable)"
+fi
+
 # ------------------------------------------------------- exit with host gone
 # A powered-off Ultimate answers nothing: the tarpit accepts connections and
 # never replies, which leaves the keepalive thread inside a REST call. A

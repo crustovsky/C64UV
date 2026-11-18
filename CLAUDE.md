@@ -263,18 +263,25 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    port (compat_posix.c mostly builds as-is: BSD sockets +
    `getifaddrs`, but `/proc/net/arp` and `ping -I` need `arp -n` /
    `ping -b` equivalents) only on request.
-2. **Gamepad -> machine:input joysticks**: SDL_Gamepad (SDL_INIT_GAMEPAD,
-   hotplug), d-pad + digitalized left stick -> directions, A = fire, B = up
-   as an option (platformers jump via up), events POSTed as
-   `{"kind":"joystick","port":N,...}` through the existing minput plumbing
-   (probe, release_all, fallback counters). Must include a port-swap
-   key/flag: games split between ports 1 and 2. Dormant until official
-   firmware ships `machine:input` (404 on 1.1.0, verified; no fallback
-   exists - games read the CIA lines directly). Testable now: unit tests
-   for mapping/JSON, integration via fakeultimate, SDL virtual gamepads
-   for synthetic input. The new Steam Controller is SDL's job: support
-   comes from SDL3's HIDAPI drivers + mapping db (worst case Steam udev
-   rules or SDL_GAMECONTROLLERCONFIG); code against generic SDL_Gamepad.
+2. **Gamepad -> machine:input joysticks** (done 2026-11-18, verified on
+   firmware 1.2.1 with a virtual pad, lines read back at `$DC00`/`$DC01`;
+   not yet played with a physical controller): SDL_Gamepad with hotplug,
+   first pad wins. The whole pad is polled into JOY_* bits on every pad
+   event (`pad_state` in main.c) and `minput_joy` POSTs only the
+   difference, release before press in one batch; mapping and JSON live in
+   keys.c (`pad_button_joy`, `pad_stick_joy`, `joy_event_json`). D-pad +
+   left stick (dead zone 16000) = directions, A = fire, B = up, X/Y =
+   fire2/fire3. Port 2 by default (`--joy-port`), Ctrl+J or the pad's Back
+   button swaps. `--joy [PORT:]inputs` is the headless twin (press, 150 ms,
+   release). `release_all` (focus loss, F9, exit) drops the joystick lines
+   too, so it zeroes `joy_sent`; the next pad event resyncs. SDL delivers
+   no pad events to an unfocused window (tests set
+   `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1`). `tests/virtualpad.py` is a
+   dependency-free uinput pad (Xbox 360 ids, so SDL maps it); the
+   integration test using it is skipped where `/dev/uinput` is not
+   writable (CI). The F10 overlay grew to 256 px for the two extra rows.
+   The new Steam Controller is SDL's job: code against generic
+   SDL_Gamepad.
 
 3. **Persistent drop storage** (implemented and verified on hardware
    2026-09-27, Windows client against firmware 1.1.0: upload, path mount,
@@ -304,6 +311,8 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    `C64U_FTP_PORT` (fakeultimate.py serves a passive-mode FTP stub as its
    fifth argument and logs `FTP STOR <path> len=N`).
 
-Dormant follow-up: when official firmware ships `machine:input`, re-verify
-the matrix-keyboard mapping against real hardware and activate the gamepad
-path alongside it.
+Follow-ups now that 1.2.x ships `machine:input`: a REST menu view from
+`machine:menu_screen` (keys reach the menu through `machine:input`, so it
+could replace the telnet view and fix the Ctrl+M eviction), mouse
+forwarding (`kind: mouse` events), and re-checking the matrix-keyboard
+mapping in a matrix-scanning game with the stream running.
