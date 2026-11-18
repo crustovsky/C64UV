@@ -141,7 +141,13 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   `$DC00`/`$DC01`: with the default Joystick Swapper = "Swapped", API port
   1 drives `$DC00` and port 2 `$DC01`. `machine:menu_screen` is 404 until
   the menu is up (about one request after `menu_button`), then 2000
-  bytes. `machine:poweroff` exists. `run_prg` now loads from an upload
+  bytes. The characters are ASCII (0x20-0x7E, mixed case), not screen
+  codes; frame lines are codes below 0x20, and the selected row has bit 7
+  set in both its character and colour bytes. The whole menu is drivable
+  through `machine:input` press/release pairs (verified: main menu ->
+  Disk File Browser -> folders via cursor right -> RETURN opens the
+  action popup -> RETURN on "Run Disk" started a game), which is all a
+  REST menu view needs. `machine:poweroff` exists. `run_prg` now loads from an upload
   folder under `/Temp` (cartridge parking and `$CC` gate unchanged).
   Streams over WiFi still fail with HTTP 500. The DMA socket (port 64)
   is **closed by the firmware after 1.0 s without a command**, and the
