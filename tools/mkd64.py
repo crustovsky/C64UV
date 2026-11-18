@@ -37,8 +37,9 @@ PROGRAM = basic([
     (10, T([POKE]) + b"53281,0:" + T([PRINT, CHR]) + b'(147)'),
     (20, T([PRINT]) + b'"   HELLO FROM C64UV"'),
     (30, T([PRINT]) + b'"   THIS DISK WAS MOUNTED AND RUN"'),
-    (40, T([FOR]) + b"C=0" + T([TO]) + b"15:" + T([POKE]) + b"53280,C:"
-         + T([FOR]) + b"D=0" + T([TO]) + b"150:" + T([NEXT]) + b":" + T([NEXT])),
+    # "=" is a token (0xB2) too: a literal one is a syntax error in FOR
+    (40, T([FOR]) + b"C\xb20" + T([TO]) + b"15:" + T([POKE]) + b"53280,C:"
+         + T([FOR]) + b"D\xb20" + T([TO]) + b"150:" + T([NEXT]) + b":" + T([NEXT])),
     (50, T([GOTO]) + b"40"),
 ])
 

@@ -493,6 +493,7 @@ struct keyb {
     bool reclaim; // reconnect as soon as the running drop releases port 64
     const char *host;
     Uint64 last_try;
+    Uint64 last_send;
 };
 
 // Lazy connection with rate-limited reconnect.
@@ -510,6 +511,14 @@ static void keyb_try_connect(struct keyb *k)
 
 static void keyb_raw(struct keyb *k, Uint16 cmd, const Uint8 *data, int n)
 {
+    // firmware 1.2.1 closes a DMA connection after 1 s without a command,
+    // and the first send into the dead socket still succeeds (the key
+    // would vanish): reconnect ourselves once the connection has idled
+    if (k->fd != COMPAT_BAD_SOCK && SDL_GetTicks() - k->last_send > 700) {
+        compat_close(k->fd);
+        k->fd = COMPAT_BAD_SOCK;
+        k->last_try = 0;
+    }
     keyb_try_connect(k);
     if (k->fd == COMPAT_BAD_SOCK)
         return;
@@ -517,6 +526,7 @@ static void keyb_raw(struct keyb *k, Uint16 cmd, const Uint8 *data, int n)
         compat_close(k->fd);
         k->fd = COMPAT_BAD_SOCK; // reconnect on next keypress
     }
+    k->last_send = SDL_GetTicks();
 }
 
 static void keyb_type(struct keyb *k, Uint8 petscii)
@@ -778,19 +788,40 @@ static bool ftp_upload(CURL *curl, const char *host, const char *rpath,
     return res == CURLE_OK;
 }
 
-// Types text into the KERNAL keyboard buffer over a DMA connection. The
-// buffer holds 10 bytes and the firmware does not chunk; batches of
-// exactly 10 went missing twice on hardware (tail batch delivered, first
-// one gone), so 8 leaves room for a key already sitting in the buffer.
+// Types text into the KERNAL keyboard buffer. The buffer holds 10 bytes
+// and the firmware does not chunk; batches of exactly 10 went missing twice
+// on hardware (tail batch delivered, first one gone), so 8 leaves room for
+// a key already sitting in the buffer. Two things learned on firmware
+// 1.2.1:
+// - a batch overwrites whatever BASIC has not read yet, and BASIC reads
+//   nothing while it executes a line (about 200 ms after a RETURN at the
+//   prompt), so a fixed pause loses keys (`LOAD"*",8,1` arrived as
+//   `LO1"`): wait until the buffer count $C6 reads 0 before the next batch;
+// - the firmware closes a DMA connection after 1 s without a command, and
+//   the first send into the dead socket still succeeds, so every batch
+//   gets a connection of its own.
 #define KEYB_BATCH 8
-static bool dma_type(compat_sock s, const char *text)
+static bool dma_type(CURL *curl, const char *host, const char *text)
 {
     size_t len = strlen(text);
     for (size_t i = 0; i < len; i += KEYB_BATCH) {
         size_t n = len - i < KEYB_BATCH ? len - i : KEYB_BATCH;
-        if (!dma_send(s, DMA_CMD_KEYB, text + i, n, false))
+        compat_sock s = dma_connect(host, 3);
+        if (s == COMPAT_BAD_SOCK)
             return false;
-        SDL_Delay(100); // let BASIC drain the buffer
+        bool sent = dma_send(s, DMA_CMD_KEYB, text + i, n, false);
+        SDL_Delay(100); // the firmware applies the write, BASIC drains
+        compat_close(s);
+        if (!sent)
+            return false;
+        for (int t = 0; t < 3000; t += 50) {
+            struct binbuf b;
+            // a failed read falls back to the plain pause
+            if (!readmem(curl, host, "00C6", 1, &b) || b.len < 1 ||
+                b.data[0] == 0)
+                break;
+            SDL_Delay(50);
+        }
     }
     return true;
 }
@@ -835,24 +866,18 @@ static long store_image(CURL *curl, const char *host, const char *path,
     // boots in about 1.5 s; let it.
     SDL_Delay(2500);
     wait_kernal_ready(curl, host, 10000);
-    compat_sock s = dma_connect(host, 3);
-    if (s == COMPAT_BAD_SOCK) {
-        SDL_Log("mounted on drive A, but the DMA socket (port 64) is "
-                "unreachable: type LOAD\"*\",8,1 yourself");
-        return -1;
-    }
-    bool typed = dma_type(s, "LOAD\"*\",8,1\r");
+    bool typed = dma_type(curl, host, "LOAD\"*\",8,1\r");
     if (typed) {
         // the cursor is off while the drive works ($CC != 0): wait for
         // the load to start, then for READY.; a KERNAL load runs at about
         // 400 bytes/s
         wait_kernal_busy(curl, host, 3000);
         wait_kernal_ready(curl, host, 120000);
-        typed = dma_type(s, "RUN\r");
+        typed = dma_type(curl, host, "RUN\r");
     }
-    compat_close(s);
     if (!typed)
-        SDL_Log("keyboard channel dropped mid-autostart: %s", compat_neterr());
+        SDL_Log("mounted on drive A, but the DMA socket (port 64) failed "
+                "(%s): type LOAD\"*\",8,1 yourself", compat_neterr());
     else
         SDL_Log("%s mounted read-write on drive A and started", shown);
     return typed ? 200 : -1;
@@ -1037,16 +1062,12 @@ static bool type_text(const char *host, const char *text)
             buf[n++] = (char)c;
     }
     buf[n] = '\0';
-    compat_sock s = dma_connect(host, 3);
-    if (s == COMPAT_BAD_SOCK) {
-        SDL_Log("DMA socket (port 64) unreachable; is the Ultimate DMA "
-                "Service enabled?");
-        return false;
-    }
-    bool ok = dma_type(s, buf);
+    CURL *curl = curl_easy_init();
+    bool ok = dma_type(curl, host, buf);
     if (!ok)
-        SDL_Log("typing failed: %s", compat_neterr());
-    compat_close(s);
+        SDL_Log("typing failed (%s); is the Ultimate DMA Service enabled?",
+                compat_neterr());
+    curl_easy_cleanup(curl);
     return ok;
 }
 
