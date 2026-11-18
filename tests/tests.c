@@ -196,6 +196,44 @@ static void test_matrix_keys(void)
     CHECK(!matrix_event_json(one, 1, "press", buf, 16)); // too small
 }
 
+static void test_joystick(void)
+{
+    CHECK(pad_button_joy(SDL_GAMEPAD_BUTTON_DPAD_LEFT) == JOY_LEFT);
+    CHECK(pad_button_joy(SDL_GAMEPAD_BUTTON_SOUTH) == JOY_FIRE);
+    CHECK(pad_button_joy(SDL_GAMEPAD_BUTTON_EAST) == JOY_UP); // jump
+    CHECK(pad_button_joy(SDL_GAMEPAD_BUTTON_WEST) == JOY_FIRE2);
+    CHECK(pad_button_joy(SDL_GAMEPAD_BUTTON_NORTH) == JOY_FIRE3);
+    CHECK(pad_button_joy(SDL_GAMEPAD_BUTTON_START) == 0);
+    CHECK(pad_button_joy(SDL_GAMEPAD_BUTTON_BACK) == 0); // port swap
+
+    CHECK(pad_stick_joy(0, 0) == 0);
+    CHECK(pad_stick_joy(8000, -8000) == 0); // dead zone
+    CHECK(pad_stick_joy(-32768, 0) == JOY_LEFT);
+    CHECK(pad_stick_joy(32767, 32767) == (JOY_RIGHT | JOY_DOWN));
+    CHECK(pad_stick_joy(0, -20000) == JOY_UP);
+
+    CHECK(joy_parse("fire") == JOY_FIRE);
+    CHECK(joy_parse("up,left,fire2") == (JOY_UP | JOY_LEFT | JOY_FIRE2));
+    CHECK(joy_parse("fire,jump") == 0);
+    CHECK(joy_parse("") == 0);
+    CHECK(joy_parse("fir") == 0);
+
+    char buf[320];
+    CHECK(joy_event_json(2, 0, JOY_UP | JOY_FIRE, buf, sizeof buf));
+    CHECK(!strcmp(buf, "{\"events\":[{\"kind\":\"joystick\",\"port\":2,"
+                       "\"inputs\":[\"up\",\"fire\"],"
+                       "\"transition\":\"press\"}]}"));
+    // a direction change is one POST: release first, then press
+    CHECK(joy_event_json(1, JOY_LEFT | JOY_FIRE, JOY_RIGHT | JOY_FIRE, buf,
+                         sizeof buf));
+    CHECK(!strcmp(buf, "{\"events\":[{\"kind\":\"joystick\",\"port\":1,"
+                       "\"inputs\":[\"left\"],\"transition\":\"release\"},"
+                       "{\"kind\":\"joystick\",\"port\":1,"
+                       "\"inputs\":[\"right\"],\"transition\":\"press\"}]}"));
+    CHECK(!joy_event_json(2, JOY_FIRE, JOY_FIRE, buf, sizeof buf)); // no-op
+    CHECK(!joy_event_json(2, 0, 0x7f, buf, 40)); // too small
+}
+
 static void test_bindings(void)
 {
     // dispatch side of the shared table
@@ -330,6 +368,7 @@ int main(void)
     test_video_assembly();
     test_petscii();
     test_matrix_keys();
+    test_joystick();
     test_bindings();
     test_json();
     test_arp_wired();

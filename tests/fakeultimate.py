@@ -140,6 +140,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             line += f" pw={pw}"
         if body:
             line += f" body={len(body)}"
+            if self.path == "/v1/machine:input":  # small JSON: log it whole
+                line += " " + body.decode("ascii", "replace")
         with open(sys.argv[3], "a") as f:
             f.write(line + "\n")
 

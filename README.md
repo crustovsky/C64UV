@@ -26,6 +26,9 @@ cable.
   servo that holds the pipeline at ~60 ms.
 - **Keyboard** - what you type lands in the C64's keyboard buffer: full
   PETSCII mapping, cursor keys, F1–F8, and Esc acting as RUN/STOP.
+- **Gamepad** - plug in a controller and it is a C64 joystick (firmware
+  1.2.0 or newer): d-pad or left stick for directions, A = fire, B = up for
+  jumping, Ctrl+J or the pad's Back button swaps between ports 2 and 1.
 - **Ultimate menu** - press **F9** to flip to the Ultimate's own menu (file
   browser, disk mounting, configuration) rendered via its telnet remote
   screen; F9 again returns to the C64.
@@ -104,6 +107,8 @@ refuses to start a stream toward an address missing from its ARP table.
 | any typing | typed into the C64 (lowercase = letters, Shift = PETSCII graphics) |
 | Esc | RUN/STOP |
 | F1–F8, cursors, Home, Del/Ins | the corresponding C64 keys |
+| gamepad | C64 joystick on port 2: d-pad / left stick, A = fire, B = up, X / Y = second and third fire button (needs firmware 1.2.0+) |
+| Ctrl+J, pad Back button | move the joystick to the other control port |
 | **F9** | toggle the Ultimate menu view |
 | **F10** | in-window key reference (same table as `--help`) |
 | Ctrl+R / Ctrl+Shift+R | reset / reboot the machine |
@@ -144,7 +149,8 @@ Every viewer action has a one-shot flag, so scripts and agents can drive the
 machine without a window: `--discover`, `--do`, `--run` (with `--store`),
 `--type 'LOAD"*",8,1\n'` (types into the C64, `\n` = RETURN),
 `--screen` (prints the 40x25 text screen read from screen RAM, the way to
-check what a typed command did), `--dump frame.ppm` (one video frame) and
+check what a typed command did), `--joy 2:left,fire` (taps joystick inputs
+on a control port; needs firmware 1.2.0+), `--dump frame.ppm` (one video frame) and
 `--term-test` (the Ultimate menu as text). After `--do reset` give the C64
 about three seconds to boot before typing. Exit status is 0 on success, 1
 when the Ultimate refused or did not answer, 2 for a usage error. If
@@ -198,22 +204,30 @@ rather than a terminal.
 
 ## Limitations
 
-- On current official firmware, typed input goes through the KERNAL keyboard
+- On firmware older than 1.2.0, typed input goes through the KERNAL keyboard
   buffer: it works for BASIC, the READY prompt, and anything reading input
-  normally - **not** for games that scan the keyboard matrix directly. The
-  viewer probes for the hardware-level `machine:input` API (in upstream
-  firmware betas) on every start and switches to true matrix-level
-  press/release automatically once your firmware has it; games, chords, and
-  held keys then work, with Tab acting as the C64 CTRL key, PageUp as
-  RESTORE, Insert as £ and End as + (both also on the numeric keypad; a PC
-  has no unshifted key for either).
+  normally - **not** for games that scan the keyboard matrix directly, and
+  there is no joystick. The viewer probes for the hardware-level
+  `machine:input` API (firmware 1.2.0 and newer) on every start and
+  switches to true matrix-level press/release automatically when the
+  machine has it; games, chords, held keys and the gamepad then work, with
+  Tab acting as the C64 CTRL key, PageUp as RESTORE, Insert as £ and End as
+  + (both also on the numeric keypad; a PC has no unshifted key for
+  either).
+- The gamepad only works while the viewer window has focus (click it
+  first). To play with another window in front, start the viewer with
+  `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1` in the environment.
+- The gamepad's port numbers are the firmware's: with the Ultimate's
+  "Joystick Swapper" setting on "Swapped", ports 1 and 2 trade places. If a
+  game does not react, press Ctrl+J (or Back on the pad) to try the other
+  port.
 - The Ultimate's menu overlay is not part of the VIC stream - that's what the
   F9 telnet view is for. The on-screen menu (Ctrl+M) cannot be driven from
-  the viewer on current firmware: every remote keystroke is a DMA write into
+  the viewer on firmware older than 1.2.0: every remote keystroke is a DMA write into
   C64 memory, and the firmware closes its menu before any DMA write, so the
-  first key you press kicks the menu out. Newer firmware with the
-  `machine:input` API routes keys into the menu; the viewer switches to it
-  automatically once your machine has it.
+  first key you press kicks the menu out. Firmware 1.2.0 and newer routes
+  `machine:input` keys into the menu, and the viewer uses that API
+  automatically.
 - IPv4 only. The device streams to one destination, so it's one viewer per
   Ultimate unless everyone uses `--multicast`.
 

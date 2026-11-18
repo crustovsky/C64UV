@@ -22,6 +22,26 @@ int key_to_c64_matrix(SDL_Keycode key, const char *names[2]);
 bool matrix_event_json(const char *names[], int n, const char *transition,
                        char *buf, size_t cap);
 
+// Gamepad -> C64 joystick, for machine:input joystick events. A state is
+// a mask of JOY_* bits.
+enum {
+    JOY_UP = 1, JOY_DOWN = 2, JOY_LEFT = 4, JOY_RIGHT = 8,
+    JOY_FIRE = 16, JOY_FIRE2 = 32, JOY_FIRE3 = 64,
+};
+// One pad button -> JOY_* bit (0 = unmapped): d-pad = directions, south
+// (A/cross) = fire, west (X/square) = fire2, north (Y/triangle) = fire3,
+// east (B/circle) = up, the jump button platformers lack.
+unsigned pad_button_joy(SDL_GamepadButton b);
+// Left stick -> direction bits; inside the dead zone = 0.
+unsigned pad_stick_joy(int x, int y);
+// Parses "up,fire" style lists (the API's input names); 0 = invalid.
+unsigned joy_parse(const char *list);
+// machine:input body taking control port `port` from state `from` to state
+// `to`: a release event, a press event, or both. False when nothing
+// changed or buf is too small.
+bool joy_event_json(int port, unsigned from, unsigned to, char *buf,
+                    size_t cap);
+
 // One static table drives the viewer's hotkey dispatch, the F10 help
 // overlay, and the key list in --help, so they can never drift apart.
 enum viewer_action {
@@ -34,6 +54,7 @@ enum viewer_action {
     VA_REBOOT,
     VA_PAUSE,
     VA_MENU_BTN,
+    VA_JOY_PORT,
 };
 
 struct viewer_binding {
