@@ -131,6 +131,24 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   open closes it (verified on 1.1.0: any key kicks the user out). Hence
   the help copy points at F9; with `machine:input` the firmware routes
   keys into the menu instead.
+- **Firmware 1.2.1 (verified over WiFi 2026-11-18)**: the update switches
+  every network service off (ports 80/21/23/64 refuse until re-enabled in
+  F2 > Network). `machine:input` answers 200 (keyboard, joysticks, mouse)
+  and the key names in keys.c all match the spec, which the machine
+  serves at `/openapi.yaml` (`/api.html` is the explorer). A `tap` returns
+  before the key is released, so back-to-back taps overlap; press/release
+  pairs do not. Joystick lines read back through `machine:readmem` of
+  `$DC00`/`$DC01`: with the default Joystick Swapper = "Swapped", API port
+  1 drives `$DC00` and port 2 `$DC01`. `machine:menu_screen` is 404 until
+  the menu is up (about one request after `menu_button`), then 2000
+  bytes. `machine:poweroff` exists. `run_prg` now loads from an upload
+  folder under `/Temp` (cartridge parking and `$CC` gate unchanged).
+  Streams over WiFi still fail with HTTP 500. The DMA socket (port 64)
+  is **closed by the firmware after 1.0 s without a command**, and the
+  first send into the dead socket still succeeds: one-shot typing opens a
+  connection per batch, the viewer reconnects after 700 ms idle. A KEYB
+  batch overwrites unread keys and BASIC reads none while it executes a
+  line (about 200 ms after RETURN): `dma_type` waits for `$C6` == 0.
 - **`machine:input` (CIA1 matrix-level)**: probed with a side-effect-free
   `GET /v1/machine:input` by the keepalive thread (404 on official firmware
   1.1.0, re-verified 2026-09-02; the docs specify 501 for hardware without
