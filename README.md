@@ -214,6 +214,9 @@ rather than a terminal.
   Tab acting as the C64 CTRL key, PageUp as RESTORE, Insert as £ and End as
   + (both also on the numeric keypad; a PC has no unshifted key for
   either).
+- The gamepad only works while the viewer window has focus (click it
+  first). To play with another window in front, start the viewer with
+  `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1` in the environment.
 - The gamepad's port numbers are the firmware's: with the Ultimate's
   "Joystick Swapper" setting on "Swapped", ports 1 and 2 trade places. If a
   game does not react, press Ctrl+J (or Back on the pad) to try the other

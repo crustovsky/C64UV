@@ -270,8 +270,8 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    `getifaddrs`, but `/proc/net/arp` and `ping -I` need `arp -n` /
    `ping -b` equivalents) only on request.
 2. **Gamepad -> machine:input joysticks** (done 2026-11-18, verified on
-   firmware 1.2.1 with a virtual pad, lines read back at `$DC00`/`$DC01`;
-   not yet played with a physical controller): SDL_Gamepad with hotplug,
+   firmware 1.2.1 with a virtual pad, lines read back at `$DC00`/`$DC01`,
+   then played by Michal with an Xbox pad over Bluetooth): SDL_Gamepad with hotplug,
    first pad wins. The whole pad is polled into JOY_* bits on every pad
    event (`pad_state` in main.c) and `minput_joy` POSTs only the
    difference, release before press in one batch; mapping and JSON live in
@@ -282,7 +282,10 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    release). `release_all` (focus loss, F9, exit) drops the joystick lines
    too, so it zeroes `joy_sent`; the next pad event resyncs. SDL delivers
    no pad events to an unfocused window (tests set
-   `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1`). `tests/virtualpad.py` is a
+   `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1`; the same variable lets a user
+   play with another window focused). "No button works" is that focus
+   rule first: `--verbose` logs every pad state change (`pad: port N
+   state XX`), so an empty log means no events arrive. `tests/virtualpad.py` is a
    dependency-free uinput pad (Xbox 360 ids, so SDL maps it); the
    integration test using it is skipped where `/dev/uinput` is not
    writable (CI). The F10 overlay grew to 256 px for the two extra rows.

@@ -1903,7 +1903,10 @@ int main(int argc, char **argv)
                 notice_until = SDL_GetTicks() + 1500;
             }
             if (pad_event && joy_ok) {
-                minput_joy(&mi, pad ? pad_state(pad) : 0);
+                unsigned want = pad ? pad_state(pad) : 0;
+                if (cfg.verbose && want != mi.joy_sent)
+                    SDL_Log("pad: port %d state %02x", mi.joy_port, want);
+                minput_joy(&mi, want);
             } else if (pad_event && pad && !pad_warned &&
                        atomic_load(&g_minput) == 0) {
                 pad_warned = true;
