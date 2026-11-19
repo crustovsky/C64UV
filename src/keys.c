@@ -238,10 +238,10 @@ const struct viewer_binding viewer_bindings[] = {
     {.key = SDLK_P, .mod = SDL_KMOD_CTRL, .label = "Ctrl+P",
      .desc = "pause/resume the machine", .action = VA_PAUSE},
     {.key = SDLK_M, .mod = SDL_KMOD_CTRL, .label = "Ctrl+M",
-     // the on-screen menu only answers the physical keyboard on today's
-     // firmware: every remote keystroke is a DMA write, and the firmware
-     // evicts the menu before any DMA write (dma_load_raw_buffer)
-     .desc = "menu button; F9 drives the menu", .action = VA_MENU_BTN,
+     // firmware 1.2+ routes machine:input keys into the menu, so typing
+     // in the window drives it; before that every remote keystroke is a
+     // DMA write, which evicts the menu (dma_load_raw_buffer): F9 instead
+     .desc = "menu button (pre-1.2: F9 instead)", .action = VA_MENU_BTN,
      .gap = true},
     {.key = SDLK_Q, .mod = SDL_KMOD_CTRL, .label = "Ctrl+Q", .desc = "quit",
      .action = VA_QUIT},

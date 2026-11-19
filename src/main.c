@@ -1378,24 +1378,35 @@ static int run_term_test(const char *host)
 // free. Same font, same colors.
 
 #define HELP_PX_W TERM_PX_W
-#define HELP_PX_H 256
 #define HELP_LINE 11 // 8 px glyphs + 3 px of air between rows
+#define HELP_GAP 8   // extra air after a group of rows
+#define HELP_TOP 40  // first row: below the title
 #define HELP_BLUE 0xFF2E2C9Bu
+
+// Buffer height for the current binding table: the rows, the footer line
+// and a margin. Derived, so a new row can never run past the buffer.
+static int help_height(void)
+{
+    int y = HELP_TOP;
+    for (int i = 0; i < viewer_bindings_count; i++)
+        y += HELP_LINE + (viewer_bindings[i].gap ? HELP_GAP : 0);
+    return y + 12 + 8 + 10; // footer offset, its glyph row, bottom margin
+}
 
 static void help_render(uint32_t *px)
 {
-    for (int i = 0; i < HELP_PX_W * HELP_PX_H; i++)
+    int h = help_height();
+    for (int i = 0; i < HELP_PX_W * h; i++)
         px[i] = HELP_BLUE;
-    int y = 14;
-    term_draw_text(px, HELP_PX_W, (HELP_PX_W - 16 * 8) / 2, y, 0xFFFFFFFF,
+    term_draw_text(px, HELP_PX_W, (HELP_PX_W - 16 * 8) / 2, 14, 0xFFFFFFFF,
                    "c64uv " C64UV_VERSION " keys");
-    y += 8 + 18;
+    int y = HELP_TOP;
     for (int i = 0; i < viewer_bindings_count; i++) {
         term_draw_text(px, HELP_PX_W, 24, y, 0xFFEDF171, // VIC yellow
                        viewer_bindings[i].label);
         term_draw_text(px, HELP_PX_W, 200, y, 0xFFB2B2B2, // light grey
                        viewer_bindings[i].desc);
-        y += HELP_LINE + (viewer_bindings[i].gap ? 8 : 0);
+        y += HELP_LINE + (viewer_bindings[i].gap ? HELP_GAP : 0);
     }
     term_draw_text(px, HELP_PX_W, 24, y + 12, 0xFF7B7B7B, // dark grey
                    "F10 or Esc closes this help");
@@ -1786,7 +1797,8 @@ int main(int argc, char **argv)
     struct term *trm = calloc(1, sizeof *trm);
     term_init(trm);
     // Help overlay (F10): own pixel buffer, spaced lines don't fit the grid.
-    uint32_t *help_px = calloc(HELP_PX_W * HELP_PX_H, sizeof(Uint32));
+    const int help_h = help_height();
+    uint32_t *help_px = calloc((size_t)HELP_PX_W * help_h, sizeof(Uint32));
     SDL_Texture *help_tex = NULL;
     bool help_active = false;
     bool term_active = false, term_present = false;
@@ -2269,7 +2281,7 @@ int main(int argc, char **argv)
             if (!help_tex) {
                 help_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
                                              SDL_TEXTUREACCESS_STREAMING,
-                                             HELP_PX_W, HELP_PX_H);
+                                             HELP_PX_W, help_h);
                 SDL_SetTextureScaleMode(help_tex, SDL_SCALEMODE_NEAREST);
             }
             help_render(help_px);
@@ -2277,7 +2289,7 @@ int main(int argc, char **argv)
             SDL_UpdateTexture(help_tex, NULL, help_px,
                               HELP_PX_W * (int)sizeof(Uint32));
             // same 2x vertical stretch as the terminal views
-            SDL_SetRenderLogicalPresentation(ren, HELP_PX_W, HELP_PX_H * 2,
+            SDL_SetRenderLogicalPresentation(ren, HELP_PX_W, help_h * 2,
                                              SDL_LOGICAL_PRESENTATION_LETTERBOX);
             SDL_SetRenderDrawColor(ren, 0x2E, 0x2C, 0x9B, 255);
             SDL_RenderClear(ren);
