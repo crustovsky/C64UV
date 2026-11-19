@@ -28,7 +28,55 @@ SWAPPER_PATH = "/v1/configs/U64%20Specific%20Settings/Joystick%20Swapper"
 # Settings a test can change with a PUT ...?value=, like on the machine.
 # The real default is "Swapped"; "Normal" keeps the API's port numbers equal
 # to the C64's, which is what most tests want to read in the log.
-STATE = {"swapper": "Normal"}
+STATE = {"swapper": "Normal", "menu": False, "row": 0}
+
+MENU_ITEMS = ["Disk File Browser", "Assembly 64 Query", "Reset C64",
+              "Power OFF"]
+
+
+def _menu_screen():
+    """The menu the way machine:menu_screen returns it: 40x25 character
+    bytes (ASCII, frame shapes below 0x20, bit 7 on the selected row),
+    then 40x25 colour bytes."""
+    chars = bytearray(b" " * 1000)
+    colours = bytearray(b"\x0f" * 1000)
+
+    def put(row, col, text):
+        chars[row * 40 + col:row * 40 + col + len(text)] = text
+
+    put(0, 0, b"\x01" + b"\x02" * 38 + b"\x03")
+    for row in range(1, 24):
+        put(row, 0, b"\x04")
+        put(row, 39, b"\x04")
+    put(24, 0, b"\x05" + b"\x02" * 38 + b"\x06")
+    put(1, 2, b"fakeultimate menu")
+    for i, item in enumerate(MENU_ITEMS):
+        put(3 + i, 2, item.encode())
+        if i == STATE["row"]:
+            for col in range(1, 39):
+                chars[(3 + i) * 40 + col] |= 0x80
+                colours[(3 + i) * 40 + col] = 0x81
+    return bytes(chars + colours)
+
+
+def _menu_input(body):
+    """Keys reach the menu while it is open, like on firmware 1.2+:
+    cursor down/up moves the selection, RUN/STOP leaves the menu."""
+    try:
+        events = json.loads(body).get("events", [])
+    except ValueError:
+        return
+    for ev in events:
+        if not STATE["menu"] or ev.get("kind") != "keyboard" or \
+                ev.get("transition") != "press":
+            continue
+        keys = ev.get("inputs", [])
+        if "run_stop" in keys:
+            STATE["menu"] = False
+        elif "cursor_up_down" in keys:
+            step = -1 if "right_shift" in keys else 1
+            STATE["row"] = (STATE["row"] + step) % len(MENU_ITEMS)
+
 
 LEN24_CMDS = (0xFF0A, 0xFF0B, 0xFF0D)  # MOUNT_IMG, RUN_IMG, RUN_CRT
 
@@ -189,15 +237,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"keyboard": {"inputs": []},
                         "joysticks": [{"port": 1, "inputs": []},
                                       {"port": 2, "inputs": []}],
+                        "mouse": {"attached": False, "inputs": [],
+                                  "pending": 0},
                         "errors": []})
+        elif self.path == "/v1/machine:menu_screen":
+            if STATE["menu"]:
+                self._reply(200, _menu_screen(), "application/octet-stream")
+            else:
+                self._json({"errors": ["Menu screen unavailable."]}, 404)
         else:
             self._json({"errors": ["Unknown API Call"]}, 404)
 
     def do_PUT(self):
         n = int(self.headers.get("Content-Length") or 0)
-        self._log(self.rfile.read(n) if n else b"")
+        body = self.rfile.read(n) if n else b""
+        self._log(body)
         if self.path.startswith(SWAPPER_PATH + "?value="):
             STATE["swapper"] = self.path.split("=", 1)[1]
+        elif self.path == "/v1/machine:menu_button":
+            STATE["menu"] = not STATE["menu"]
+            STATE["row"] = 0
+        elif self.path == "/v1/machine:input":
+            _menu_input(body)
         self._json({"errors": []})
 
     do_POST = do_PUT

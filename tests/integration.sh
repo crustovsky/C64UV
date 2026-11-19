@@ -254,6 +254,26 @@ test "$rc" = 2
 ! grep -q 'machine:input' "$out/disc.log"
 echo "matrix keys test passed"
 
+# -------------------------------------------------------------- menu screen
+# --menu-screen prints the open menu as text with the selected row marked;
+# with the menu closed (404) it fails. --keys drives the menu.
+
+if timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen 2>/dev/null; then
+    echo "--menu-screen succeeded with the menu closed"; exit 1
+fi
+timeout 8 ./c64uv --host 127.0.0.42:8064 --do menu
+timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen > "$out/menu.txt"
+test "$(wc -l < "$out/menu.txt")" = 25
+head -1 "$out/menu.txt" | grep -q '^  +--------------------------------------+$'
+grep -q '^> |.Disk File Browser' "$out/menu.txt"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --keys cursor_up_down
+timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen > "$out/menu.txt"
+grep -q '^> |.Assembly 64 Query' "$out/menu.txt"
+grep -q '^  |.Disk File Browser' "$out/menu.txt"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --keys run_stop # leaves the menu
+timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen 2>/dev/null && exit 1
+echo "menu screen test passed"
+
 # ---------------------------------------------------------------- joystick
 # --joy presses and releases the named inputs on the given control port
 # through machine:input; a bad input name is a usage-level refusal.
@@ -363,6 +383,38 @@ if [ -w /dev/uinput ]; then
     grep -q "drives joystick port 1" "$out/pad2.err"
     grep -q "gamepad on port 1 unplugged" "$out/pad2.err"
     echo "two-gamepad test passed"
+
+    # The REST menu view, driven by the pad: Start opens the menu (one
+    # menu_button press, then the screen is polled), the d-pad becomes
+    # cursor keys instead of joystick lines, Start closes it again (the
+    # second press). Opened once more, RUN/STOP-ing out of the menu on the
+    # machine side must end the view without a third... press.
+    : > "$out/disc.log"
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+        SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 \
+        timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
+        --port "$VPORT" --no-audio 2> "$out/menu.err" &
+    padpid=$!
+    pids+=($padpid)
+    for _ in $(seq 1 80); do
+        grep -q "machine:menu_screen available" "$out/menu.err" && break
+        sleep 0.25
+    done
+    python3 tests/virtualpad.py wait=1.5 start=1 start=0 wait=0.6 down=1 \
+        down=0 wait=0.3 start=1 start=0 wait=0.6 a=1 a=0 wait=0.3
+    grep -q "menu view: showing the Ultimate menu" "$out/menu.err"
+    grep -q "menu view closed" "$out/menu.err"
+    test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 2
+    grep -q '"inputs":\["cursor_up_down"\],"transition":"press"' "$out/disc.log"
+    ! grep -q '"kind":"joystick".*"down"' "$out/disc.log" # not a joystick there
+    grep -q '"port":2,"inputs":\["fire"\],"transition":"press"' "$out/disc.log"
+    # quitting with the view open closes the menu on the machine
+    python3 tests/virtualpad.py wait=1 start=1 start=0 wait=0.8
+    test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 3
+    kill -TERM $padpid; wait $padpid || true
+    test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 4
+    timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen 2>/dev/null && exit 1
+    echo "menu view test passed"
 else
     echo "gamepad test skipped (/dev/uinput not writable)"
 fi

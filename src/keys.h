@@ -43,6 +43,10 @@ enum {
 // (A/cross) = fire, west (X/square) = fire2, north (Y/triangle) = fire3,
 // east (B/circle) = up, the jump button platformers lack.
 unsigned pad_button_joy(SDL_GamepadButton b);
+// The pad in the Ultimate menu view: d-pad = cursor keys, south (A) =
+// RETURN, east (B) = cursor left, which is "back" in the menu. SDLK_UNKNOWN
+// for the rest.
+SDL_Keycode pad_menu_key(SDL_GamepadButton b);
 // Left stick -> direction bits; inside the dead zone = 0.
 unsigned pad_stick_joy(int x, int y);
 // Mouse motion -> direction bits for the joystick-emulation path. dx/dy are

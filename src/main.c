@@ -43,6 +43,7 @@ struct config {
     bool no_keyb;
     const char *dump_path;  // write first complete frame as PPM and exit
     bool term_test;         // headless telnet check: dump menu grid, exit
+    bool menu_screen;       // headless: print the REST menu screen, exit
     bool discover;          // sweep the local subnets for Ultimates and exit
     bool verbose;
 };
@@ -63,6 +64,9 @@ static atomic_int g_minput = -1;
 // port 2, and the other way round (verified on 1.2.1). The viewer talks in
 // C64 port numbers everywhere and converts in joy_api_port().
 static atomic_bool g_joy_swapped;
+// machine:menu_screen capability (probed with machine:input): -1 unknown,
+// 0 no (the F9 view uses telnet), 1 yes (the F9 view is the real menu).
+static atomic_int g_menu_rest = -1;
 // Set once the API answered, so a later transport failure is reported as
 // "stopped responding" rather than as unsupported firmware.
 static atomic_bool g_minput_up;
@@ -255,6 +259,23 @@ static int keepalive_thread(void *arg)
                 joy_swapper_read(curl, rc->host, &g_quit);
                 if (atomic_load(&g_quit))
                     break;
+                // menu_screen answers 404 "Menu screen unavailable." while
+                // the menu is closed; firmware without the call answers
+                // 404 with something else
+                char murl[256];
+                snprintf(murl, sizeof murl, "http://%s/v1/machine:menu_screen",
+                         rc->host);
+                long mcode = rest_req(curl, "GET", murl, NULL, 0, NULL, 3000,
+                                      resp, &g_quit);
+                if (atomic_load(&g_quit))
+                    break;
+                bool menu = mcode == 200 ||
+                            (mcode == 404 &&
+                             strstr(resp, "Menu screen unavailable"));
+                atomic_store(&g_menu_rest, menu);
+                SDL_Log("machine:menu_screen %s", menu
+                            ? "available: F9 shows the Ultimate's own menu"
+                            : "not supported: F9 uses the telnet menu");
                 atomic_store(&g_minput, 1);
                 atomic_store(&g_minput_up, true);
                 SDL_Log("machine:input available: matrix-level keyboard");
@@ -736,7 +757,7 @@ static const char *image_type_for(const char *path)
 }
 
 struct binbuf {
-    uint8_t data[1000]; // a full 40x25 text screen
+    uint8_t data[2048]; // a text screen (1000) or a menu screen (2000)
     int len;
 };
 
@@ -749,19 +770,21 @@ static size_t bin_sink(char *d, size_t size, size_t nmemb, void *userp)
     return n;
 }
 
-// GET machine:readmem: `len` bytes from hex address `addr` into b (capped
-// at the buffer). False on a transport error.
-static bool readmem(CURL *curl, const char *host, const char *addr, int len,
-                    struct binbuf *b)
+// GET a binary body into b (capped at the buffer). Returns the HTTP status
+// or -1 on a transport error; `cancel` as in rest_req.
+static long rest_get_bin(CURL *curl, const char *url, struct binbuf *b,
+                         long timeout_ms, const atomic_bool *cancel)
 {
-    char url[256];
-    snprintf(url, sizeof url,
-             "http://%s/v1/machine:readmem?address=%s&length=%d", host, addr,
-             len);
     b->len = 0;
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+    if (cancel) {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, rest_cancel_cb);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)cancel);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+    }
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, bin_sink);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, b);
     struct curl_slist *hdrs = NULL;
@@ -774,7 +797,23 @@ static bool readmem(CURL *curl, const char *host, const char *addr, int len,
     CURLcode res = curl_easy_perform(curl);
     curl_slist_free_all(hdrs);
     t_refused = curl_refused(curl, res);
-    return res == CURLE_OK;
+    if (res != CURLE_OK)
+        return -1;
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    return code;
+}
+
+// GET machine:readmem: `len` bytes from hex address `addr` into b. False
+// unless the machine answered with the memory.
+static bool readmem(CURL *curl, const char *host, const char *addr, int len,
+                    struct binbuf *b)
+{
+    char url[256];
+    snprintf(url, sizeof url,
+             "http://%s/v1/machine:readmem?address=%s&length=%d", host, addr,
+             len);
+    return rest_get_bin(curl, url, b, 3000, NULL) == 200;
 }
 
 // Readiness gate: the KERNAL zeroes $CC when it sits at a prompt with the
@@ -1602,6 +1641,197 @@ static bool mousejoy_tick(struct mousejoy *mj)
     return changed;
 }
 
+// ---------------------------------------------------- REST menu view
+//
+// Firmware 1.2+ serves the screen of the Ultimate's real menu (GET
+// machine:menu_screen: 2000 bytes while it is open, 404 while it is not)
+// and routes machine:input keys into it. The F9 view then shows that menu:
+// the same one the machine's own video output shows, working over WiFi
+// too. A worker thread polls the screen so the event loop never waits for
+// the network; the keys travel the normal machine:input path.
+//
+// Commands and states carry a generation number (value = gen << 3 | code)
+// so a state left over from an earlier session can never be mistaken for
+// the answer to the newest command.
+
+enum { RM_NONE, RM_OPEN, RM_ATTACH, RM_CLOSE }; // commands
+// RM_OPEN presses the menu button if the menu is closed; RM_ATTACH is for
+// a button press that already happened (Ctrl+M); RM_CLOSE presses it
+// again if the menu is still open.
+enum { RMS_OFF, RMS_OPENING, RMS_LIVE, RMS_GONE, RMS_FAILED }; // states
+// RMS_GONE: the menu closed on the machine (left with RUN/STOP, started a
+// program, or never opened). RMS_FAILED: the machine stopped answering.
+
+#define RMENU_POLL_MS 100
+#define RMENU_OPEN_WAIT_MS 2500
+
+struct rmenu {
+    char screen_url[256], button_url[256];
+    atomic_uint cmd, state;
+    atomic_bool kick; // a key went out: poll now, not at the next interval
+    atomic_bool done; // the thread has left its loop
+    atomic_uint seq;  // bumped whenever `screen` changes
+    SDL_Mutex *lock;  // guards `screen`
+    uint8_t screen[MENU_BYTES];
+    SDL_Thread *thr;
+    unsigned gen;     // event-loop side: generation of the last command
+};
+
+static void rmenu_press_button(CURL *curl, const struct rmenu *rm)
+{
+    char resp[512];
+    rest_req(curl, "PUT", rm->button_url, NULL, 0, NULL, 1500, resp, NULL);
+}
+
+static int rmenu_thread(void *arg)
+{
+    struct rmenu *rm = arg;
+    CURL *curl = curl_easy_init();
+    struct binbuf *b = malloc(sizeof *b);
+    bool active = false, pressed = false, live = false;
+    unsigned gen = 0;
+    int fails = 0;
+    Uint64 t0 = 0;
+    while (!atomic_load(&g_quit)) {
+        unsigned c = atomic_exchange(&rm->cmd, RM_NONE);
+        if ((c & 7) == RM_OPEN || (c & 7) == RM_ATTACH) {
+            gen = c >> 3;
+            active = true;
+            pressed = (c & 7) == RM_ATTACH;
+            live = false;
+            fails = 0;
+            t0 = SDL_GetTicks();
+            atomic_store(&rm->state, gen << 3 | RMS_OPENING);
+        } else if ((c & 7) == RM_CLOSE) {
+            gen = c >> 3;
+            if (active &&
+                rest_get_bin(curl, rm->screen_url, b, 1500, &g_quit) == 200)
+                rmenu_press_button(curl, rm); // still open: close it
+            active = false;
+            atomic_store(&rm->state, gen << 3 | RMS_OFF);
+        }
+        if (!active) {
+            SDL_Delay(15);
+            continue;
+        }
+        long code = rest_get_bin(curl, rm->screen_url, b, 1500, &g_quit);
+        if (atomic_load(&g_quit))
+            break;
+        int end = -1; // state that ends this session, if any
+        if (code == 200 && b->len == MENU_BYTES) {
+            fails = 0;
+            SDL_LockMutex(rm->lock);
+            if (!live || memcmp(rm->screen, b->data, MENU_BYTES)) {
+                memcpy(rm->screen, b->data, MENU_BYTES);
+                atomic_fetch_add(&rm->seq, 1);
+            }
+            SDL_UnlockMutex(rm->lock);
+            if (!live) {
+                live = true;
+                atomic_store(&rm->state, gen << 3 | RMS_LIVE);
+            }
+        } else if (code == 404) {
+            fails = 0;
+            if (live) {
+                end = RMS_GONE; // closed on the machine
+            } else if (!pressed) {
+                rmenu_press_button(curl, rm);
+                pressed = true;
+                t0 = SDL_GetTicks();
+            } else if (SDL_GetTicks() - t0 > RMENU_OPEN_WAIT_MS) {
+                end = RMS_GONE; // the press did not bring a menu up
+            }
+        } else if (++fails >= 5) {
+            end = RMS_FAILED;
+        }
+        if (end >= 0) {
+            active = false;
+            atomic_store(&rm->state, gen << 3 | (unsigned)end);
+            continue;
+        }
+        // the next poll: at once after a key, else after the interval
+        for (int t = 0; t < RMENU_POLL_MS && !atomic_load(&g_quit); t += 10) {
+            if (atomic_exchange(&rm->kick, false)) {
+                SDL_Delay(25); // let the menu draw the answer to the key
+                break;
+            }
+            if (atomic_load(&rm->cmd) != RM_NONE)
+                break;
+            SDL_Delay(10);
+        }
+    }
+    // quitting with the view up: do not leave the machine sitting in its
+    // menu (bounded like the keepalive's stop calls)
+    unsigned c = atomic_exchange(&rm->cmd, RM_NONE);
+    if ((active || (c & 7) == RM_CLOSE) && (c & 7) != RM_OPEN &&
+        rest_get_bin(curl, rm->screen_url, b, 1000, NULL) == 200)
+        rmenu_press_button(curl, rm);
+    free(b);
+    curl_easy_cleanup(curl);
+    atomic_store(&rm->done, true);
+    return 0;
+}
+
+// Event-loop side: issue a command, starting the thread on first use.
+static void rmenu_cmd(struct rmenu *rm, const char *host, unsigned cmd)
+{
+    if (!rm->thr) {
+        snprintf(rm->screen_url, sizeof rm->screen_url,
+                 "http://%s/v1/machine:menu_screen", host);
+        snprintf(rm->button_url, sizeof rm->button_url,
+                 "http://%s/v1/machine:menu_button", host);
+        rm->lock = SDL_CreateMutex();
+        rm->thr = SDL_CreateThread(rmenu_thread, "menu", rm);
+    }
+    rm->gen++;
+    atomic_store(&rm->state, rm->gen << 3 | RMS_OPENING);
+    atomic_store(&rm->cmd, rm->gen << 3 | cmd);
+}
+
+// The state that answers the newest command (RMS_OPENING until it does).
+static int rmenu_state(struct rmenu *rm)
+{
+    unsigned st = atomic_load(&rm->state);
+    return st >> 3 == rm->gen ? (int)(st & 7) : RMS_OPENING;
+}
+
+// --menu-screen: the open menu as text, the selected row marked with '>'.
+static int print_menu_screen(const char *host)
+{
+    char url[256];
+    snprintf(url, sizeof url, "http://%s/v1/machine:menu_screen", host);
+    CURL *curl = curl_easy_init();
+    struct binbuf *b = malloc(sizeof *b);
+    long code = -1;
+    // the screen follows a menu_button press by about one request
+    for (int attempt = 0; attempt < 4; attempt++) {
+        code = rest_get_bin(curl, url, b, 3000, NULL);
+        if (code != 404)
+            break;
+        SDL_Delay(250);
+    }
+    int rc = 1;
+    if (code == 200 && b->len == MENU_BYTES) {
+        for (int row = 0; row < MENU_ROWS; row++) {
+            char line[MENU_COLS + 1];
+            menu_row_text(b->data, row, line);
+            printf("%c %s\n", menu_row_selected(b->data, row) ? '>' : ' ',
+                   line);
+        }
+        rc = 0;
+    } else if (code == 404) {
+        SDL_Log("the Ultimate menu is not open (open it with --do menu; "
+                "this needs firmware 1.2.0 or newer)");
+    } else if (code == -1) {
+        SDL_Log("machine:menu_screen: %s", rest_no_answer());
+    } else {
+        SDL_Log("machine:menu_screen HTTP %ld (%d bytes)", code, b->len);
+    }
+    free(b);
+    curl_easy_cleanup(curl);
+    return rc;
+}
+
 // ------------------------------------------------------ telnet menu terminal
 //
 // Port 23 mirrors the Ultimate's menu as a VT100 session (src/term.c). The
@@ -1752,7 +1982,8 @@ static void usage(const char *argv0)
             "          [--type TEXT [--matrix]] [--keys LIST] [--screen]\n"
             "          [--joy INPUTS] [--joy-port N]\n"
             "          [--mouse] [--mouse-hold MS] [--dump FILE.ppm]\n"
-            "          [--term-test] [--discover] [--verbose] [--version]\n"
+            "          [--term-test] [--menu-screen] [--discover] [--verbose]\n"
+            "          [--version]\n"
             "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
             "auto-discover)\n"
             "  --dest    where the Ultimate should send the streams (default: auto;\n"
@@ -1789,6 +2020,9 @@ static void usage(const char *argv0)
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
             "  --term-test  print the telnet menu screen as text, then exit\n"
+            "  --menu-screen  print the open Ultimate menu (40x25, selected\n"
+            "            row marked >) as text, then exit; firmware 1.2.0+,\n"
+            "            open it with --do menu, drive it with --keys\n"
             "  --discover  scan the local subnets for Ultimates, then exit\n",
             argv0);
     fprintf(stderr, "keys in the viewer window (F10 shows this in-window):\n");
@@ -1863,6 +2097,8 @@ int main(int argc, char **argv)
             cfg.dump_path = argv[++i];
         else if (!strcmp(argv[i], "--term-test"))
             cfg.term_test = true;
+        else if (!strcmp(argv[i], "--menu-screen"))
+            cfg.menu_screen = true;
         else if (!strcmp(argv[i], "--discover"))
             cfg.discover = true;
         else if (!strcmp(argv[i], "--verbose"))
@@ -1926,7 +2162,8 @@ int main(int argc, char **argv)
     // the answer before doing their one thing); the windowed viewer opens
     // immediately and discovers in the background instead.
     static char auto_host[46];
-    bool headless = cfg.dump_path || cfg.term_test || cfg.do_action ||
+    bool headless = cfg.dump_path || cfg.term_test || cfg.menu_screen ||
+                    cfg.do_action ||
                     cfg.run_path || cfg.type_text || cfg.screen ||
                     cfg.joy_spec || cfg.keys;
     if (!cfg.host && !cfg.no_start && headless) {
@@ -1969,6 +2206,8 @@ int main(int argc, char **argv)
 
     if (cfg.term_test)
         return run_term_test(cfg.host);
+    if (cfg.menu_screen)
+        return print_menu_screen(cfg.host);
 
     if (cfg.dump_path)
         cfg.no_audio = true; // headless frame grab needs no sound
@@ -2133,6 +2372,13 @@ int main(int argc, char **argv)
     Uint64 tfd_last_try = 0;
     bool tfd_refused = false; // the last telnet connect was refused
     SDL_Texture *term_tex = NULL;
+    // REST menu view (F9 on firmware 1.2+): its own 40x25 texture
+    static struct rmenu rm;
+    bool rmenu_active = false; // the view is requested (opening or live)
+    bool rmenu_live = false;   // a screen arrived: the view is on display
+    unsigned rmenu_seq_shown = 0;
+    SDL_Texture *menu_tex = NULL;
+    Uint32 *menu_px = calloc(MENU_PX_W * MENU_PX_H, sizeof(Uint32));
     Uint32 *term_px = calloc(TERM_PX_W * TERM_PX_H, sizeof(Uint32));
 
     struct frame_buf *fb = calloc(1, sizeof *fb);
@@ -2216,6 +2462,7 @@ int main(int argc, char **argv)
         if (windowed) {
             SDL_Event ev;
             bool pad_event = false, joy_swap = false, mouse_event = false;
+            bool menu_toggle = false, menu_attach = false;
             while (SDL_PollEvent(&ev)) {
                 if (ev.type == SDL_EVENT_QUIT) {
                     atomic_store(&g_quit, true);
@@ -2246,10 +2493,27 @@ int main(int argc, char **argv)
                 } else if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
                            ev.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
                            ev.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
-                    pad_event = true;
-                    if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
-                        ev.gbutton.button == SDL_GAMEPAD_BUTTON_BACK)
-                        joy_swap = true;
+                    bool down = ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+                    bool button = ev.type != SDL_EVENT_GAMEPAD_AXIS_MOTION;
+                    if (down && ev.gbutton.button == SDL_GAMEPAD_BUTTON_START) {
+                        menu_toggle = true; // the pad's F9
+                    } else if (rmenu_active) {
+                        // in the menu the pad steers the menu, not a
+                        // joystick: d-pad = cursor keys, A = RETURN, B = back
+                        SDL_Keycode k = button ? pad_menu_key(
+                                                     ev.gbutton.button)
+                                               : SDLK_UNKNOWN;
+                        if (k != SDLK_UNKNOWN &&
+                            atomic_load(&g_minput) == 1) {
+                            minput_key(&mi, k, down);
+                            atomic_store(&rm.kick, true);
+                        }
+                    } else {
+                        pad_event = true;
+                        if (down &&
+                            ev.gbutton.button == SDL_GAMEPAD_BUTTON_BACK)
+                            joy_swap = true;
+                    }
                 } else if (ev.type == SDL_EVENT_MOUSE_MOTION && mj.enabled) {
                     mousejoy_motion(&mj, ev.motion.xrel, ev.motion.yrel);
                 } else if ((ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
@@ -2286,6 +2550,7 @@ int main(int argc, char **argv)
                     } else if (va == VA_MENU_BTN && !cfg.no_start &&
                                cfg.host) {
                         machine_ctl(cfg.host, "menu_button");
+                        menu_attach = true; // show it where that is possible
                     } else if (va == VA_JOY_PORT) {
                         joy_swap = true;
                     } else if (va == VA_MOUSE_JOY) {
@@ -2367,51 +2632,8 @@ int main(int argc, char **argv)
                             }
                         }
                         mouse_event = true;
-                    } else if (va == VA_MENU_VIEW && !cfg.no_start &&
-                               cfg.host) {
-                        term_present = true; // repaint whichever view we land in
-                        if (term_active) {
-                            term_active = false;
-                        } else {
-                            if (tfd == COMPAT_BAD_SOCK &&
-                                (tfd_last_try == 0 ||
-                                 SDL_GetTicks() - tfd_last_try > 3000)) {
-                                tfd_last_try = SDL_GetTicks();
-                                tfd = compat_tcp_connect(cfg.host, 23, 1);
-                                if (tfd != COMPAT_BAD_SOCK) {
-                                    term_init(trm);
-                                    SDL_Log("menu terminal connected "
-                                            "(port 23)");
-                                } else {
-                                    tfd_refused = compat_neterr_refused();
-                                    SDL_Log("menu terminal: connect %s",
-                                            tfd_refused ? "refused (telnet "
-                                                          "service off)"
-                                                        : "failed");
-                                }
-                            }
-                            // no connection, no menu view: a blank or stale
-                            // grid would pass for the machine's own screen
-                            if (tfd != COMPAT_BAD_SOCK) {
-                                term_active = true;
-                                mousejoy_clear(&mj);
-                                if (atomic_load(&g_minput) == 1)
-                                    minput_release_all(&mi); // no keys held
-                            } else {
-                                if (tfd_refused)
-                                    status_set(status,
-                                               "the Ultimate's telnet menu "
-                                               "service is off",
-                                               SERVICES_WHERE);
-                                else
-                                    status_set(status,
-                                               "cannot reach the Ultimate "
-                                               "menu (telnet, port 23)",
-                                               "is it powered on? is telnet "
-                                               "enabled?");
-                                notice_until = SDL_GetTicks() + 3000;
-                            }
-                        }
+                    } else if (va == VA_MENU_VIEW) {
+                        menu_toggle = true;
                     } else if (term_active) {
                         Uint8 seq[8];
                         int n = term_encode_key(ev.key.key, ev.key.mod, seq);
@@ -2424,6 +2646,8 @@ int main(int argc, char **argv)
                         if (atomic_load(&g_minput) == 1) {
                             if (!ev.key.repeat) // the matrix has no repeat
                                 minput_key(&mi, ev.key.key, true);
+                            if (rmenu_active)
+                                atomic_store(&rm.kick, true);
                         } else if (ev.key.key == SDLK_ESCAPE) {
                             keyb_stop(&kb); // Esc = RUN/STOP
                         } else {
@@ -2481,6 +2705,98 @@ int main(int argc, char **argv)
                     }
                 }
             }
+            // F9 / pad Start: the Ultimate menu view. On firmware with
+            // menu_screen it is the machine's real menu over REST; before
+            // that the telnet remote menu.
+            bool rmenu_ok = kb.enabled && atomic_load(&g_minput) == 1 &&
+                            atomic_load(&g_menu_rest) == 1;
+            if (menu_toggle && !cfg.no_start && cfg.host && !help_active) {
+                term_present = true; // repaint whichever view we land in
+                if (term_active) {
+                    term_active = false;
+                } else if (rmenu_active) {
+                    rmenu_cmd(&rm, cfg.host, RM_CLOSE);
+                    rmenu_active = rmenu_live = false;
+                    minput_release_all(&mi);
+                    pad_event = true; // the pad is a joystick again
+                    SDL_Log("menu view closed");
+                } else if (rmenu_ok) {
+                    minput_release_all(&mi); // no key held into the menu
+                    mousejoy_clear(&mj);
+                    rmenu_cmd(&rm, cfg.host, RM_OPEN);
+                    rmenu_active = true;
+                    rmenu_live = false;
+                } else {
+                    if (tfd == COMPAT_BAD_SOCK &&
+                        (tfd_last_try == 0 ||
+                         SDL_GetTicks() - tfd_last_try > 3000)) {
+                        tfd_last_try = SDL_GetTicks();
+                        tfd = compat_tcp_connect(cfg.host, 23, 1);
+                        if (tfd != COMPAT_BAD_SOCK) {
+                            term_init(trm);
+                            SDL_Log("menu terminal connected (port 23)");
+                        } else {
+                            tfd_refused = compat_neterr_refused();
+                            SDL_Log("menu terminal: connect %s",
+                                    tfd_refused ? "refused (telnet service "
+                                                  "off)"
+                                                : "failed");
+                        }
+                    }
+                    // no connection, no menu view: a blank or stale grid
+                    // would pass for the machine's own screen
+                    if (tfd != COMPAT_BAD_SOCK) {
+                        term_active = true;
+                        mousejoy_clear(&mj);
+                        if (atomic_load(&g_minput) == 1)
+                            minput_release_all(&mi); // no keys held
+                    } else {
+                        if (tfd_refused)
+                            status_set(status,
+                                       "the Ultimate's telnet menu service "
+                                       "is off", SERVICES_WHERE);
+                        else
+                            status_set(status,
+                                       "cannot reach the Ultimate menu "
+                                       "(telnet, port 23)",
+                                       "is it powered on? is telnet "
+                                       "enabled?");
+                        notice_until = SDL_GetTicks() + 3000;
+                    }
+                }
+            }
+            // Ctrl+M pressed the button: where the menu screen is
+            // readable, show the menu it opened (a press that closed one
+            // ends the view through RMS_GONE instead)
+            if (menu_attach && rmenu_ok && !rmenu_active && !term_active) {
+                minput_release_all(&mi);
+                mousejoy_clear(&mj);
+                rmenu_cmd(&rm, cfg.host, RM_ATTACH);
+                rmenu_active = true;
+                rmenu_live = false;
+            }
+            if (rmenu_active) {
+                int st = rmenu_state(&rm);
+                if (st == RMS_LIVE && !rmenu_live) {
+                    rmenu_live = true;
+                    term_present = true;
+                    SDL_Log("menu view: showing the Ultimate menu");
+                } else if (st == RMS_GONE || st == RMS_FAILED) {
+                    rmenu_active = rmenu_live = false;
+                    term_present = true;
+                    pad_event = true; // the pad is a joystick again
+                    minput_release_all(&mi); // a key may still be down
+                    if (st == RMS_FAILED) {
+                        status_set(status, "the Ultimate menu stopped "
+                                   "answering", "F9 tries again");
+                        notice_until = SDL_GetTicks() + 3000;
+                    }
+                    SDL_Log("menu view: %s", st == RMS_GONE
+                                ? "the menu closed on the machine"
+                                : "no answer from the Ultimate");
+                }
+            }
+
             // joystick lines, once per loop: the pad's current state merged
             // with any mouse pulse that started or ended this iteration
             bool joy_ok = kb.enabled && atomic_load(&g_minput) == 1;
@@ -2671,8 +2987,34 @@ int main(int argc, char **argv)
             }
         }
 
+        bool rmenu_show = rmenu_active && rmenu_live && !help_active;
+        if (windowed && rmenu_show &&
+            (term_present || atomic_load(&rm.seq) != rmenu_seq_shown)) {
+            if (!menu_tex) {
+                menu_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                             SDL_TEXTUREACCESS_STREAMING,
+                                             MENU_PX_W, MENU_PX_H);
+                SDL_SetTextureScaleMode(menu_tex, SDL_SCALEMODE_NEAREST);
+            }
+            SDL_LockMutex(rm.lock);
+            rmenu_seq_shown = atomic_load(&rm.seq);
+            menu_render(rm.screen, menu_px, MENU_PX_W);
+            SDL_UnlockMutex(rm.lock);
+            term_present = false;
+            SDL_UpdateTexture(menu_tex, NULL, menu_px,
+                              MENU_PX_W * (int)sizeof(Uint32));
+            // square pixels on a black screen, like the machine's output
+            SDL_SetRenderLogicalPresentation(ren, MENU_PX_W, MENU_PX_H,
+                                             SDL_LOGICAL_PRESENTATION_LETTERBOX);
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+            SDL_RenderClear(ren);
+            SDL_RenderTexture(ren, menu_tex, NULL, NULL);
+            SDL_RenderPresent(ren);
+        }
+
         struct term *view = help_active ? NULL
                             : term_active ? trm
+                            : rmenu_show ? NULL
                             : !got_any || stream_lost || notice_until
                                 ? status
                                 : NULL;
@@ -2734,7 +3076,7 @@ int main(int argc, char **argv)
                 SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
                 tex_h = fb->height;
             }
-            if (!term_active && !help_active) {
+            if (!term_active && !help_active && !rmenu_show) {
                 SDL_UpdateTexture(tex, NULL, fb->px, VIDEO_MAX_W * sizeof(Uint32));
                 SDL_SetRenderLogicalPresentation(
                     ren, fb->width, fb->height,
@@ -2758,6 +3100,8 @@ int main(int argc, char **argv)
         }
     }
 
+    if (rmenu_active) // the thread closes the menu on its way out
+        atomic_store(&rm.cmd, (rm.gen + 1) << 3 | RM_CLOSE);
     atomic_store(&g_quit, true);
     if (atomic_load(&g_minput) == 1 && mi.url[0])
         minput_release_all(&mi);
@@ -2784,6 +3128,14 @@ int main(int argc, char **argv)
         }
         SDL_WaitThread(ka, NULL);
     }
+    if (rm.thr) {
+        while (windowed && !atomic_load(&rm.done)) {
+            SDL_PumpEvents();
+            SDL_Delay(10);
+        }
+        SDL_WaitThread(rm.thr, NULL);
+        SDL_DestroyMutex(rm.lock);
+    }
     if (mi.curl)
         curl_easy_cleanup(mi.curl);
     curl_global_cleanup();
@@ -2791,6 +3143,9 @@ int main(int argc, char **argv)
     compat_close(tfd);
     if (term_tex)
         SDL_DestroyTexture(term_tex);
+    if (menu_tex)
+        SDL_DestroyTexture(menu_tex);
+    free(menu_px);
     if (help_tex)
         SDL_DestroyTexture(help_tex);
     free(term_px);

@@ -109,6 +109,56 @@ static int mk_packet(uint8_t *p, uint16_t frame, uint16_t line, bool last,
     return VIDEO_HDR_LEN + 768;
 }
 
+static void test_menu_screen(void)
+{
+    // a payload the way the firmware lays it out: characters, then colours
+    static uint8_t scr[MENU_BYTES];
+    memset(scr, ' ', MENU_COLS * MENU_ROWS);
+    memset(scr + MENU_COLS * MENU_ROWS, 0x0F, MENU_COLS * MENU_ROWS);
+    scr[0] = 0x01; // top-left corner, edge, top-right corner
+    memset(scr + 1, 0x02, MENU_COLS - 2);
+    scr[MENU_COLS - 1] = 0x03;
+    scr[MENU_COLS] = 0x04;
+    memcpy(scr + MENU_COLS + 2, "Disk File Browser", 17);
+    // row 2 is the selected one: bit 7 on characters and colours, white
+    const char *sel = "Run Disk";
+    for (int i = 0; i < MENU_COLS; i++) {
+        uint8_t c = i >= 2 && i < 10 ? (uint8_t)sel[i - 2] : ' ';
+        scr[2 * MENU_COLS + i] = c | 0x80;
+        scr[MENU_COLS * MENU_ROWS + 2 * MENU_COLS + i] = 0x81;
+    }
+    scr[3 * MENU_COLS] = 0x0B; // progress block
+    scr[3 * MENU_COLS + 1] = 0x13; // marker
+
+    char line[MENU_COLS + 1];
+    menu_row_text(scr, 0, line);
+    CHECK(line[0] == '+' && line[1] == '-' && line[MENU_COLS - 1] == '+');
+    CHECK(strlen(line) == MENU_COLS);
+    menu_row_text(scr, 1, line);
+    CHECK(line[0] == '|' && !strncmp(line + 2, "Disk File Browser", 17));
+    menu_row_text(scr, 2, line);
+    CHECK(!strncmp(line, "  Run Disk ", 11)); // bit 7 stripped, case kept
+    menu_row_text(scr, 3, line);
+    CHECK(line[0] == '#' && line[1] == '*');
+    CHECK(menu_row_selected(scr, 2) && !menu_row_selected(scr, 1));
+
+    static uint32_t px[MENU_PX_W * MENU_PX_H];
+    menu_render(scr, px, MENU_PX_W);
+    const uint32_t black = 0xFF000000, white = 0xFFFFFFFF, grey = 0xFFB2B2B2;
+    // the corner's arms: nothing top-left, the stroke runs right and down
+    CHECK(px[0] == black);
+    CHECK(px[3 * MENU_PX_W + 7] == grey && px[7 * MENU_PX_W + 3] == grey);
+    CHECK(px[3 * MENU_PX_W + 0] == black && px[0 * MENU_PX_W + 3] == black);
+    // edge joins the corner: the stroke is continuous across cells
+    CHECK(px[3 * MENU_PX_W + 8] == grey && px[4 * MENU_PX_W + 15] == grey);
+    // selected row: reverse video, white background on a blank cell
+    CHECK(px[(2 * 8 + 1) * MENU_PX_W + 0] == white);
+    // unselected blank cell stays black
+    CHECK(px[(5 * 8 + 1) * MENU_PX_W + 0] == black);
+    // progress block fills the cell below its first pixel row
+    CHECK(px[(3 * 8 + 4) * MENU_PX_W + 4] == grey);
+}
+
 static void test_video_assembly(void)
 {
     static struct frame_buf fb;
@@ -249,6 +299,12 @@ static void test_joystick(void)
     CHECK(mouse_joy_dir(0, -3, 2) == JOY_UP); // screen y grows downwards
     CHECK(mouse_joy_dir(0, 3, 2) == JOY_DOWN);
     CHECK(mouse_joy_dir(3, -3, 2) == (JOY_RIGHT | JOY_UP));
+
+    // in the menu view the pad steers the menu instead
+    CHECK(pad_menu_key(SDL_GAMEPAD_BUTTON_DPAD_DOWN) == SDLK_DOWN);
+    CHECK(pad_menu_key(SDL_GAMEPAD_BUTTON_SOUTH) == SDLK_RETURN);
+    CHECK(pad_menu_key(SDL_GAMEPAD_BUTTON_EAST) == SDLK_LEFT); // back
+    CHECK(pad_menu_key(SDL_GAMEPAD_BUTTON_START) == SDLK_UNKNOWN);
 
     CHECK(joy_parse("fire") == JOY_FIRE);
     CHECK(joy_parse("up,left,fire2") == (JOY_UP | JOY_LEFT | JOY_FIRE2));
@@ -405,6 +461,7 @@ int main(void)
     test_term_basics();
     test_term_geometry();
     test_term_keys();
+    test_menu_screen();
     test_video_assembly();
     test_petscii();
     test_matrix_keys();

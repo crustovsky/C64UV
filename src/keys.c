@@ -205,6 +205,19 @@ unsigned pad_button_joy(SDL_GamepadButton b)
     }
 }
 
+SDL_Keycode pad_menu_key(SDL_GamepadButton b)
+{
+    switch (b) {
+    case SDL_GAMEPAD_BUTTON_DPAD_UP: return SDLK_UP;
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return SDLK_DOWN;
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return SDLK_LEFT;
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return SDLK_RIGHT;
+    case SDL_GAMEPAD_BUTTON_SOUTH: return SDLK_RETURN;
+    case SDL_GAMEPAD_BUTTON_EAST: return SDLK_LEFT;
+    default: return SDLK_UNKNOWN;
+    }
+}
+
 unsigned pad_stick_joy(int x, int y)
 {
     const int dead = 16000; // of 32767: a digital stick wants a firm push
@@ -292,7 +305,7 @@ const struct viewer_binding viewer_bindings[] = {
      .action = VA_JOY_PORT, .gap = true},
     {.label = "file drop", .desc = "run .prg/.crt/.sid/.d64 on the C64",
      .action = VA_INFO},
-    {.key = SDLK_F9, .label = "F9", .desc = "toggle the Ultimate menu view",
+    {.key = SDLK_F9, .label = "F9", .desc = "Ultimate menu view (pad: Start)",
      .action = VA_MENU_VIEW},
     {.key = SDLK_F10, .label = "F10", .desc = "show/hide this help",
      .action = VA_HELP, .gap = true},
