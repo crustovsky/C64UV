@@ -31,7 +31,11 @@ struct config {
     const char *joy_spec;   // one-shot: tap these joystick inputs, then exit
     int joy_port;           // control port the gamepad drives (1 or 2)
     bool joy_port_set;      // --joy-port was given explicitly
-    bool mouse;             // start with the mouse driving the joystick
+    bool mouse;             // start with the mouse grabbed
+    bool mouse_joy;         // the mouse steers the joystick even where the
+                            // firmware has real mouse events
+    float mouse_speed;      // 1351 counts per pixel of mouse travel
+    const char *mouse_send; // one-shot: send these mouse events, then exit
     int mouse_hold;         // ms a direction stays held after motion stops
     bool screen;            // one-shot: print the C64 text screen, then exit
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
@@ -64,6 +68,10 @@ static atomic_int g_minput = -1;
 // port 2, and the other way round (verified on 1.2.1). The viewer talks in
 // C64 port numbers everywhere and converts in joy_api_port().
 static atomic_bool g_joy_swapped;
+// `kind: mouse` events in machine:input (1.2.1 has them, the first builds
+// with the input API do not): -1 unknown, 0 no, 1 yes. Read off the same
+// probe answer, which lists a "mouse" object when the firmware has one.
+static atomic_int g_mouse = -1;
 // machine:menu_screen capability (probed with machine:input): -1 unknown,
 // 0 no (the F9 view uses telnet), 1 yes (the F9 view is the real menu).
 static atomic_int g_menu_rest = -1;
@@ -124,13 +132,11 @@ struct rest_ctx {
 
 static size_t curl_sink(char *data, size_t size, size_t nmemb, void *userp)
 {
-    char *buf = userp; // 512-byte response buffer, keeps first chunk only
-    size_t n = size * nmemb;
-    if (buf[0] == '\0') {
-        size_t cap = 511 < n ? 511 : n;
-        memcpy(buf, data, cap);
-        buf[cap] = '\0';
-    }
+    char *buf = userp; // 512-byte response buffer: the head of the body
+    size_t n = size * nmemb, have = strlen(buf);
+    size_t take = 511 - have < n ? 511 - have : n;
+    memcpy(buf + have, data, take);
+    buf[have + take] = '\0';
     return n;
 }
 
@@ -254,6 +260,11 @@ static int keepalive_thread(void *arg)
             if (atomic_load(&g_quit))
                 break;
             if (code == 200) {
+                bool mouse = strstr(resp, "\"mouse\"") != NULL;
+                atomic_store(&g_mouse, mouse);
+                SDL_Log("machine:input mouse events %s", mouse
+                            ? "available: Ctrl+G is a 1351 mouse"
+                            : "not supported: Ctrl+G steers the joystick");
                 // before g_minput flips: no joystick event may go out with
                 // the port mapping still unknown
                 joy_swapper_read(curl, rc->host, &g_quit);
@@ -1540,16 +1551,200 @@ static void minput_release_all(struct minput *mi)
     minput_post(mi, "{\"events\":[{\"kind\":\"release_all\"}]}");
 }
 
+// ------------------------------------------------------ mouse -> 1351
+//
+// Firmware with `kind: mouse` events (1.2.1) treats them like the reports
+// of a USB mouse: a 1351 on control port 1, sent to the C64 at least 20 ms
+// apart from a 1024-report queue (429 when a batch does not fit). The
+// event loop only adds up motion and queues button changes; a thread turns
+// them into POSTs, one move of up to 127 counts per axis at a time, so a
+// slow answer delays the pointer but never the window. Motion beyond one
+// report's worth that piles up while a request is in flight is dropped:
+// catching up later would make the pointer run on after the hand stopped.
+
+struct mfwd {
+    char url[256];
+    SDL_Mutex *lock;  // guards ax, ay, q, qn
+    SDL_Thread *thr;
+    atomic_bool done;   // the thread has left its loop
+    atomic_bool failed; // the machine stopped answering: let go of the grab
+    float ax, ay;       // motion not sent yet, in counts
+    struct mouse_btn_ev q[16];
+    int qn;
+    unsigned held;      // event-loop side: buttons we pressed
+};
+
+static int mfwd_thread(void *arg)
+{
+    struct mfwd *mf = arg;
+    CURL *curl = curl_easy_init();
+    char body[512], resp[512];
+    int fails = 0;
+    bool told = false;
+    while (!atomic_load(&g_quit)) {
+        struct mouse_btn_ev ev[16];
+        SDL_LockMutex(mf->lock);
+        int dx = (int)mf->ax, dy = (int)mf->ay; // the fraction stays
+        dx = dx < -127 ? -127 : dx > 127 ? 127 : dx;
+        dy = dy < -127 ? -127 : dy > 127 ? 127 : dy;
+        mf->ax -= (float)dx;
+        mf->ay -= (float)dy;
+        if (mf->ax > 127 || mf->ax < -127)
+            mf->ax = 0;
+        if (mf->ay > 127 || mf->ay < -127)
+            mf->ay = 0;
+        int n = mf->qn;
+        memcpy(ev, mf->q, sizeof ev);
+        mf->qn = 0;
+        SDL_UnlockMutex(mf->lock);
+        if (!mouse_event_json(dx, dy, ev, n, body, sizeof body)) {
+            SDL_Delay(4);
+            continue;
+        }
+        long code = rest_req(curl, "POST", mf->url, body, (long)strlen(body),
+                             "application/json", 1000, resp, &g_quit);
+        int pending = 0;
+        if (code == -1) {
+            if (++fails >= 5 && !atomic_load(&g_quit)) {
+                fails = 0;
+                atomic_store(&mf->failed, true);
+            }
+        } else {
+            fails = 0;
+            if (code != 200 && !told) {
+                told = true; // 429 = its queue is full; others say why
+                SDL_Log("mouse: machine:input HTTP %ld: %s", code, resp);
+            }
+            const char *pp = strstr(resp, "\"pending\":");
+            if (pp)
+                pending = atoi(pp + 10);
+        }
+        // one report leaves the firmware every 20 ms: do not feed it
+        // faster, and back off while it works through a backlog
+        SDL_Delay(20 + 20 * (Uint32)(pending > 10 ? 10 : pending));
+    }
+    curl_easy_cleanup(curl);
+    atomic_store(&mf->done, true);
+    return 0;
+}
+
+static void mfwd_start(struct mfwd *mf, const char *host)
+{
+    if (mf->thr)
+        return;
+    snprintf(mf->url, sizeof mf->url, "http://%s/v1/machine:input", host);
+    mf->lock = SDL_CreateMutex();
+    mf->thr = SDL_CreateThread(mfwd_thread, "mouse", mf);
+}
+
+static void mfwd_motion(struct mfwd *mf, float dx, float dy)
+{
+    SDL_LockMutex(mf->lock);
+    mf->ax += dx;
+    mf->ay += dy;
+    SDL_UnlockMutex(mf->lock);
+}
+
+static void mfwd_button(struct mfwd *mf, unsigned bit, bool down)
+{
+    if (!bit || down == ((mf->held & bit) != 0))
+        return;
+    mf->held ^= bit;
+    SDL_LockMutex(mf->lock);
+    if (mf->qn < 16)
+        mf->q[mf->qn++] = (struct mouse_btn_ev){bit, down};
+    SDL_UnlockMutex(mf->lock);
+}
+
+// Lets go of every button we hold and forgets unsent motion. A no-op
+// before the first mouse event.
+static void mfwd_release(struct mfwd *mf)
+{
+    if (!mf->thr)
+        return;
+    SDL_LockMutex(mf->lock);
+    mf->ax = mf->ay = 0;
+    mf->qn = 0;
+    if (mf->held)
+        mf->q[mf->qn++] = (struct mouse_btn_ev){mf->held, false};
+    mf->held = 0;
+    SDL_UnlockMutex(mf->lock);
+}
+
+static unsigned mouse_button_bit(Uint8 button)
+{
+    switch (button) {
+    case SDL_BUTTON_LEFT: return MOUSE_LEFT;
+    case SDL_BUTTON_RIGHT: return MOUSE_RIGHT;
+    case SDL_BUTTON_MIDDLE: return MOUSE_MIDDLE;
+    default: return 0;
+    }
+}
+
+// --mouse-send LIST: the headless twin. Items split by spaces or commas
+// (see mouse_send_json), all checked before the first one is sent; then
+// waits for the firmware to have sent every report, so a following
+// --screen or screenshot sees the result. Returns the exit status.
+static int mouse_send(const char *host, const char *list)
+{
+    char body[2048], resp[512] = "";
+    char *copy = SDL_strdup(list), *save = NULL;
+    int count = 0;
+    for (char *item = SDL_strtok_r(copy, ", ", &save); item;
+         item = SDL_strtok_r(NULL, ", ", &save), count++)
+        if (!mouse_send_json(item, body, sizeof body)) {
+            fprintf(stderr, "--mouse-send: bad item '%s' (move:DX:DY, "
+                    "left, right, middle, left:down, left:up, wheel:N)\n",
+                    item);
+            SDL_free(copy);
+            return 2;
+        }
+    SDL_free(copy);
+    if (count == 0) {
+        fprintf(stderr, "--mouse-send: nothing to send\n");
+        return 2;
+    }
+    char url[256];
+    snprintf(url, sizeof url, "http://%s/v1/machine:input", host);
+    CURL *curl = curl_easy_init();
+    long code = 200;
+    copy = SDL_strdup(list);
+    for (char *item = SDL_strtok_r(copy, ", ", &save); item && code == 200;
+         item = SDL_strtok_r(NULL, ", ", &save)) {
+        mouse_send_json(item, body, sizeof body);
+        code = rest_req(curl, "POST", url, body, (long)strlen(body),
+                        "application/json", 3000, resp, NULL);
+        SDL_Delay(60); // a tap holds for 40 ms on the firmware side
+    }
+    SDL_free(copy);
+    for (int t = 0; code == 200 && t < 100; t++) { // up to 5 s
+        const char *pp = strstr(resp, "\"pending\":");
+        if (!pp || atoi(pp + 10) == 0)
+            break;
+        SDL_Delay(50);
+        code = rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp, NULL);
+    }
+    curl_easy_cleanup(curl);
+    if (code == 200)
+        SDL_Log("%d mouse event%s OK", count, count == 1 ? "" : "s");
+    else if (code == -1)
+        SDL_Log("machine:input: %s", rest_no_answer());
+    else
+        SDL_Log("machine:input HTTP %ld: %s (mouse events need firmware "
+                "1.2.1 or newer)", code, resp);
+    return code == 200 ? 0 : 1;
+}
+
 // ------------------------------------------------------- mouse -> joystick
 //
-// 3.15a's machine:input takes keyboard, joystick and release_all events
-// only; there is no mouse event to forward, and the 1351's POT registers
-// are read-only from the CPU side. The remote pointer path is therefore
-// joystick levels: the GEOS JOYSTICK driver (the built-in default) moves the
-// pointer at a constant rate while a direction line is held. A direction is
-// held while the mouse moves and released shortly after it stops, so one
-// gesture costs two POSTs instead of one per pixel. COMM 1351 software sees
-// nothing.
+// The fallback for firmware whose machine:input has no mouse event (the
+// first builds with the input API, e.g. 3.15a), and what --mouse-joy
+// selects on purpose: the 1351's POT registers cannot be written from
+// outside, so the pointer is steered with joystick levels. The GEOS
+// JOYSTICK driver (its built-in default) moves the pointer at a constant
+// rate while a direction line is held. A direction is held while the mouse
+// moves and released shortly after it stops, so one gesture costs two
+// POSTs instead of one per pixel. COMM 1351 software sees nothing.
 
 #define MOUSE_DEADZONE 3.0f
 #define MOUSE_TRAVEL_MAX 24.0f // motion since the last tick
@@ -1971,6 +2166,84 @@ static void status_idle(struct term *t, const struct config *cfg,
     }
 }
 
+// ---------------------------------------------------------- test hook
+//
+// C64U_TEST_EVENTS scripts input for the windowed viewer, so the
+// integration suite can press keys and move the mouse under SDL's dummy
+// video driver (which has neither). Steps, split by spaces:
+//   ready          wait for the machine:input probe to answer
+//   wait=MS        pause
+//   key=ctrl+g     a key press and release (SDL key names: f9, down, g...)
+//   move=DX,DY     relative mouse motion
+//   button=left:1  mouse button down (1) or up (0); left, right, middle
+
+struct test_events {
+    char *script, *save, *step;
+    Uint64 at;
+};
+
+static void test_events_pump(struct test_events *te, SDL_Window *win)
+{
+    if (!te->script || SDL_GetTicks() < te->at)
+        return;
+    if (!te->step) {
+        te->step = SDL_strtok_r(te->save ? NULL : te->script, " ", &te->save);
+        if (!te->step) {
+            te->script = NULL; // done
+            return;
+        }
+    }
+    const char *st = te->step;
+    SDL_Event ev;
+    SDL_zero(ev);
+    if (!strcmp(st, "ready")) {
+        if (atomic_load(&g_minput) < 0)
+            return; // ask again on the next loop
+    } else if (!strncmp(st, "wait=", 5)) {
+        te->at = SDL_GetTicks() + (Uint64)atoi(st + 5);
+    } else if (!strncmp(st, "key=", 4)) {
+        const char *name = st + 4;
+        SDL_Keymod mod = SDL_KMOD_NONE;
+        for (;;) {
+            if (!strncmp(name, "ctrl+", 5)) {
+                mod |= SDL_KMOD_LCTRL;
+                name += 5;
+            } else if (!strncmp(name, "shift+", 6)) {
+                mod |= SDL_KMOD_LSHIFT;
+                name += 6;
+            } else
+                break;
+        }
+        ev.key.key = SDL_GetKeyFromName(name);
+        ev.key.mod = mod;
+        ev.key.windowID = SDL_GetWindowID(win);
+        ev.type = SDL_EVENT_KEY_DOWN;
+        ev.key.down = true;
+        SDL_PushEvent(&ev);
+        ev.type = SDL_EVENT_KEY_UP;
+        ev.key.down = false;
+        SDL_PushEvent(&ev);
+    } else if (!strncmp(st, "move=", 5)) {
+        ev.type = SDL_EVENT_MOUSE_MOTION;
+        ev.motion.windowID = SDL_GetWindowID(win);
+        ev.motion.xrel = (float)atof(st + 5);
+        const char *comma = strchr(st, ',');
+        ev.motion.yrel = comma ? (float)atof(comma + 1) : 0;
+        SDL_PushEvent(&ev);
+    } else if (!strncmp(st, "button=", 7)) {
+        bool down = strstr(st, ":1") != NULL;
+        ev.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN
+                       : SDL_EVENT_MOUSE_BUTTON_UP;
+        ev.button.windowID = SDL_GetWindowID(win);
+        ev.button.down = down;
+        ev.button.button = !strncmp(st + 7, "right", 5) ? SDL_BUTTON_RIGHT
+                           : !strncmp(st + 7, "middle", 6) ? SDL_BUTTON_MIDDLE
+                           : SDL_BUTTON_LEFT;
+        SDL_PushEvent(&ev);
+    }
+    te->step = NULL;
+}
+
 // ---------------------------------------------------------------- main
 
 static void usage(const char *argv0)
@@ -1981,7 +2254,8 @@ static void usage(const char *argv0)
             "          [--password PW] [--do ACTION] [--run FILE] [--store DIR]\n"
             "          [--type TEXT [--matrix]] [--keys LIST] [--screen]\n"
             "          [--joy INPUTS] [--joy-port N]\n"
-            "          [--mouse] [--mouse-hold MS] [--dump FILE.ppm]\n"
+            "          [--mouse] [--mouse-joy] [--mouse-speed F] [--mouse-hold MS]\n"
+            "          [--mouse-send LIST] [--dump FILE.ppm]\n"
             "          [--term-test] [--menu-screen] [--discover] [--verbose]\n"
             "          [--version]\n"
             "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
@@ -2012,11 +2286,16 @@ static void usage(const char *argv0)
             "            right,fire,fire2,fire3 (e.g. --joy 1:left,fire)\n"
             "  --joy-port  control port the gamepad drives, 1 or 2 (default 2;\n"
             "            Ctrl+J or the pad's Back button swaps it)\n"
-            "  --mouse   start with the mouse driving the C64 joystick\n"
-            "            (Ctrl+G toggles); GEOS needs its JOYSTICK driver,\n"
-            "            not COMM 1351\n"
-            "  --mouse-hold  ms the joystick stays held after the mouse stops\n"
-            "            (default 50; higher bridges sparse mouse events)\n"
+            "  --mouse   start with the mouse grabbed (Ctrl+G toggles): a 1351\n"
+            "            mouse in port 1 on firmware 1.2.1+, else it steers\n"
+            "            the joystick (for GEOS's JOYSTICK driver)\n"
+            "  --mouse-speed  1351 counts per pixel of mouse travel (default 1)\n"
+            "  --mouse-joy  steer the joystick with the mouse on any firmware\n"
+            "  --mouse-hold  joystick mode: ms a direction stays held after\n"
+            "            the mouse stops (default 50)\n"
+            "  --mouse-send  send 1351 mouse events, then exit: move:DX:DY,\n"
+            "            left, right, middle, left:down, left:up, wheel:N\n"
+            "            (e.g. --mouse-send \"move:40:-10 left\")\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
             "  --term-test  print the telnet menu screen as text, then exit\n"
@@ -2037,7 +2316,8 @@ int main(int argc, char **argv)
                          .listen_port = 11000,
                          .scale = 2,
                          .joy_port = 2, // most games read port 2
-                         .mouse_hold = 50};
+                         .mouse_hold = 50,
+                         .mouse_speed = 1.0f};
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--host") && i + 1 < argc)
             cfg.host = argv[++i];
@@ -2084,6 +2364,17 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--mouse"))
             cfg.mouse = true;
+        else if (!strcmp(argv[i], "--mouse-joy"))
+            cfg.mouse_joy = true;
+        else if (!strcmp(argv[i], "--mouse-send") && i + 1 < argc)
+            cfg.mouse_send = argv[++i];
+        else if (!strcmp(argv[i], "--mouse-speed") && i + 1 < argc) {
+            cfg.mouse_speed = (float)atof(argv[++i]);
+            if (!(cfg.mouse_speed >= 0.1f && cfg.mouse_speed <= 10.0f)) {
+                fprintf(stderr, "--mouse-speed takes a factor, 0.1-10\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--mouse-hold") && i + 1 < argc) {
             char *end = NULL;
             long ms = strtol(argv[++i], &end, 10);
@@ -2165,7 +2456,7 @@ int main(int argc, char **argv)
     bool headless = cfg.dump_path || cfg.term_test || cfg.menu_screen ||
                     cfg.do_action ||
                     cfg.run_path || cfg.type_text || cfg.screen ||
-                    cfg.joy_spec || cfg.keys;
+                    cfg.joy_spec || cfg.keys || cfg.mouse_send;
     if (!cfg.host && !cfg.no_start && headless) {
         struct discovered found[DISCOVER_MAX];
         fprintf(stderr, "no --host given, discovering...\n");
@@ -2190,6 +2481,11 @@ int main(int argc, char **argv)
     if (cfg.joy_spec)
         return joy_tap(cfg.host, cfg.joy_spec, cfg.joy_port) ? 0 : 1;
 
+    if (cfg.mouse_send) {
+        int rc = mouse_send(cfg.host, cfg.mouse_send);
+        if (rc || !(cfg.keys || cfg.type_text || cfg.screen))
+            return rc;
+    }
     if (cfg.keys) {
         int rc = press_keys(cfg.host, cfg.keys);
         if (rc || !(cfg.type_text || cfg.screen))
@@ -2310,17 +2606,19 @@ int main(int argc, char **argv)
         }
     }
 
-    // GEOS's built-in JOYSTICK driver reads control port 1 (JS1); the
-    // gamepad default of port 2 is for games. --mouse without an explicit
-    // --joy-port therefore starts on 1.
-    if (cfg.mouse && !cfg.joy_port_set)
-        cfg.joy_port = 1;
-
     struct keyb kb = {.fd = COMPAT_BAD_SOCK, .host = cfg.host};
     struct minput mi = {.joy_port = cfg.joy_port};
     struct mousejoy mj = {.hold_ms = cfg.mouse_hold};
+    static struct mfwd mf;
     bool mouse_desired = cfg.mouse; // grab again when the window regains focus
-    bool mouse_port_done = cfg.mouse; // first grab may switch to port 1
+    // Joystick mode only: GEOS's built-in JOYSTICK driver reads control
+    // port 1 (JS1) while the gamepad default of port 2 is for games, so the
+    // first grab in that mode moves the joystick to port 1, unless
+    // --joy-port chose one. Ctrl+J after that is respected.
+    bool mouse_port_done = cfg.joy_port_set;
+    struct test_events tev = {0};
+    if (getenv("C64U_TEST_EVENTS"))
+        tev.script = SDL_strdup(getenv("C64U_TEST_EVENTS"));
     // Gamepads -> joysticks: the first pad that shows up drives
     // mi.joy_port, a second one the other port (two players). A pad keeps
     // its slot until it leaves; the other one is not moved when it does.
@@ -2463,6 +2761,15 @@ int main(int argc, char **argv)
             SDL_Event ev;
             bool pad_event = false, joy_swap = false, mouse_event = false;
             bool menu_toggle = false, menu_attach = false;
+            bool mouse_toggle = false;
+            // the grabbed mouse belongs to the C64 only while its screen
+            // is what the window shows
+            bool mouse_1351 = !cfg.mouse_joy && atomic_load(&g_mouse) == 1;
+            bool mouse_live = mj.enabled && kb.enabled &&
+                              atomic_load(&g_minput) == 1 && !term_active &&
+                              !rmenu_active && !help_active;
+            if (windowed)
+                test_events_pump(&tev, win);
             while (SDL_PollEvent(&ev)) {
                 if (ev.type == SDL_EVENT_QUIT) {
                     atomic_store(&g_quit, true);
@@ -2514,13 +2821,22 @@ int main(int argc, char **argv)
                             ev.gbutton.button == SDL_GAMEPAD_BUTTON_BACK)
                             joy_swap = true;
                     }
-                } else if (ev.type == SDL_EVENT_MOUSE_MOTION && mj.enabled) {
-                    mousejoy_motion(&mj, ev.motion.xrel, ev.motion.yrel);
-                } else if ((ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
-                            ev.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
-                           mj.enabled) {
+                } else if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+                    if (mouse_live && mouse_1351) {
+                        mfwd_start(&mf, cfg.host);
+                        mfwd_motion(&mf, ev.motion.xrel * cfg.mouse_speed,
+                                    ev.motion.yrel * cfg.mouse_speed);
+                    } else if (mouse_live) {
+                        mousejoy_motion(&mj, ev.motion.xrel, ev.motion.yrel);
+                    }
+                } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                           ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
                     unsigned bit = mouse_button_joy(ev.button.button);
-                    if (bit) {
+                    if (mouse_live && mouse_1351) {
+                        mfwd_start(&mf, cfg.host);
+                        mfwd_button(&mf, mouse_button_bit(ev.button.button),
+                                    ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+                    } else if (mouse_live && bit) {
                         if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
                             mj.btn |= bit;
                         else
@@ -2534,6 +2850,9 @@ int main(int argc, char **argv)
                         atomic_store(&g_quit, true);
                     } else if (va == VA_HELP) {
                         help_active = !help_active;
+                        mousejoy_clear(&mj); // the overlay takes the mouse
+                        mfwd_release(&mf);
+                        mouse_event = true;
                         term_present = true;
                     } else if (help_active) {
                         if (ev.key.key == SDLK_ESCAPE) {
@@ -2553,85 +2872,8 @@ int main(int argc, char **argv)
                         menu_attach = true; // show it where that is possible
                     } else if (va == VA_JOY_PORT) {
                         joy_swap = true;
-                    } else if (va == VA_MOUSE_JOY) {
-                        if (mouse_desired) {
-                            mouse_desired = false;
-                            mousejoy_set(&mj, win, false);
-                            SDL_Log("mouse joystick off");
-                            status_set(status, "mouse released", NULL);
-                            notice_until = SDL_GetTicks() + 2000;
-                        } else if (atomic_load(&g_minput) == 0) {
-                            bool was_up = atomic_load(&g_minput_up);
-                            SDL_Log("mouse joystick ignored: machine:input "
-                                    "%s", was_up ? "stopped responding"
-                                                 : "not available");
-                            status_set(status,
-                                       was_up
-                                           ? "machine:input stopped "
-                                             "responding"
-                                           : "mouse joystick needs firmware "
-                                             "1.2.0 or newer",
-                                       was_up ? "check the REST/network "
-                                                "connection"
-                                              : "this Ultimate has no "
-                                                "machine:input");
-                            notice_until = SDL_GetTicks() + 3000;
-                        } else if (!kb.enabled) {
-                            status_set(status, "not connected yet",
-                                       "waiting for the Ultimate");
-                            notice_until = SDL_GetTicks() + 2000;
-                        } else {
-                            mouse_desired = true;
-                            if (!mouse_port_done) {
-                                mouse_port_done = true;
-                                if (mi.joy_port != 1) {
-                                    if (kb.enabled &&
-                                        atomic_load(&g_minput) == 1) {
-                                        minput_joy(&mi, 1, 0);
-                                        minput_joy(&mi, 2, 0);
-                                    }
-                                    mi.joy_port = 1;
-                                    SDL_Log("mouse joystick: using port 1 "
-                                            "(GEOS's JS1)");
-                                }
-                            }
-                            if (mousejoy_set(&mj, win, true)) {
-                                SDL_Log("mouse joystick on (port %d, "
-                                        "hold %d ms)",
-                                        mi.joy_port, mj.hold_ms);
-                                if (atomic_load(&g_minput) == 1) {
-                                    status_set(status,
-                                               "mouse drives the C64 "
-                                               "joystick",
-                                               mi.joy_port == 1
-                                                   ? "GEOS needs its JOYSTICK "
-                                                     "driver"
-                                                   : "GEOS reads port 1; "
-                                                     "Ctrl+J to swap");
-                                    if (mi.joy_port != 1)
-                                        SDL_Log("mouse joystick: GEOS's "
-                                                "JOYSTICK driver reads port "
-                                                "1; Ctrl+J swaps ports");
-                                } else {
-                                    SDL_Log("mouse joystick: machine:input "
-                                            "not confirmed; no events are "
-                                            "sent");
-                                    status_set(status,
-                                               "mouse grabbed, but "
-                                               "machine:input is silent",
-                                               "no events until the REST API "
-                                               "answers");
-                                }
-                                notice_until = SDL_GetTicks() + 3000;
-                            } else {
-                                // no focus yet, or the compositor refused
-                                // the grab: the focus-gained handler retries
-                                status_set(status, "could not grab the mouse",
-                                           "click the window and press Ctrl+G");
-                                notice_until = SDL_GetTicks() + 3000;
-                            }
-                        }
-                        mouse_event = true;
+                    } else if (va == VA_MOUSE) {
+                        mouse_toggle = true;
                     } else if (va == VA_MENU_VIEW) {
                         menu_toggle = true;
                     } else if (term_active) {
@@ -2668,6 +2910,7 @@ int main(int argc, char **argv)
                         mousejoy_set(&mj, win, false); // release the pointer
                     else
                         mousejoy_clear(&mj);
+                    mfwd_release(&mf);
                     if (atomic_load(&g_minput) == 1)
                         minput_release_all(&mi);
                 } else if (ev.type == SDL_EVENT_WINDOW_RESIZED ||
@@ -2705,6 +2948,76 @@ int main(int argc, char **argv)
                     }
                 }
             }
+            // Ctrl+G: grab or release the pointer. What the grabbed mouse
+            // is depends on the firmware: a 1351 where machine:input takes
+            // mouse events, else (or with --mouse-joy) the joystick.
+            if (atomic_exchange(&mf.failed, false) && mouse_desired) {
+                mouse_desired = false;
+                mousejoy_set(&mj, win, false);
+                mfwd_release(&mf);
+                status_set(status, "mouse released: the Ultimate stopped "
+                           "answering", "Ctrl+G grabs it again");
+                notice_until = SDL_GetTicks() + 3000;
+                SDL_Log("mouse: no answer from the Ultimate, released");
+            }
+            if (mouse_toggle && windowed) {
+                int cap = atomic_load(&g_minput);
+                if (mouse_desired) {
+                    mouse_desired = false;
+                    mousejoy_set(&mj, win, false);
+                    mfwd_release(&mf);
+                    SDL_Log("mouse released");
+                    status_set(status, "mouse released", NULL);
+                    notice_until = SDL_GetTicks() + 1500;
+                } else if (!kb.enabled || cap < 0) {
+                    status_set(status, "not connected yet",
+                               "waiting for the Ultimate");
+                    notice_until = SDL_GetTicks() + 2000;
+                } else if (cap == 0) {
+                    bool was_up = atomic_load(&g_minput_up);
+                    SDL_Log("mouse ignored: machine:input %s",
+                            was_up ? "stopped responding" : "not available");
+                    status_set(status,
+                               was_up ? "machine:input stopped responding"
+                                      : "the mouse needs firmware 1.2.0 or "
+                                        "newer",
+                               was_up ? "check the network connection"
+                                      : "this Ultimate has no machine:input");
+                    notice_until = SDL_GetTicks() + 3000;
+                } else {
+                    mouse_desired = true; // a failed grab is retried when
+                                          // the window gains focus
+                    if (!mouse_1351 && !mouse_port_done) {
+                        mouse_port_done = true;
+                        if (mi.joy_port != 1) {
+                            minput_joy(&mi, 1, 0);
+                            minput_joy(&mi, 2, 0);
+                            mi.joy_port = 1;
+                            pad_event = true;
+                        }
+                    }
+                    if (!mousejoy_set(&mj, win, true)) {
+                        status_set(status, "could not grab the mouse",
+                                   "click the window and press Ctrl+G");
+                    } else if (mouse_1351) {
+                        SDL_Log("mouse grabbed: 1351 mouse in port 1");
+                        status_set(status, "mouse grabbed: a 1351 mouse in "
+                                   "port 1", "Ctrl+G releases it");
+                    } else {
+                        char l1[TERM_COLS + 1];
+                        snprintf(l1, sizeof l1, "mouse grabbed: it steers "
+                                 "the joystick in port %d", mi.joy_port);
+                        SDL_Log("mouse grabbed: joystick on port %d (hold "
+                                "%d ms)", mi.joy_port, mj.hold_ms);
+                        status_set(status, l1,
+                                   "Ctrl+G releases it, Ctrl+J swaps the "
+                                   "port");
+                    }
+                    notice_until = SDL_GetTicks() + 2000;
+                }
+                mouse_event = true;
+            }
+
             // F9 / pad Start: the Ultimate menu view. On firmware with
             // menu_screen it is the machine's real menu over REST; before
             // that the telnet remote menu.
@@ -2723,6 +3036,7 @@ int main(int argc, char **argv)
                 } else if (rmenu_ok) {
                     minput_release_all(&mi); // no key held into the menu
                     mousejoy_clear(&mj);
+                    mfwd_release(&mf);
                     rmenu_cmd(&rm, cfg.host, RM_OPEN);
                     rmenu_active = true;
                     rmenu_live = false;
@@ -2748,6 +3062,7 @@ int main(int argc, char **argv)
                     if (tfd != COMPAT_BAD_SOCK) {
                         term_active = true;
                         mousejoy_clear(&mj);
+                        mfwd_release(&mf);
                         if (atomic_load(&g_minput) == 1)
                             minput_release_all(&mi); // no keys held
                     } else {
@@ -2771,6 +3086,7 @@ int main(int argc, char **argv)
             if (menu_attach && rmenu_ok && !rmenu_active && !term_active) {
                 minput_release_all(&mi);
                 mousejoy_clear(&mj);
+                mfwd_release(&mf);
                 rmenu_cmd(&rm, cfg.host, RM_ATTACH);
                 rmenu_active = true;
                 rmenu_live = false;
@@ -2800,9 +3116,15 @@ int main(int argc, char **argv)
             // joystick lines, once per loop: the pad's current state merged
             // with any mouse pulse that started or ended this iteration
             bool joy_ok = kb.enabled && atomic_load(&g_minput) == 1;
-            if (joy_ok && !joy_was_ok)
+            if (joy_ok && !joy_was_ok) {
                 pad_event = true; // the probe just answered: send what a
                                   // pad already holds
+                if (mouse_desired && !mouse_1351 && !mouse_port_done) {
+                    mouse_port_done = true; // --mouse in joystick mode
+                    mi.joy_port = 1;
+                    SDL_Log("mouse steers the joystick in port 1");
+                }
+            }
             joy_was_ok = joy_ok;
             bool mouse_changed = mousejoy_tick(&mj);
             if (joy_swap) {
@@ -3127,6 +3449,14 @@ int main(int argc, char **argv)
             SDL_Delay(10);
         }
         SDL_WaitThread(ka, NULL);
+    }
+    if (mf.thr) {
+        while (windowed && !atomic_load(&mf.done)) {
+            SDL_PumpEvents();
+            SDL_Delay(10);
+        }
+        SDL_WaitThread(mf.thr, NULL);
+        SDL_DestroyMutex(mf.lock);
     }
     if (rm.thr) {
         while (windowed && !atomic_load(&rm.done)) {

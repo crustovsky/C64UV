@@ -274,6 +274,92 @@ timeout 10 ./c64uv --host 127.0.0.42:8064 --keys run_stop # leaves the menu
 timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen 2>/dev/null && exit 1
 echo "menu screen test passed"
 
+# -------------------------------------------------------------------- mouse
+# --mouse-send turns its items into machine:input mouse events; a bad item
+# is a usage error that sends nothing.
+
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --mouse-send "move:40:-10 left, move:300:0"
+grep -q '{"events":\[{"kind":"mouse","move":{"x":40,"y":-10}}\]}' "$out/disc.log"
+grep -q '{"kind":"mouse","inputs":\["left"\],"transition":"tap"}' "$out/disc.log"
+grep -q '{"kind":"mouse","path":\[\[100,0\],\[100,0\],\[100,0\]\]}' "$out/disc.log"
+: > "$out/disc.log"
+rc=0; ./c64uv --host 127.0.0.42:8064 --mouse-send "move:5:5 click" 2>/dev/null || rc=$?
+test "$rc" = 2
+! grep -q 'machine:input' "$out/disc.log"
+echo "mouse send test passed"
+
+# ------------------------------------------------------- windowed, scripted
+# The window itself, driven through the C64U_TEST_EVENTS hook under SDL's
+# dummy video driver. Ctrl+G grabs the mouse as a 1351 (the fake lists a
+# mouse in machine:input): motion and buttons go out as mouse events, and
+# stop when released. F9 then opens the REST menu view (one menu_button
+# press), cursor down reaches the menu as a key, F9 closes it (the second
+# press). Ctrl+M (the third) attaches the same view, RUN/STOP leaves the
+# menu on the machine and the view follows without another press; opened
+# once more (the fourth), quitting closes it on the machine (the fifth).
+
+viewer() { # viewer <logname> <events> [flags...]: runs until the script ends
+    local name=$1 events=$2; shift 2
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy C64U_TEST_EVENTS="$events" \
+        timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
+        --port "$VPORT" --no-audio "$@" 2> "$out/$name.err" &
+    vpid=$!
+    pids+=($vpid)
+}
+: > "$out/disc.log"
+viewer win "ready wait=300 key=ctrl+g wait=200 move=12,-4 wait=300 \
+button=left:1 wait=200 button=left:0 wait=300 key=ctrl+g wait=200 move=50,50 \
+wait=300 key=f9 wait=700 key=down wait=400 key=f9 wait=600 key=ctrl+m \
+wait=700 key=escape wait=700 key=f9 wait=700"
+for _ in $(seq 1 100); do
+    [ "$(grep -c 'menu view: showing' "$out/win.err")" = 3 ] && break
+    sleep 0.2
+done
+sleep 0.3
+test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 4
+kill -TERM $vpid; wait $vpid || true
+grep -q "mouse grabbed: 1351 mouse in port 1" "$out/win.err"
+grep -q '{"kind":"mouse","move":{"x":12,"y":-4}}' "$out/disc.log"
+grep -q '{"kind":"mouse","inputs":\["left"\],"transition":"press"}' "$out/disc.log"
+grep -q '{"kind":"mouse","inputs":\["left"\],"transition":"release"}' "$out/disc.log"
+! grep -q '"x":50' "$out/disc.log" # released: motion stays on the PC
+grep -q "machine:menu_screen available" "$out/win.err"
+grep -q "menu view closed" "$out/win.err"
+grep -q '"inputs":\["cursor_up_down"\],"transition":"press"' "$out/disc.log"
+grep -q "menu view: the menu closed on the machine" "$out/win.err"
+test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 5 # quit closed it
+timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen 2>/dev/null && exit 1
+echo "windowed mouse + menu view test passed"
+
+# The same grab on firmware without mouse events (and with --mouse-joy on
+# any): the mouse steers the joystick, on port 1 for GEOS's JOYSTICK
+# driver, held while it moves and released after --mouse-hold.
+curl -s -X PUT "http://127.0.0.42:8064/test/mouse?value=0" >/dev/null
+: > "$out/disc.log"
+viewer mjoy "ready wait=300 key=ctrl+g wait=200 move=30,0 wait=500 \
+button=left:1 wait=200 button=left:0 wait=400"
+for _ in $(seq 1 100); do
+    grep -q '"inputs":\["fire"\],"transition":"release"' "$out/disc.log" && break
+    sleep 0.2
+done
+kill -TERM $vpid; wait $vpid || true
+curl -s -X PUT "http://127.0.0.42:8064/test/mouse?value=1" >/dev/null
+grep -q "mouse grabbed: joystick on port 1" "$out/mjoy.err"
+grep -q '"port":1,"inputs":\["right"\],"transition":"press"' "$out/disc.log"
+grep -q '"port":1,"inputs":\["right"\],"transition":"release"' "$out/disc.log"
+grep -q '"port":1,"inputs":\["fire"\],"transition":"press"' "$out/disc.log"
+! grep -q '"kind":"mouse"' "$out/disc.log"
+: > "$out/disc.log"
+viewer mjoy2 "ready wait=300 key=ctrl+g wait=200 move=0,30 wait=500" --mouse-joy --joy-port 2
+for _ in $(seq 1 100); do
+    grep -q '"inputs":\["down"\],"transition":"release"' "$out/disc.log" && break
+    sleep 0.2
+done
+kill -TERM $vpid; wait $vpid || true
+grep -q '"port":2,"inputs":\["down"\],"transition":"press"' "$out/disc.log"
+echo "windowed mouse joystick test passed"
+
 # ---------------------------------------------------------------- joystick
 # --joy presses and releases the named inputs on the given control port
 # through machine:input; a bad input name is a usage-level refusal.
@@ -387,8 +473,7 @@ if [ -w /dev/uinput ]; then
     # The REST menu view, driven by the pad: Start opens the menu (one
     # menu_button press, then the screen is polled), the d-pad becomes
     # cursor keys instead of joystick lines, Start closes it again (the
-    # second press). Opened once more, RUN/STOP-ing out of the menu on the
-    # machine side must end the view without a third... press.
+    # second press), and A is fire again.
     : > "$out/disc.log"
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
         SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 \

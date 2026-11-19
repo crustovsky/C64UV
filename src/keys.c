@@ -1,6 +1,8 @@
 #include "keys.h"
 
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // Lowercase letters are the unshifted keys, uppercase are shifted (graphics
@@ -231,6 +233,121 @@ unsigned mouse_joy_dir(float dx, float dy, float dz)
            (dy <= -dz ? JOY_UP : 0) | (dy >= dz ? JOY_DOWN : 0);
 }
 
+static const char *const mouse_names[] = {"left", "right", "middle"};
+
+// Appends to buf at *w; *w goes negative once something did not fit.
+static void json_add(char *buf, size_t cap, int *w, const char *fmt, ...)
+{
+    if (*w < 0)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *w, cap - (size_t)*w, fmt, ap);
+    va_end(ap);
+    *w = n < 0 || (size_t)(*w + n) >= cap ? -1 : *w + n;
+}
+
+static void json_add_buttons(char *buf, size_t cap, int *w, unsigned buttons,
+                             const char *transition)
+{
+    json_add(buf, cap, w, "{\"kind\":\"mouse\",\"inputs\":[");
+    bool one = false;
+    for (int i = 0; i < 3; i++)
+        if (buttons >> i & 1) {
+            json_add(buf, cap, w, "%s\"%s\"", one ? "," : "", mouse_names[i]);
+            one = true;
+        }
+    json_add(buf, cap, w, "],\"transition\":\"%s\"}", transition);
+}
+
+bool mouse_event_json(int dx, int dy, const struct mouse_btn_ev *ev, int nev,
+                      char *buf, size_t cap)
+{
+    if (cap == 0 || (!dx && !dy && nev == 0) || dx < -127 || dx > 127 ||
+        dy < -127 || dy > 127)
+        return false;
+    int w = 0;
+    bool first = true;
+    json_add(buf, cap, &w, "{\"events\":[");
+    if (dx || dy) {
+        json_add(buf, cap, &w,
+                 "{\"kind\":\"mouse\",\"move\":{\"x\":%d,\"y\":%d}}", dx, dy);
+        first = false;
+    }
+    for (int i = 0; i < nev; i++) {
+        if (!(ev[i].buttons & 7))
+            continue;
+        json_add(buf, cap, &w, "%s", first ? "" : ",");
+        json_add_buttons(buf, cap, &w, ev[i].buttons & 7,
+                         ev[i].down ? "press" : "release");
+        first = false;
+    }
+    json_add(buf, cap, &w, "]}");
+    return w > 0 && !first;
+}
+
+// Strict decimal integer in [lo, hi]; *end is left after it.
+static bool parse_int(const char *s, const char **end, long lo, long hi,
+                      long *out)
+{
+    char *e;
+    if (!(*s == '-' || (*s >= '0' && *s <= '9')))
+        return false;
+    long v = strtol(s, &e, 10);
+    if (e == s || (e == s + 1 && *s == '-') || v < lo || v > hi)
+        return false;
+    *out = v;
+    *end = e;
+    return true;
+}
+
+bool mouse_send_json(const char *item, char *buf, size_t cap)
+{
+    if (cap == 0)
+        return false;
+    int w = 0;
+    const char *p;
+    long a, b;
+    json_add(buf, cap, &w, "{\"events\":[");
+    if (!strncmp(item, "move:", 5)) {
+        if (!parse_int(item + 5, &p, -4000, 4000, &a) || *p++ != ':' ||
+            !parse_int(p, &p, -4000, 4000, &b) || *p || (!a && !b))
+            return false;
+        long steps = (labs(a) > labs(b) ? labs(a) : labs(b)) / 127 + 1;
+        if (steps == 1) {
+            json_add(buf, cap, &w,
+                     "{\"kind\":\"mouse\",\"move\":{\"x\":%ld,\"y\":%ld}}", a,
+                     b);
+        } else { // even steps that add up exactly
+            json_add(buf, cap, &w, "{\"kind\":\"mouse\",\"path\":[");
+            for (long i = 1; i <= steps; i++)
+                json_add(buf, cap, &w, "%s[%ld,%ld]", i > 1 ? "," : "",
+                         a * i / steps - a * (i - 1) / steps,
+                         b * i / steps - b * (i - 1) / steps);
+            json_add(buf, cap, &w, "]}");
+        }
+    } else if (!strncmp(item, "wheel:", 6)) {
+        if (!parse_int(item + 6, &p, -64, 64, &a) || *p || !a)
+            return false;
+        json_add(buf, cap, &w,
+                 "{\"kind\":\"mouse\",\"wheel\":{\"vertical\":%ld}}", a);
+    } else {
+        size_t n = strcspn(item, ":");
+        unsigned bit = 0;
+        for (int i = 0; i < 3; i++)
+            if (strlen(mouse_names[i]) == n &&
+                !strncmp(item, mouse_names[i], n))
+                bit = 1u << i;
+        const char *how = item[n] ? item + n + 1 : NULL;
+        if (!bit || (how && strcmp(how, "down") && strcmp(how, "up")))
+            return false;
+        json_add_buttons(buf, cap, &w, bit,
+                         !how ? "tap" : how[0] == 'd' ? "press" : "release");
+    }
+    json_add(buf, cap, &w, "]}");
+    return w > 0;
+}
+
 static const char *const joy_names[] = {"up", "down", "left", "right",
                                         "fire", "fire2", "fire3"};
 #define JOY_NAMES ((int)(sizeof joy_names / sizeof joy_names[0]))
@@ -297,9 +414,11 @@ const struct viewer_binding viewer_bindings[] = {
      .action = VA_INFO, .gap = true},
     {.label = "gamepad", .desc = "C64 joystick: A fire, B up",
      .action = VA_INFO},
+    // firmware with mouse events: a real 1351; before that (or with
+    // --mouse-joy) the mouse steers the joystick lines instead
     {.key = SDLK_G, .mod = SDL_KMOD_CTRL, .label = "Ctrl+G",
-     .desc = "grab mouse as C64 joystick",
-     .action = VA_MOUSE_JOY},
+     .desc = "grab the mouse (1351 or joystick)",
+     .action = VA_MOUSE},
     {.key = SDLK_J, .mod = SDL_KMOD_CTRL, .label = "Ctrl+J",
      .desc = "swap joystick port (pad: Back)",
      .action = VA_JOY_PORT, .gap = true},

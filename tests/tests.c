@@ -328,6 +328,51 @@ static void test_joystick(void)
     CHECK(!joy_event_json(2, 0, 0x7f, buf, 40)); // too small
 }
 
+static void test_mouse(void)
+{
+    char b[512];
+    struct mouse_btn_ev ev[2] = {{MOUSE_LEFT, true},
+                                 {MOUSE_LEFT | MOUSE_RIGHT, false}};
+    CHECK(mouse_event_json(5, -3, NULL, 0, b, sizeof b) &&
+          !strcmp(b, "{\"events\":[{\"kind\":\"mouse\",\"move\":{\"x\":5,"
+                     "\"y\":-3}}]}"));
+    CHECK(mouse_event_json(0, 0, ev, 2, b, sizeof b) &&
+          !strcmp(b, "{\"events\":[{\"kind\":\"mouse\",\"inputs\":[\"left\"],"
+                     "\"transition\":\"press\"},{\"kind\":\"mouse\",\"inputs\":"
+                     "[\"left\",\"right\"],\"transition\":\"release\"}]}"));
+    CHECK(mouse_event_json(-127, 127, ev, 1, b, sizeof b) &&
+          strstr(b, "\"move\":{\"x\":-127,\"y\":127}},{\"kind\":\"mouse\","
+                    "\"inputs\":[\"left\"]"));
+    CHECK(!mouse_event_json(0, 0, NULL, 0, b, sizeof b)); // nothing to send
+    CHECK(!mouse_event_json(128, 0, NULL, 0, b, sizeof b)); // beyond a report
+    CHECK(!mouse_event_json(5, 5, ev, 2, b, 40)); // too small
+
+    CHECK(mouse_send_json("left", b, sizeof b) &&
+          !strcmp(b, "{\"events\":[{\"kind\":\"mouse\",\"inputs\":[\"left\"],"
+                     "\"transition\":\"tap\"}]}"));
+    CHECK(mouse_send_json("right:down", b, sizeof b) &&
+          strstr(b, "[\"right\"],\"transition\":\"press\""));
+    CHECK(mouse_send_json("middle:up", b, sizeof b) &&
+          strstr(b, "[\"middle\"],\"transition\":\"release\""));
+    CHECK(mouse_send_json("move:40:-10", b, sizeof b) &&
+          !strcmp(b, "{\"events\":[{\"kind\":\"mouse\",\"move\":{\"x\":40,"
+                     "\"y\":-10}}]}"));
+    // a long move becomes a path whose steps fit a report and add up
+    CHECK(mouse_send_json("move:300:-10", b, sizeof b) &&
+          !strcmp(b, "{\"events\":[{\"kind\":\"mouse\",\"path\":[[100,-3],"
+                     "[100,-3],[100,-4]]}]}"));
+    CHECK(mouse_send_json("wheel:-2", b, sizeof b) &&
+          strstr(b, "\"wheel\":{\"vertical\":-2}"));
+    CHECK(!mouse_send_json("move:0:0", b, sizeof b));
+    CHECK(!mouse_send_json("move:5", b, sizeof b));
+    CHECK(!mouse_send_json("move:5:x", b, sizeof b));
+    CHECK(!mouse_send_json("move:9999:0", b, sizeof b));
+    CHECK(!mouse_send_json("wheel:0", b, sizeof b));
+    CHECK(!mouse_send_json("left:click", b, sizeof b));
+    CHECK(!mouse_send_json("fire", b, sizeof b));
+    CHECK(!mouse_send_json("", b, sizeof b));
+}
+
 static void test_bindings(void)
 {
     // dispatch side of the shared table
@@ -340,7 +385,7 @@ static void test_bindings(void)
     CHECK(viewer_binding_match(SDLK_F10, 0) == VA_HELP);
     CHECK(viewer_binding_match(SDLK_F10, SDL_KMOD_NUM) == VA_HELP); // stray mod
     CHECK(viewer_binding_match(SDLK_M, SDL_KMOD_RCTRL) == VA_MENU_BTN);
-    CHECK(viewer_binding_match(SDLK_G, SDL_KMOD_LCTRL) == VA_MOUSE_JOY);
+    CHECK(viewer_binding_match(SDLK_G, SDL_KMOD_LCTRL) == VA_MOUSE);
     CHECK(viewer_binding_match(SDLK_G, 0) == VA_NONE); // plain G types
 
     // table integrity: every row renders in help, no dispatch collisions
@@ -467,6 +512,7 @@ int main(void)
     test_matrix_keys();
     test_matrix_typing();
     test_joystick();
+    test_mouse();
     test_bindings();
     test_json();
     test_arp_wired();

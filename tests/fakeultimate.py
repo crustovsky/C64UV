@@ -28,7 +28,9 @@ SWAPPER_PATH = "/v1/configs/U64%20Specific%20Settings/Joystick%20Swapper"
 # Settings a test can change with a PUT ...?value=, like on the machine.
 # The real default is "Swapped"; "Normal" keeps the API's port numbers equal
 # to the C64's, which is what most tests want to read in the log.
-STATE = {"swapper": "Normal", "menu": False, "row": 0}
+# "mouse": whether machine:input lists a mouse (1.2.1 does, the first
+# firmware with the input API does not); PUT /test/mouse?value=0 clears it.
+STATE = {"swapper": "Normal", "menu": False, "row": 0, "mouse": True}
 
 MENU_ITEMS = ["Disk File Browser", "Assembly 64 Query", "Reset C64",
               "Power OFF"]
@@ -234,12 +236,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path.startswith("/v1/machine:readmem"):
             self._reply(200, b"\x00", "application/octet-stream")
         elif self.path == "/v1/machine:input":
-            self._json({"keyboard": {"inputs": []},
-                        "joysticks": [{"port": 1, "inputs": []},
-                                      {"port": 2, "inputs": []}],
-                        "mouse": {"attached": False, "inputs": [],
-                                  "pending": 0},
-                        "errors": []})
+            state = {"keyboard": {"inputs": []},
+                     "joysticks": [{"port": 1, "inputs": []},
+                                   {"port": 2, "inputs": []}]}
+            if STATE["mouse"]:
+                state["mouse"] = {"attached": False, "inputs": [],
+                                  "pending": 0}
+            state["errors"] = []
+            self._json(state)
         elif self.path == "/v1/machine:menu_screen":
             if STATE["menu"]:
                 self._reply(200, _menu_screen(), "application/octet-stream")
@@ -254,6 +258,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._log(body)
         if self.path.startswith(SWAPPER_PATH + "?value="):
             STATE["swapper"] = self.path.split("=", 1)[1]
+        elif self.path.startswith("/test/mouse?value="):
+            STATE["mouse"] = self.path.endswith("1")
         elif self.path == "/v1/machine:menu_button":
             STATE["menu"] = not STATE["menu"]
             STATE["row"] = 0
