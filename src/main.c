@@ -56,6 +56,11 @@ static atomic_int g_run_pct = -1;
 static char g_run_name[64]; // written before the run thread starts
 // machine:input capability (probed once per session): -1 unknown, 0 no, 1 yes
 static atomic_int g_minput = -1;
+// The Ultimate's "Joystick Swapper" setting, read once next to that probe.
+// With "Swapped" the API's port 1 drives $DC00, which is the C64's control
+// port 2, and the other way round (verified on 1.2.1). The viewer talks in
+// C64 port numbers everywhere and converts in joy_api_port().
+static atomic_bool g_joy_swapped;
 // Set once the API answered, so a later transport failure is reported as
 // "stopped responding" rather than as unsupported firmware.
 static atomic_bool g_minput_up;
@@ -65,6 +70,39 @@ static const char *g_password;
 // --store folder on the Ultimate: dropped disk images are uploaded there
 // (FTP) and mounted by path instead of going to the firmware's temp area.
 static const char *g_store;
+// A firmware update switches every network service off: the machine then
+// answers pings but refuses the TCP ports. t_refused records that the last
+// REST call on this thread died that way, g_rest_off that the keepalive
+// keeps running into it (the window says so instead of "waiting").
+static _Thread_local bool t_refused;
+static atomic_bool g_rest_off;
+#define SERVICES_WHERE "enable it on the machine: F2 > Network Settings"
+
+// libcurl keeps the OS error of a failed connect.
+static bool curl_refused(CURL *curl, CURLcode res)
+{
+    long os_err = 0;
+    return res == CURLE_COULDNT_CONNECT &&
+           curl_easy_getinfo(curl, CURLINFO_OS_ERRNO, &os_err) == CURLE_OK &&
+           compat_errno_refused(os_err);
+}
+
+// Why a REST call got no HTTP answer, for the log.
+static const char *rest_no_answer(void)
+{
+    return t_refused ? "connection refused: the Ultimate is on, but its Web "
+                       "Remote Control service is off (" SERVICES_WHERE ")"
+                     : "no response from Ultimate";
+}
+
+// The same for a DMA socket connect that just failed.
+static const char *dma_no_answer(void)
+{
+    return compat_neterr_refused()
+               ? "port 64 refused the connection: the Ultimate DMA Service "
+                 "is off (" SERVICES_WHERE ")"
+               : compat_neterr();
+}
 
 // ---------------------------------------------------------------- REST control
 
@@ -140,11 +178,40 @@ static long rest_req(CURL *curl, const char *method, const char *url,
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     CURLcode res = curl_easy_perform(curl);
     curl_slist_free_all(hdrs);
+    t_refused = curl_refused(curl, res);
     if (res != CURLE_OK)
         return -1;
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     return code;
+}
+
+#define JOY_SWAPPER_PATH "configs/U64%20Specific%20Settings/Joystick%20Swapper"
+
+// Reads the Joystick Swapper setting into g_joy_swapped. An Ultimate
+// without the setting (or an unreadable answer) counts as not swapped.
+static void joy_swapper_read(CURL *curl, const char *host,
+                             const atomic_bool *cancel)
+{
+    char url[256], resp[512], cur[32];
+    snprintf(url, sizeof url, "http://%s/v1/%s", host, JOY_SWAPPER_PATH);
+    long code = rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp, cancel);
+    bool known = code == 200 &&
+                 json_find_str(resp, "current", cur, sizeof cur);
+    bool swapped = known && !SDL_strcasecmp(cur, "Swapped");
+    atomic_store(&g_joy_swapped, swapped);
+    if (known)
+        SDL_Log("Joystick Swapper is \"%s\": C64 port 2 is the API's port %d",
+                cur, swapped ? 1 : 2);
+    else
+        SDL_Log("Joystick Swapper setting not readable (HTTP %ld): taking "
+                "the API's port numbers as the C64's", code);
+}
+
+// C64 control port (what the game reads) -> the API's port number.
+static int joy_api_port(int c64_port)
+{
+    return atomic_load(&g_joy_swapped) ? 3 - c64_port : c64_port;
 }
 
 static long rest_put(CURL *curl, const char *url, char *resp)
@@ -181,6 +248,11 @@ static int keepalive_thread(void *arg)
             if (atomic_load(&g_quit))
                 break;
             if (code == 200) {
+                // before g_minput flips: no joystick event may go out with
+                // the port mapping still unknown
+                joy_swapper_read(curl, rc->host, &g_quit);
+                if (atomic_load(&g_quit))
+                    break;
                 atomic_store(&g_minput, 1);
                 atomic_store(&g_minput_up, true);
                 SDL_Log("machine:input available: matrix-level keyboard");
@@ -190,7 +262,7 @@ static int keepalive_thread(void *arg)
                         "via the KERNAL buffer", code);
             } else {
                 static bool logged;
-                if (!logged) {
+                if (!logged && !t_refused) { // refused: the start call says so
                     logged = true;
                     SDL_Log("machine:input probe: no response from the "
                             "Ultimate; retrying");
@@ -202,11 +274,15 @@ static int keepalive_thread(void *arg)
                                  NULL, 3000, resp, &g_quit);
             if (atomic_load(&g_quit))
                 break; // cancelled: the result says nothing about the machine
+            if (i == 0)
+                atomic_store(&g_rest_off, code == -1 && t_refused);
+            if (code == -1 && t_refused)
+                code = -3; // refused: its own state for the log below
             if (code != last_code[i]) { // log only on state change
                 if (code == 200)
                     SDL_Log("stream start OK (%s)", rc->start_url[i]);
-                else if (code == -1)
-                    SDL_Log("stream start: no response from Ultimate");
+                else if (code < 0)
+                    SDL_Log("stream start: %s", rest_no_answer());
                 else
                     SDL_Log("stream start HTTP %ld: %s%s", code, resp,
                             strstr(resp, "No Operational Network Interface")
@@ -225,7 +301,7 @@ static int keepalive_thread(void *arg)
     // there answers well within a second. Anything longer would hold the
     // exit, and the window with it, past the compositor's patience.
     for (int i = 0; i < rc->nstreams; i++)
-        if (last_code[i] != -1)
+        if (last_code[i] >= 0)
             rest_req(curl, "PUT", rc->stop_url[i], NULL, 0, NULL, 1000, resp,
                      NULL);
     curl_easy_cleanup(curl);
@@ -390,17 +466,40 @@ static bool discovery_choose(struct discovered *found, int n, char *out,
     return true;
 }
 
+// What to tell someone whose sweep came back empty (stderr, headless).
+static void discovery_empty_hint(void)
+{
+    char ip[COMPAT_IP_STRLEN];
+    if (discover_services_off(ip, sizeof ip))
+        fprintf(stderr,
+                "an Ultimate is switched on at %s, but its Web Remote "
+                "Control service is off\n(" SERVICES_WHERE "; a firmware "
+                "update turns the network services off)\n", ip);
+    else
+        fprintf(stderr,
+                "no Ultimate found on your network: pass --host <ip> or "
+                "set C64U_HOST\n"
+                "(find it on the machine: F5 menu on the Ultimate shows "
+                "its IP, or check your router;\n after a firmware update "
+                "its network services are off: " SERVICES_WHERE ")\n");
+}
+
 // Background discovery for the windowed no-host start: the window opens
 // immediately and shows progress while the sweep runs here.
 struct disc_async {
     struct discovered found[DISCOVER_MAX];
     atomic_int n; // -1 while a sweep runs, result count when done
+    char off_ip[COMPAT_IP_STRLEN]; // nothing found, but this one is up
 };
 
 static int discover_thread(void *arg)
 {
     struct disc_async *d = arg;
-    atomic_store(&d->n, discover_scan(d->found, DISCOVER_MAX, false));
+    int n = discover_scan(d->found, DISCOVER_MAX, false);
+    d->off_ip[0] = '\0';
+    if (n == 0)
+        discover_services_off(d->off_ip, sizeof d->off_ip);
+    atomic_store(&d->n, n); // last: the event loop reads off_ip after this
     return 0;
 }
 
@@ -507,6 +606,7 @@ struct keyb {
     compat_sock fd; // COMPAT_BAD_SOCK when disconnected
     bool enabled;
     bool reclaim; // reconnect as soon as the running drop releases port 64
+    bool refused_logged;
     const char *host;
     Uint64 last_try;
     Uint64 last_send;
@@ -521,8 +621,12 @@ static void keyb_try_connect(struct keyb *k)
         return;
     k->last_try = SDL_GetTicks();
     k->fd = dma_connect(k->host, 1);
-    if (k->fd != COMPAT_BAD_SOCK)
+    if (k->fd != COMPAT_BAD_SOCK) {
         SDL_Log("keyboard channel connected (port 64)");
+    } else if (compat_neterr_refused() && !k->refused_logged) {
+        k->refused_logged = true; // once: this runs again on every keypress
+        SDL_Log("keyboard channel: %s", dma_no_answer());
+    }
 }
 
 static void keyb_raw(struct keyb *k, Uint16 cmd, const Uint8 *data, int n)
@@ -580,7 +684,7 @@ static bool machine_ctl(const char *host, const char *action)
     if (code == 200)
         SDL_Log("machine:%s OK", action);
     else if (code == -1)
-        SDL_Log("machine:%s: no response from Ultimate", action);
+        SDL_Log("machine:%s: %s", action, rest_no_answer());
     else
         SDL_Log("machine:%s HTTP %ld: %s", action, code, resp);
     return code == 200;
@@ -665,9 +769,10 @@ static bool readmem(CURL *curl, const char *host, const char *addr, int len,
         hdrs = curl_slist_append(NULL, pwhdr);
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     }
-    bool ok = curl_easy_perform(curl) == CURLE_OK;
+    CURLcode res = curl_easy_perform(curl);
     curl_slist_free_all(hdrs);
-    return ok;
+    t_refused = curl_refused(curl, res);
+    return res == CURLE_OK;
 }
 
 // Readiness gate: the KERNAL zeroes $CC when it sits at a prompt with the
@@ -799,7 +904,10 @@ static bool ftp_upload(CURL *curl, const char *host, const char *rpath,
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
     CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK)
+    if (curl_refused(curl, res))
+        SDL_Log("FTP upload to %s refused: the Ultimate's FTP Service is off "
+                "(" SERVICES_WHERE ")", url);
+    else if (res != CURLE_OK)
         SDL_Log("FTP upload to %s failed: %s", url, curl_easy_strerror(res));
     return res == CURLE_OK;
 }
@@ -893,7 +1001,7 @@ static long store_image(CURL *curl, const char *host, const char *path,
     }
     if (!typed)
         SDL_Log("mounted on drive A, but the DMA socket (port 64) failed "
-                "(%s): type LOAD\"*\",8,1 yourself", compat_neterr());
+                "(%s): type LOAD\"*\",8,1 yourself", dma_no_answer());
     else
         SDL_Log("%s mounted read-write on drive A and started", shown);
     return typed ? 200 : -1;
@@ -952,7 +1060,7 @@ static bool run_file(const char *host, const char *path)
         if (code == 200)
             SDL_Log("runners:%s %s OK (%ld bytes)", ep, path, len);
         else if (code == -1)
-            SDL_Log("runners:%s: no response from Ultimate", ep);
+            SDL_Log("runners:%s: %s", ep, rest_no_answer());
         else
             SDL_Log("runners:%s HTTP %ld: %s", ep, code, resp);
     } else if (store) {
@@ -966,8 +1074,8 @@ static bool run_file(const char *host, const char *path)
         } else {
             compat_sock s = dma_connect(host, 3);
             if (s == COMPAT_BAD_SOCK)
-                SDL_Log("%s: DMA socket (port 64) unreachable; is the "
-                        "Ultimate DMA Service enabled?", path);
+                SDL_Log("%s: DMA socket (port 64): %s", path,
+                        dma_no_answer());
             else if (dma_send(s, DMA_CMD_RUN_IMG, data, (size_t)len, true))
                 code = 200;
             else
@@ -989,7 +1097,7 @@ static bool run_file(const char *host, const char *path)
             SDL_Log("%s mounted on drive A (%ld bytes); no autostart for "
                     ".%s, type LOAD\"*\",8,1 yourself", path, len, img);
         else if (code == -1)
-            SDL_Log("drives/a:mount: no response from Ultimate");
+            SDL_Log("drives/a:mount: %s", rest_no_answer());
         else
             SDL_Log("drives/a:mount HTTP %ld: %s", code, resp);
     }
@@ -1081,8 +1189,7 @@ static bool type_text(const char *host, const char *text)
     CURL *curl = curl_easy_init();
     bool ok = dma_type(curl, host, buf);
     if (!ok)
-        SDL_Log("typing failed (%s); is the Ultimate DMA Service enabled?",
-                compat_neterr());
+        SDL_Log("typing failed: %s", dma_no_answer());
     curl_easy_cleanup(curl);
     return ok;
 }
@@ -1106,7 +1213,10 @@ static bool print_screen(const char *host)
     bool ok = readmem(curl, host, "0400", 1000, &b) && b.len == 1000;
     curl_easy_cleanup(curl);
     if (!ok) {
-        SDL_Log("machine:readmem failed (%d bytes)", b.len);
+        if (t_refused)
+            SDL_Log("machine:readmem: %s", rest_no_answer());
+        else
+            SDL_Log("machine:readmem failed (%d bytes)", b.len);
         return false;
     }
     for (int row = 0; row < 25; row++) {
@@ -1135,10 +1245,11 @@ static bool joy_tap(const char *host, const char *spec, int port)
     char url[256], body[320], resp[512];
     snprintf(url, sizeof url, "http://%s/v1/machine:input", host);
     CURL *curl = curl_easy_init();
+    joy_swapper_read(curl, host, NULL);
     long code = -1;
     for (int pass = 0; pass < 2; pass++) { // press, then release
-        joy_event_json(port, pass ? mask : 0, pass ? 0 : mask, body,
-                       sizeof body);
+        joy_event_json(joy_api_port(port), pass ? mask : 0, pass ? 0 : mask,
+                       body, sizeof body);
         code = rest_req(curl, "POST", url, body, (long)strlen(body),
                         "application/json", 3000, resp, NULL);
         if (code != 200)
@@ -1150,7 +1261,7 @@ static bool joy_tap(const char *host, const char *spec, int port)
     if (code == 200)
         SDL_Log("joystick port %d: %s OK", port, spec);
     else if (code == -1)
-        SDL_Log("machine:input: no response from Ultimate");
+        SDL_Log("machine:input: %s", rest_no_answer());
     else
         SDL_Log("machine:input HTTP %ld: %s (joysticks need firmware 1.2.0 "
                 "or newer)", code, resp);
@@ -1169,8 +1280,9 @@ struct minput {
     CURL *curl;
     char url[256];
     int fails;
-    int joy_port;      // control port the gamepad drives
-    unsigned joy_sent; // JOY_* bits the firmware holds for us
+    int joy_port;         // C64 control port the first gamepad drives
+    unsigned joy_sent[2]; // JOY_* bits the firmware holds for us, per
+                          // C64 port ([0] = port 1)
 };
 
 static void minput_post(struct minput *mi, const char *body)
@@ -1206,15 +1318,16 @@ static void minput_key(struct minput *mi, SDL_Keycode key, bool down)
         minput_post(mi, body);
 }
 
-// Fired on focus loss, view switches, and exit so no key stays held down.
-// Brings the firmware's joystick lines to `want` (JOY_* bits): one POST
-// with the releases and presses that differ from what it holds.
-static void minput_joy(struct minput *mi, unsigned want)
+// Brings the joystick lines of C64 control port `port` to `want` (JOY_*
+// bits): one POST with the releases and presses that differ from what the
+// firmware holds there.
+static void minput_joy(struct minput *mi, int port, unsigned want)
 {
     char body[320];
-    if (joy_event_json(mi->joy_port, mi->joy_sent, want, body, sizeof body))
+    if (joy_event_json(joy_api_port(port), mi->joy_sent[port - 1], want,
+                       body, sizeof body))
         minput_post(mi, body);
-    mi->joy_sent = want;
+    mi->joy_sent[port - 1] = want;
 }
 
 // What the pad holds right now, as JOY_* bits. Polled as a whole instead
@@ -1231,9 +1344,10 @@ static unsigned pad_state(SDL_Gamepad *pad)
     return m;
 }
 
+// Fired on focus loss, view switches, and exit so no key stays held down.
 static void minput_release_all(struct minput *mi)
 {
-    mi->joy_sent = 0; // release_all drops the joystick lines too
+    mi->joy_sent[0] = mi->joy_sent[1] = 0; // it drops the joystick lines too
     minput_post(mi, "{\"events\":[{\"kind\":\"release_all\"}]}");
 }
 
@@ -1349,7 +1463,12 @@ static int run_term_test(const char *host)
 {
     compat_sock fd = compat_tcp_connect(host, 23, 3);
     if (fd == COMPAT_BAD_SOCK) {
-        fprintf(stderr, "cannot connect to %s:23\n", host);
+        if (compat_neterr_refused())
+            fprintf(stderr, "%s:23 refused the connection: the Ultimate's "
+                    "Telnet Remote Menu Service is off (" SERVICES_WHERE
+                    ")\n", host);
+        else
+            fprintf(stderr, "cannot connect to %s:23\n", host);
         return 1;
     }
     struct term *t = malloc(sizeof *t);
@@ -1449,6 +1568,27 @@ static void status_stream_lost(struct term *t, const char *host)
     else
         snprintf(msg, sizeof msg, "the stream stopped");
     status_set(t, msg, "is the Ultimate powered on? waiting...");
+}
+
+// What the status grid says when no notice is up and there is no picture.
+static void status_idle(struct term *t, const struct config *cfg,
+                        bool stream_lost)
+{
+    char msg[TERM_COLS + 1];
+    if (atomic_load(&g_rest_off)) {
+        status_set(t, "the Ultimate is on, but its web service is off",
+                   SERVICES_WHERE);
+    } else if (stream_lost) {
+        status_stream_lost(t, cfg->host);
+    } else if (cfg->no_start) {
+        snprintf(msg, sizeof msg, "listening for a stream on UDP :%d",
+                 cfg->listen_port);
+        status_set(t, msg, NULL);
+    } else {
+        snprintf(msg, sizeof msg, "waiting for the stream from %s",
+                 cfg->host);
+        status_set(t, msg, NULL);
+    }
 }
 
 // ---------------------------------------------------------------- main
@@ -1617,7 +1757,7 @@ int main(int argc, char **argv)
                    discover_ip_is_wired(found[i].ip)
                        ? "  (wired)" : "");
         if (n == 0)
-            fprintf(stderr, "no Ultimate found\n");
+            discovery_empty_hint();
         return n > 0 ? 0 : 1;
     }
 
@@ -1635,11 +1775,7 @@ int main(int argc, char **argv)
         if (discovery_choose(found, n, auto_host, sizeof auto_host)) {
             cfg.host = auto_host;
         } else {
-            fprintf(stderr,
-                    "no Ultimate found on your network: pass --host <ip> or "
-                    "set C64U_HOST\n"
-                    "(find it on the machine: F5 menu on the Ultimate shows "
-                    "its IP, or check your router)\n");
+            discovery_empty_hint();
             return 2;
         }
     }
@@ -1778,9 +1914,12 @@ int main(int argc, char **argv)
     struct mousejoy mj = {.hold_ms = cfg.mouse_hold};
     bool mouse_desired = cfg.mouse; // grab again when the window regains focus
     bool mouse_port_done = cfg.mouse; // first grab may switch to port 1
-    // Gamepad -> joystick: the first pad that shows up, until it leaves.
-    SDL_Gamepad *pad = NULL;
+    // Gamepads -> joysticks: the first pad that shows up drives
+    // mi.joy_port, a second one the other port (two players). A pad keeps
+    // its slot until it leaves; the other one is not moved when it does.
+    SDL_Gamepad *pads[2] = {NULL, NULL};
     bool joy_warned = false;
+    bool joy_was_ok = false;
     bool want_keyb = windowed && !cfg.no_keyb && !cfg.no_start;
     if (want_keyb)
         SDL_StartTextInput(win);
@@ -1806,19 +1945,11 @@ int main(int argc, char **argv)
     // Status screen: shown until the first video frame arrives.
     struct term *status = calloc(1, sizeof *status);
     {
-        char msg[TERM_COLS + 1];
         if (discovering)
             status_set(status, "looking for your Ultimate...",
                        "scanning the local subnets");
-        else if (cfg.no_start) {
-            snprintf(msg, sizeof msg, "listening for a stream on UDP :%d",
-                     cfg.listen_port);
-            status_set(status, msg, NULL);
-        } else {
-            snprintf(msg, sizeof msg, "waiting for the stream from %s",
-                     cfg.host);
-            status_set(status, msg, NULL);
-        }
+        else
+            status_idle(status, &cfg, false);
     }
 
     // Background discovery (windowed start with no host).
@@ -1832,6 +1963,7 @@ int main(int argc, char **argv)
     compat_sock tfd = COMPAT_BAD_SOCK;
     int shown_pct = -1; // drop progress currently in the window title
     Uint64 tfd_last_try = 0;
+    bool tfd_refused = false; // the last telnet connect was refused
     SDL_Texture *term_tex = NULL;
     Uint32 *term_px = calloc(TERM_PX_W * TERM_PX_H, sizeof(Uint32));
 
@@ -1853,6 +1985,7 @@ int main(int argc, char **argv)
     // A short notice on the status grid (menu unreachable, link lost)
     // shows until this tick, then the regular status text comes back.
     Uint64 notice_until = 0;
+    bool shown_rest_off = false; // g_rest_off as the status grid has it
     bool paused = false; // Ctrl+P toggle state (viewer-side best guess)
     // Audio latency control: startup fill and jitter leave a standing queue
     // that never drains on its own (input and output rates match). A servo on
@@ -1890,6 +2023,14 @@ int main(int argc, char **argv)
                         if (mouse_desired)
                             mousejoy_set(&mj, win, true);
                     }
+                } else if (da.off_ip[0]) {
+                    char msg[TERM_COLS + 1];
+                    snprintf(msg, sizeof msg,
+                             "found %s, but its web service is off",
+                             da.off_ip);
+                    status_set(status, msg, SERVICES_WHERE);
+                    term_present = true;
+                    next_scan = SDL_GetTicks() + 10000;
                 } else {
                     status_set(status, "no Ultimate found on your network",
                                "is it powered on? retrying in 10 s");
@@ -1911,16 +2052,29 @@ int main(int argc, char **argv)
                 if (ev.type == SDL_EVENT_QUIT) {
                     atomic_store(&g_quit, true);
                 } else if (ev.type == SDL_EVENT_GAMEPAD_ADDED) {
-                    if (!pad && (pad = SDL_OpenGamepad(ev.gdevice.which)))
+                    int slot = !pads[0] ? 0 : !pads[1] ? 1 : -1;
+                    bool open = false; // SDL can announce a pad twice
+                    for (int k = 0; k < 2; k++)
+                        open |= pads[k] && SDL_GetGamepadID(pads[k]) ==
+                                               ev.gdevice.which;
+                    if (slot < 0 && !open)
+                        SDL_Log("third gamepad ignored: the C64 has two "
+                                "control ports");
+                    else if (!open &&
+                             (pads[slot] = SDL_OpenGamepad(ev.gdevice.which)))
                         SDL_Log("gamepad '%s' drives joystick port %d",
-                                SDL_GetGamepadName(pad), mi.joy_port);
+                                SDL_GetGamepadName(pads[slot]),
+                                slot ? 3 - mi.joy_port : mi.joy_port);
                 } else if (ev.type == SDL_EVENT_GAMEPAD_REMOVED) {
-                    if (pad && SDL_GetGamepadID(pad) == ev.gdevice.which) {
-                        SDL_CloseGamepad(pad);
-                        pad = NULL;
-                        pad_event = true; // let go of what it held
-                        SDL_Log("gamepad unplugged");
-                    }
+                    for (int k = 0; k < 2; k++)
+                        if (pads[k] && SDL_GetGamepadID(pads[k]) ==
+                                           ev.gdevice.which) {
+                            SDL_CloseGamepad(pads[k]);
+                            pads[k] = NULL;
+                            pad_event = true; // let go of what it held
+                            SDL_Log("gamepad on port %d unplugged",
+                                    k ? 3 - mi.joy_port : mi.joy_port);
+                        }
                 } else if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
                            ev.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
                            ev.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
@@ -1999,10 +2153,11 @@ int main(int argc, char **argv)
                                 mouse_port_done = true;
                                 if (mi.joy_port != 1) {
                                     if (kb.enabled &&
-                                        atomic_load(&g_minput) == 1)
-                                        minput_joy(&mi, 0);
+                                        atomic_load(&g_minput) == 1) {
+                                        minput_joy(&mi, 1, 0);
+                                        minput_joy(&mi, 2, 0);
+                                    }
                                     mi.joy_port = 1;
-                                    mi.joy_sent = 0;
                                     SDL_Log("mouse joystick: using port 1 "
                                             "(GEOS's JS1)");
                                 }
@@ -2059,8 +2214,13 @@ int main(int argc, char **argv)
                                     term_init(trm);
                                     SDL_Log("menu terminal connected "
                                             "(port 23)");
-                                } else
-                                    SDL_Log("menu terminal: connect failed");
+                                } else {
+                                    tfd_refused = compat_neterr_refused();
+                                    SDL_Log("menu terminal: connect %s",
+                                            tfd_refused ? "refused (telnet "
+                                                          "service off)"
+                                                        : "failed");
+                                }
                             }
                             // no connection, no menu view: a blank or stale
                             // grid would pass for the machine's own screen
@@ -2070,11 +2230,17 @@ int main(int argc, char **argv)
                                 if (atomic_load(&g_minput) == 1)
                                     minput_release_all(&mi); // no keys held
                             } else {
-                                status_set(status,
-                                           "cannot reach the Ultimate menu "
-                                           "(telnet, port 23)",
-                                           "is it powered on? is telnet "
-                                           "enabled?");
+                                if (tfd_refused)
+                                    status_set(status,
+                                               "the Ultimate's telnet menu "
+                                               "service is off",
+                                               SERVICES_WHERE);
+                                else
+                                    status_set(status,
+                                               "cannot reach the Ultimate "
+                                               "menu (telnet, port 23)",
+                                               "is it powered on? is telnet "
+                                               "enabled?");
                                 notice_until = SDL_GetTicks() + 3000;
                             }
                         }
@@ -2150,33 +2316,41 @@ int main(int argc, char **argv)
             // joystick lines, once per loop: the pad's current state merged
             // with any mouse pulse that started or ended this iteration
             bool joy_ok = kb.enabled && atomic_load(&g_minput) == 1;
+            if (joy_ok && !joy_was_ok)
+                pad_event = true; // the probe just answered: send what a
+                                  // pad already holds
+            joy_was_ok = joy_ok;
             bool mouse_changed = mousejoy_tick(&mj);
             if (joy_swap) {
-                if (joy_ok)
-                    minput_joy(&mi, 0); // nothing stays held on the old port
+                if (joy_ok) { // nothing stays held on the old ports
+                    minput_joy(&mi, 1, 0);
+                    minput_joy(&mi, 2, 0);
+                }
                 mi.joy_port = 3 - mi.joy_port;
                 pad_event = true;
                 SDL_Log("joystick on port %d", mi.joy_port);
-                status_set(status, mi.joy_port == 1 ? "joystick on port 1"
-                                                    : "joystick on port 2",
+                char l1[TERM_COLS + 1];
+                if (pads[0] && pads[1])
+                    snprintf(l1, sizeof l1, "pad 1 on port %d, pad 2 on "
+                             "port %d", mi.joy_port, 3 - mi.joy_port);
+                else
+                    snprintf(l1, sizeof l1, "joystick on port %d",
+                             mi.joy_port);
+                status_set(status, l1,
                            "Ctrl+J or the pad's Back button swaps");
                 notice_until = SDL_GetTicks() + 1500;
             }
             if ((pad_event || mouse_event || mouse_changed) && joy_ok) {
-                unsigned want =
-                    (pad ? pad_state(pad) : 0) | mj.dir | mj.btn;
-                if (cfg.verbose && want != mi.joy_sent)
-                    SDL_Log("joystick: port %d state %02x", mi.joy_port,
-                            want);
-                minput_joy(&mi, want);
-            } else if ((pad_event || mouse_event || mouse_changed) &&
-                       !joy_warned && atomic_load(&g_minput) < 0) {
-                joy_warned = true;
-                SDL_Log("joystick event not sent: the machine:input probe "
-                        "has not answered");
-                status_set(status, "machine:input is not answering",
-                           "check the REST service/network");
-                notice_until = SDL_GetTicks() + 3000;
+                // first pad (and the mouse joystick) on mi.joy_port, a
+                // second pad on the other port
+                for (int k = 0; k < 2; k++) {
+                    int port = k ? 3 - mi.joy_port : mi.joy_port;
+                    unsigned want = (pads[k] ? pad_state(pads[k]) : 0) |
+                                    (k ? 0 : mj.dir | mj.btn);
+                    if (cfg.verbose && want != mi.joy_sent[port - 1])
+                        SDL_Log("joystick: port %d state %02x", port, want);
+                    minput_joy(&mi, port, want);
+                }
             } else if ((pad_event || mouse_event || mouse_changed) &&
                        !joy_warned && atomic_load(&g_minput) == 0) {
                 joy_warned = true;
@@ -2299,7 +2473,7 @@ int main(int argc, char **argv)
 
         if (got_any && !stream_lost && SDL_GetTicks() - last_frame > 2000) {
             stream_lost = true;
-            status_stream_lost(status, cfg.host);
+            status_idle(status, &cfg, true);
             notice_until = 0;
             term_present = true;
             if (windowed)
@@ -2315,15 +2489,18 @@ int main(int argc, char **argv)
         }
         if (notice_until && SDL_GetTicks() >= notice_until) {
             notice_until = 0;
-            if (stream_lost)
-                status_stream_lost(status, cfg.host);
-            else if (!got_any && !discovering && cfg.host) {
-                char msg[TERM_COLS + 1];
-                snprintf(msg, sizeof msg, "waiting for the stream from %s",
-                         cfg.host);
-                status_set(status, msg, NULL);
-            }
+            if (stream_lost || (!got_any && !discovering && cfg.host))
+                status_idle(status, &cfg, stream_lost);
             term_present = true;
+        }
+        // the keepalive found the REST port refusing (or answering again)
+        if (atomic_load(&g_rest_off) != shown_rest_off) {
+            shown_rest_off = !shown_rest_off;
+            if (!notice_until && !discovering && cfg.host &&
+                (stream_lost || !got_any)) {
+                status_idle(status, &cfg, stream_lost);
+                term_present = true;
+            }
         }
 
         struct term *view = help_active ? NULL
@@ -2416,8 +2593,9 @@ int main(int argc, char **argv)
     atomic_store(&g_quit, true);
     if (atomic_load(&g_minput) == 1 && mi.url[0])
         minput_release_all(&mi);
-    if (pad)
-        SDL_CloseGamepad(pad);
+    for (int k = 0; k < 2; k++)
+        if (pads[k])
+            SDL_CloseGamepad(pads[k]);
     // The background threads must not outlive curl, but a blocking join
     // would leave the compositor's pings unanswered: with the Ultimate
     // powered off, the old 3 s REST timeouts added up to a ten-second

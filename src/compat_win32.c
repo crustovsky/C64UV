@@ -101,9 +101,19 @@ compat_sock compat_tcp_connect(const char *ip, uint16_t port, int timeout_s)
         FD_SET(fd, &w);
         FD_SET(fd, &e);
         struct timeval tv = {.tv_sec = timeout_s};
-        ok = select(0, NULL, &w, &e, &tv) == 1 && FD_ISSET(fd, &w);
-        if (!ok)
-            WSASetLastError(WSAETIMEDOUT);
+        int ready = select(0, NULL, &w, &e, &tv);
+        ok = ready == 1 && FD_ISSET(fd, &w);
+        if (!ok) {
+            // a failed connect lands in the except set; SO_ERROR says why
+            // (WSAECONNREFUSED when the service is off)
+            int err = 0, len = sizeof err;
+            if (ready == 1 && FD_ISSET(fd, &e) &&
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&err, &len) == 0 &&
+                err)
+                WSASetLastError(err);
+            else
+                WSASetLastError(WSAETIMEDOUT);
+        }
     }
     if (ok) {
         nb = 0;
@@ -188,6 +198,16 @@ bool compat_neterr_transient(void)
 {
     int err = WSAGetLastError();
     return err == WSAEWOULDBLOCK || err == WSAETIMEDOUT || err == WSAEINTR;
+}
+
+bool compat_neterr_refused(void)
+{
+    return WSAGetLastError() == WSAECONNREFUSED;
+}
+
+bool compat_errno_refused(long os_errno)
+{
+    return os_errno == WSAECONNREFUSED;
 }
 
 bool compat_route_source_ip(const char *ip, char *out, size_t cap)

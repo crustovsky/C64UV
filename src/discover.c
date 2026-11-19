@@ -82,26 +82,12 @@ static size_t probe_sink(char *data, size_t size, size_t nmemb, void *userp)
     return n;
 }
 
-#define DISC_CONC 64 // concurrent probes; a /24 sweeps in ~4 waves
-
-int discover_scan(struct discovered *out, int max, bool verbose)
+// The /24 of every usable IPv4 interface (deduplicated: wired and wireless
+// commonly share a subnet), plus our own addresses so a sweep can skip
+// them. C64U_DISCOVER_NET replaces the list with that one /24. Returns the
+// number of nets (max 8); self may be NULL.
+static int local_nets(uint32_t nets[8], uint32_t self[16], int *nself_out)
 {
-    long port = 80;
-    const char *penv = getenv("C64U_DISCOVER_PORT");
-    if (penv)
-        port = atol(penv);
-    // password-protected Ultimates refuse /v1/info without the header
-    struct curl_slist *pwhdr = NULL;
-    if (getenv("C64U_PASSWORD")) {
-        char h[160];
-        snprintf(h, sizeof h, "X-Password: %s", getenv("C64U_PASSWORD"));
-        pwhdr = curl_slist_append(NULL, h);
-    }
-
-    // Collect the /24 of every usable IPv4 interface (deduplicated: wired and
-    // wireless commonly share a subnet), remembering our own addresses so the
-    // sweep skips them.
-    uint32_t nets[8], self[16];
     int nnets = 0, nself = 0;
     const char *nenv = getenv("C64U_DISCOVER_NET");
     if (nenv) {
@@ -121,7 +107,7 @@ int discover_scan(struct discovered *out, int max, bool verbose)
             // skips /32 VPN endpoints (Tailscale, WireGuard).
             if (i->mask & 0xFF)
                 continue;
-            if (nself < 16)
+            if (self && nself < 16)
                 self[nself++] = i->addr;
             uint32_t net = i->addr & 0xFFFFFF00u;
             bool dup = false;
@@ -131,6 +117,58 @@ int discover_scan(struct discovered *out, int max, bool verbose)
                 nets[nnets++] = net;
         }
     }
+    if (nself_out)
+        *nself_out = nself;
+    return nnets;
+}
+
+static long discover_port(void)
+{
+    const char *penv = getenv("C64U_DISCOVER_PORT");
+    return penv ? atol(penv) : 80;
+}
+
+bool discover_services_off(char *ip, size_t cap)
+{
+    uint32_t nets[8];
+    int nnets = local_nets(nets, NULL, NULL);
+    for (int k = 0; k < nnets; k++)
+        for (uint32_t h = 1; h < 255; h++) {
+            char cand[COMPAT_IP_STRLEN];
+            compat_ipv4_format(nets[k] | h, cand, sizeof cand);
+            if (!discover_ip_is_wired(cand))
+                continue;
+            // a neighbor entry can outlive a machine that was switched
+            // off; a refused connection proves it is up right now
+            compat_sock s = compat_tcp_connect(cand, (uint16_t)discover_port(), 1);
+            if (s != COMPAT_BAD_SOCK) {
+                compat_close(s); // it answers after all: not our case
+                continue;
+            }
+            if (compat_neterr_refused()) {
+                snprintf(ip, cap, "%s", cand);
+                return true;
+            }
+        }
+    return false;
+}
+
+#define DISC_CONC 64 // concurrent probes; a /24 sweeps in ~4 waves
+
+int discover_scan(struct discovered *out, int max, bool verbose)
+{
+    long port = discover_port();
+    // password-protected Ultimates refuse /v1/info without the header
+    struct curl_slist *pwhdr = NULL;
+    if (getenv("C64U_PASSWORD")) {
+        char h[160];
+        snprintf(h, sizeof h, "X-Password: %s", getenv("C64U_PASSWORD"));
+        pwhdr = curl_slist_append(NULL, h);
+    }
+
+    uint32_t nets[8], self[16];
+    int nself = 0;
+    int nnets = local_nets(nets, self, &nself);
 
     CURLM *multi = curl_multi_init();
     if (!multi)

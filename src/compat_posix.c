@@ -158,6 +158,16 @@ bool compat_neterr_transient(void)
     return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
 }
 
+bool compat_neterr_refused(void)
+{
+    return errno == ECONNREFUSED;
+}
+
+bool compat_errno_refused(long os_errno)
+{
+    return os_errno == ECONNREFUSED;
+}
+
 bool compat_route_source_ip(const char *ip, char *out, size_t cap)
 {
     int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);

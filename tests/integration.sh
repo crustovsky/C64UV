@@ -241,7 +241,42 @@ if timeout 10 ./c64uv --host 127.0.0.42:8064 --joy jump 2>/dev/null; then
     echo "--joy accepted a bad input name"; exit 1
 fi
 ! grep -q 'machine:input' "$out/disc.log"
+# Joystick Swapper on "Swapped" (the machine's default): the API's ports
+# trade places, so the C64's port 2 goes out as API port 1.
+curl -s -X PUT "http://127.0.0.42:8064/v1/configs/U64%20Specific%20Settings/Joystick%20Swapper?value=Swapped" >/dev/null
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --joy 2:fire 2> "$out/swap.err"
+grep -q '"port":1,"inputs":\["fire"\],"transition":"press"' "$out/disc.log"
+grep -q 'joystick port 2: fire OK' "$out/swap.err"
+curl -s -X PUT "http://127.0.0.42:8064/v1/configs/U64%20Specific%20Settings/Joystick%20Swapper?value=Normal" >/dev/null
 echo "joystick test passed"
+
+# ------------------------------------------------------------ services off
+# After a firmware update the Ultimate answers pings but refuses every TCP
+# service. A closed loopback port stands in: each path must say which
+# service is off instead of "no response", and discovery must name a
+# machine whose wired MAC it saw while port 80 refused.
+
+if ./c64uv --host 127.0.0.44:8064 --do reset 2> "$out/off.err"; then
+    echo "--do against a closed port succeeded"; exit 1
+fi
+grep -q "Web Remote Control service is off" "$out/off.err"
+C64U_DMA_PORT=8068 ./c64uv --host 127.0.0.42:8064 --type hi 2> "$out/off.err" && exit 1
+grep -q "Ultimate DMA Service is off" "$out/off.err"
+./c64uv --host 127.0.0.44 --term-test 2> "$out/off.err" && exit 1
+grep -q "Telnet Remote Menu Service is off" "$out/off.err"
+printf '%s\n%s\n' \
+    "IP address       HW type     Flags       HW address            Mask     Device" \
+    "127.0.0.77       0x1         0x2         02:15:41:aa:bb:cc     *        eth0" \
+    > "$out/arp.txt"
+C64U_ARP_TABLE="$out/arp.txt" C64U_DISCOVER_NET=127.0.0.0 \
+    C64U_DISCOVER_PORT=8068 ./c64uv --discover 2> "$out/off.err" && exit 1
+grep -q "switched on at 127.0.0.77" "$out/off.err"
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+    timeout 5 ./c64uv --host 127.0.0.44:8064 --dest 127.0.0.1 \
+    --port "$VPORT" --no-audio 2> "$out/off.err" || true
+grep -q "stream start: connection refused" "$out/off.err"
+echo "services-off test passed"
 
 # ----------------------------------------------------------------- gamepad
 # The windowed path with a virtual pad (uinput; skipped where that is not
@@ -272,6 +307,32 @@ if [ -w /dev/uinput ]; then
     done
     grep -q "joystick on port 1" "$out/pad.err"
     echo "gamepad test passed"
+
+    # Two pads: the first drives port 2, the second port 1; Back on either
+    # swaps both, and unplugging one releases only its own port.
+    : > "$out/disc.log"
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+        SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 \
+        timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
+        --port "$VPORT" --no-audio 2> "$out/pad2.err" &
+    padpid=$!
+    pids+=($padpid)
+    for _ in $(seq 1 80); do
+        grep -q "machine:input available" "$out/pad2.err" && break
+        sleep 0.25
+    done
+    python3 tests/virtualpad.py wait=1.5 a=1 2:left=1 a=0 2:left=0 \
+        2:back=1 2:back=0 a=1 2:x=1 unplug=1 wait=0.3 2:x=0 wait=0.3
+    kill -TERM $padpid; wait $padpid || true
+    for want in "2 fire press" "1 left press" "2 fire release" \
+        "1 left release" "1 fire press" "2 fire2 press" "1 fire release" \
+        "2 fire2 release"; do
+        # shellcheck disable=SC2086,SC2059
+        grep -q "$(printf "$j" $want)" "$out/disc.log"
+    done
+    grep -q "drives joystick port 1" "$out/pad2.err"
+    grep -q "gamepad on port 1 unplugged" "$out/pad2.err"
+    echo "two-gamepad test passed"
 else
     echo "gamepad test skipped (/dev/uinput not writable)"
 fi

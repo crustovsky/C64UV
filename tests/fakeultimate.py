@@ -24,6 +24,12 @@ import socket
 import sys
 import threading
 
+SWAPPER_PATH = "/v1/configs/U64%20Specific%20Settings/Joystick%20Swapper"
+# Settings a test can change with a PUT ...?value=, like on the machine.
+# The real default is "Swapped"; "Normal" keeps the API's port numbers equal
+# to the C64's, which is what most tests want to read in the log.
+STATE = {"swapper": "Normal"}
+
 LEN24_CMDS = (0xFF0A, 0xFF0B, 0xFF0D)  # MOUNT_IMG, RUN_IMG, RUN_CRT
 
 
@@ -166,6 +172,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "Cartridge": {"current": "Retro Replay",
                                       "presets": ["", "Retro Replay"],
                                       "default": ""}}, "errors": []})
+        elif self.path == SWAPPER_PATH:
+            self._json({"U64 Specific Settings": {
+                        "Joystick Swapper": {"current": STATE["swapper"],
+                                             "values": ["Normal", "Swapped"],
+                                             "default": "Swapped"}},
+                        "errors": []})
         elif self.path.startswith("/v1/machine:readmem?address=0400"):
             # a text screen: READY. on row 0 (screen codes), blanks elsewhere
             screen = bytearray(b"\x20" * 1000)
@@ -184,6 +196,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         n = int(self.headers.get("Content-Length") or 0)
         self._log(self.rfile.read(n) if n else b"")
+        if self.path.startswith(SWAPPER_PATH + "?value="):
+            STATE["swapper"] = self.path.split("=", 1)[1]
         self._json({"errors": []})
 
     do_POST = do_PUT

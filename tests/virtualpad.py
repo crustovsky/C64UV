@@ -8,8 +8,9 @@ plays the steps given on the command line:
 
 name=1/0 presses/releases a button (a b x y back start up down left right;
 the last four are the d-pad), stick=X,Y moves the left stick, wait=S
-sleeps. Every step is followed by a short pause so the viewer sees each
-state. Used by tests/integration.sh when /dev/uinput is writable.
+sleeps. A step prefixed "2:" goes to a second pad (created when any step
+names it), and unplug=1 removes a pad mid-script. Every step is followed by
+a short pause so the viewer sees each state. Used by tests/integration.sh when /dev/uinput is writable.
 """
 import fcntl
 import os
@@ -38,7 +39,7 @@ def emit(fd, etype, code, value):
     os.write(fd, struct.pack("llHHi", 0, 0, EV_SYN, 0, 0))
 
 
-def main():
+def make_pad(name):
     fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
     fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
     for code in BUTTONS.values():
@@ -54,14 +55,31 @@ def main():
                     struct.pack("HHiiiiii", code, 0, 0, lo, hi, 0, 0, 0))
     # uinput_setup: bus USB, Microsoft X-Box 360 pad
     fcntl.ioctl(fd, UI_DEV_SETUP,
-                struct.pack("HHHH80sI", 3, 0x045E, 0x028E, 0x0114,
-                            b"c64uv test pad", 0))
+                struct.pack("HHHH80sI", 3, 0x045E, 0x028E, 0x0114, name, 0))
     fcntl.ioctl(fd, UI_DEV_CREATE)
+    return fd
+
+
+def main():
+    steps = sys.argv[1:]
+    fds = [make_pad(b"c64uv test pad")]
+    if any(s.startswith("2:") for s in steps):
+        time.sleep(0.7)  # the viewer must see the first pad first
+        fds.append(make_pad(b"c64uv test pad 2"))
     try:
-        for step in sys.argv[1:]:
+        for step in steps:
+            fd = fds[0]
+            if step.startswith("2:"):
+                fd, step = fds[1], step[2:]
             name, _, val = step.partition("=")
             if name == "wait":
                 time.sleep(float(val))
+                continue
+            if name == "unplug":  # this pad goes away, the other stays
+                fcntl.ioctl(fd, UI_DEV_DESTROY)
+                os.close(fd)
+                fds[fds.index(fd)] = None
+                time.sleep(0.3)
                 continue
             if name == "stick":
                 x, y = (int(v) for v in val.split(","))
@@ -74,8 +92,10 @@ def main():
                 emit(fd, EV_KEY, BUTTONS[name], int(val))
             time.sleep(0.15)
     finally:
-        fcntl.ioctl(fd, UI_DEV_DESTROY)
-        os.close(fd)
+        for fd in fds:
+            if fd is not None:
+                fcntl.ioctl(fd, UI_DEV_DESTROY)
+                os.close(fd)
 
 
 if __name__ == "__main__":

@@ -90,6 +90,13 @@ const char *compat_neterr(void);
 // EWOULDBLOCK, EINTR; WSAEWOULDBLOCK, WSAETIMEDOUT), i.e. worth retrying.
 bool compat_neterr_transient(void);
 
+// True when the last socket error was a refused connection: the host is up
+// but nothing listens on the port (an Ultimate with that service off).
+bool compat_neterr_refused(void);
+// The same test for an OS error number obtained elsewhere (libcurl's
+// CURLINFO_OS_ERRNO).
+bool compat_errno_refused(long os_errno);
+
 // Source address the OS would use to reach `ip` (UDP connect +
 // getsockname). Dotted quad in out (>= COMPAT_IP_STRLEN bytes).
 bool compat_route_source_ip(const char *ip, char *out, size_t cap);
