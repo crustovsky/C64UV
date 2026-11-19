@@ -33,4 +33,11 @@ bool json_find_str(const char *json, const char *key, char *out, size_t cap);
 // (tests point compat_neighbor_mac at a fixture via C64U_ARP_TABLE).
 bool discover_ip_is_wired(const char *ip);
 
+// For a sweep that found nothing: looks for an Ultimate that is switched on
+// but has its web service off (a firmware update turns every network
+// service off). Such a machine cannot answer /v1/info, but the sweep's
+// connection attempt left its wired MAC (02:15:41) in the neighbor table
+// and port 80 refuses the connection. True with its address in `ip`.
+bool discover_services_off(char *ip, size_t cap);
+
 #endif

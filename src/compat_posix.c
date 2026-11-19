@@ -158,6 +158,16 @@ bool compat_neterr_transient(void)
     return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
 }
 
+bool compat_neterr_refused(void)
+{
+    return errno == ECONNREFUSED;
+}
+
+bool compat_errno_refused(long os_errno)
+{
+    return os_errno == ECONNREFUSED;
+}
+
 bool compat_route_source_ip(const char *ip, char *out, size_t cap)
 {
     int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -229,17 +239,20 @@ bool compat_neighbor_mac(const char *ip, char *out, size_t cap)
 // prime is a ping, not a bare datagram (a datagram to the stream port gets
 // no reply and leaves the table empty: "Network Host Resolve Error").
 // ping may force the egress device (-I) without privileges.
-void compat_arp_prime(compat_sock s, const char *ip, const char *ifname)
+bool compat_arp_prime(compat_sock s, const char *ip, const char *ifname)
 {
     (void)s;
     uint32_t a;
     if (!compat_ipv4_parse(ip, &a))
-        return; // hostnames never reach a shell
+        return true; // hostnames never reach a shell
     char dev[48] = "";
     if (ifname && ifname[0])
         snprintf(dev, sizeof dev, "-I '%s'", ifname);
     char cmd[160];
     snprintf(cmd, sizeof cmd, "ping -n -q -c 1 -W 1 %s '%s' >/dev/null 2>&1",
              dev, ip);
-    (void)!system(cmd);
+    int rc = system(cmd);
+    // ping exits 1 for "no reply"; anything else (no ping binary, a
+    // signal) says nothing about the path
+    return !(rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 1);
 }

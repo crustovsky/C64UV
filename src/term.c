@@ -252,6 +252,120 @@ void term_draw_text(uint32_t *px, int pitch_px, int x, int y, uint32_t color,
     }
 }
 
+// ------------------------------------------------- REST menu screen
+//
+// Shapes of the firmware's own character set below 0x20 (its chars.bin;
+// names from the upstream menu_screen_tool.py): box corners, edges and
+// tees, a block, a half block and a diamond. Corners and tees are drawn
+// from their arms, which meet in the middle of the cell.
+enum { ARM_U = 1, ARM_D = 2, ARM_L = 4, ARM_R = 8, SHAPE_BLOCK = 16,
+       SHAPE_UPPER = 32, SHAPE_DIAMOND = 64 };
+
+static const uint8_t menu_shapes[0x20] = {
+    [0x01] = ARM_D | ARM_R,         [0x02] = ARM_L | ARM_R,
+    [0x03] = ARM_L | ARM_D,         [0x04] = ARM_U | ARM_D,
+    [0x05] = ARM_U | ARM_R,         [0x06] = ARM_U | ARM_L,
+    [0x07] = ARM_D | ARM_R,         [0x08] = ARM_L | ARM_R | ARM_D,
+    [0x09] = ARM_L | ARM_D,         [0x0A] = ARM_U | ARM_D | ARM_R,
+    [0x0B] = SHAPE_BLOCK,           [0x0C] = ARM_U | ARM_D | ARM_L,
+    [0x0D] = ARM_L | ARM_R | ARM_U, [0x0E] = ARM_U | ARM_R,
+    [0x0F] = ARM_U | ARM_L,         [0x10] = SHAPE_DIAMOND,
+    [0x11] = SHAPE_DIAMOND,         [0x12] = SHAPE_UPPER,
+    [0x13] = SHAPE_DIAMOND,
+};
+
+// One pixel row of a cell, bit 0 = leftmost pixel (the font's order).
+static uint8_t menu_glyph_row(uint8_t code, int y)
+{
+    code &= 0x7F;
+    if (code >= 0x20)
+        return (uint8_t)font8x8_basic[code][y];
+    uint8_t sh = menu_shapes[code], bits = 0;
+    if (sh & SHAPE_BLOCK)
+        return y >= 1 ? 0xFF : 0;
+    if (sh & SHAPE_UPPER)
+        return y < 4 ? 0xFF : 0;
+    if (sh & SHAPE_DIAMOND) {
+        static const uint8_t d[8] = {0x00, 0x18, 0x3C, 0x7E, 0x7E, 0x3C,
+                                     0x18, 0x00};
+        return d[y];
+    }
+    if (((sh & ARM_U) && y <= 4) || ((sh & ARM_D) && y >= 3))
+        bits |= 0x18; // vertical stroke, columns 3-4
+    if (y == 3 || y == 4) {
+        if (sh & ARM_L)
+            bits |= 0x1F; // columns 0-4
+        if (sh & ARM_R)
+            bits |= 0xF8; // columns 3-7
+    }
+    return bits;
+}
+
+uint32_t term_vic_color(int index)
+{
+    return vic_palette[index & 0x0F];
+}
+
+int menu_guess_bg(const uint8_t *scr)
+{
+    const int cells = MENU_COLS * MENU_ROWS;
+    for (int i = 0; i < cells; i++)
+        if (scr[i] & scr[cells + i] & 0x80)
+            return scr[cells + i] >> 4 & 0x0F;
+    return -1;
+}
+
+void menu_render(const uint8_t *scr, int bg, uint32_t *px, int pitch_px)
+{
+    const int cells = MENU_COLS * MENU_ROWS;
+    for (int i = 0; i < cells; i++) {
+        uint8_t ch = scr[i];
+        uint32_t fgc = vic_palette[scr[cells + i] & 0x0F];
+        int hi = scr[cells + i] >> 4; // 0 = the screen background
+        uint32_t bgc = vic_palette[(hi ? hi : bg) & 0x0F];
+        if (ch & 0x80) { uint32_t tmp = fgc; fgc = bgc; bgc = tmp; }
+        int row = i / MENU_COLS, col = i % MENU_COLS;
+        for (int y = 0; y < 8; y++) {
+            uint32_t *out = px + (row * 8 + y) * pitch_px + col * 8;
+            uint8_t bits = menu_glyph_row(ch, y);
+            for (int x = 0; x < 8; x++)
+                out[x] = (bits >> x & 1) ? fgc : bgc;
+        }
+    }
+}
+
+void menu_row_text(const uint8_t *scr, int row, char *out)
+{
+    for (int col = 0; col < MENU_COLS; col++) {
+        uint8_t code = scr[row * MENU_COLS + col] & 0x7F;
+        char c = (char)code;
+        if (code == 0x7F) {
+            c = ' ';
+        } else if (code < 0x20) {
+            uint8_t sh = menu_shapes[code];
+            uint8_t arms = sh & (ARM_U | ARM_D | ARM_L | ARM_R);
+            c = code == 0 ? ' '
+                : (sh & (SHAPE_BLOCK | SHAPE_UPPER)) ? '#'
+                : (sh & SHAPE_DIAMOND) ? '*'
+                : arms == (ARM_L | ARM_R) ? '-'
+                : arms == (ARM_U | ARM_D) ? '|'
+                : arms ? '+' : ' ';
+        }
+        out[col] = c;
+    }
+    out[MENU_COLS] = '\0';
+}
+
+bool menu_row_selected(const uint8_t *scr, int row)
+{
+    const int cells = MENU_COLS * MENU_ROWS;
+    for (int col = 0; col < MENU_COLS; col++)
+        if (scr[row * MENU_COLS + col] & scr[cells + row * MENU_COLS + col] &
+            0x80)
+            return true;
+    return false;
+}
+
 int term_encode_key(SDL_Keycode key, SDL_Keymod mod, uint8_t *out)
 {
     (void)mod;

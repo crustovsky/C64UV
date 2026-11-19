@@ -224,6 +224,150 @@ test "$(wc -l < "$out/screen.txt")" = 25
 head -1 "$out/screen.txt" | grep -q '^READY\. *$'
 echo "type/screen test passed"
 
+# ------------------------------------------------------------- matrix keys
+# --keys and --type --matrix go through machine:input as press/release
+# pairs (never tap, which overlaps); a bad key name is a usage error that
+# sends nothing.
+
+matrix_log() { # the logged machine:input bodies must be exactly these strokes
+    python3 - "$out/disc.log" "$@" <<'PYEOF'
+import sys
+log = [l.split(" ", 3)[3] for l in open(sys.argv[1]).read().splitlines()
+       if l.startswith("POST /v1/machine:input")]
+k = '{"events":[{"kind":"keyboard","inputs":[%s],"transition":"%s"}]}'
+want = [k % (",".join('"%s"' % n for n in stroke.split("+")), t)
+        for stroke in sys.argv[2:] for t in ("press", "release")]
+assert log == want, log
+PYEOF
+}
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --keys "f1,left_shift+a:200 run_stop"
+matrix_log f1 left_shift+a run_stop
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --matrix --type 'A"\n' --screen > "$out/screen.txt"
+matrix_log a left_shift+2 return
+test "$(wc -l < "$out/screen.txt")" = 25
+grep -q "DMA cmd" "$out/disc.log" && exit 1 # nothing through the buffer
+: > "$out/disc.log"
+rc=0; ./c64uv --host 127.0.0.42:8064 --keys "f1,enter" 2>/dev/null || rc=$?
+test "$rc" = 2
+! grep -q 'machine:input' "$out/disc.log"
+echo "matrix keys test passed"
+
+# -------------------------------------------------------------- menu screen
+# --menu-screen prints the open menu as text with the selected row marked;
+# with the menu closed (404) it fails. --keys drives the menu.
+
+if timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen 2>/dev/null; then
+    echo "--menu-screen succeeded with the menu closed"; exit 1
+fi
+timeout 8 ./c64uv --host 127.0.0.42:8064 --do menu
+timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen > "$out/menu.txt"
+test "$(wc -l < "$out/menu.txt")" = 25
+head -1 "$out/menu.txt" | grep -q '^  +--------------------------------------+$'
+grep -q '^> |.Disk File Browser' "$out/menu.txt"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --keys cursor_up_down
+timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen > "$out/menu.txt"
+grep -q '^> |.Assembly 64 Query' "$out/menu.txt"
+grep -q '^  |.Disk File Browser' "$out/menu.txt"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --keys run_stop # leaves the menu
+timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen 2>/dev/null && exit 1
+echo "menu screen test passed"
+
+# -------------------------------------------------------------------- mouse
+# --mouse-send turns its items into machine:input mouse events; a bad item
+# is a usage error that sends nothing.
+
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --mouse-send "move:40:-10 left, move:300:0"
+grep -q '{"events":\[{"kind":"mouse","move":{"x":40,"y":-10}}\]}' "$out/disc.log"
+grep -q '{"kind":"mouse","inputs":\["left"\],"transition":"tap"}' "$out/disc.log"
+grep -q '{"kind":"mouse","path":\[\[100,0\],\[100,0\],\[100,0\]\]}' "$out/disc.log"
+: > "$out/disc.log"
+rc=0; ./c64uv --host 127.0.0.42:8064 --mouse-send "move:5:5 click" 2>/dev/null || rc=$?
+test "$rc" = 2
+! grep -q 'machine:input' "$out/disc.log"
+echo "mouse send test passed"
+
+# ------------------------------------------------------- windowed, scripted
+# The window itself, driven through the C64U_TEST_EVENTS hook under SDL's
+# dummy video driver. Ctrl+G grabs the mouse as a 1351 (the fake lists a
+# mouse in machine:input): motion and buttons go out as mouse events, and
+# stop when released. F9 then opens the REST menu view (one menu_button
+# press), cursor down reaches the menu as a key, F9 closes it (the second
+# press). Ctrl+M (the third) attaches the same view, RUN/STOP leaves the
+# menu on the machine and the view follows without another press; opened
+# once more (the fourth), quitting closes it on the machine (the fifth).
+
+viewer() { # viewer <logname> <events> [flags...]: runs until the script ends
+    local name=$1 events=$2; shift 2
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy C64U_TEST_EVENTS="$events" \
+        timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
+        --port "$VPORT" --no-audio "$@" 2> "$out/$name.err" &
+    vpid=$!
+    pids+=($vpid)
+}
+: > "$out/disc.log"
+viewer win "ready wait=300 key=ctrl+p wait=200 key=ctrl+p wait=200 \
+key=ctrl+g wait=200 move=12,-4 wait=300 \
+button=left:1 wait=200 button=left:0 wait=300 key=ctrl+g wait=200 move=50,50 \
+wait=300 key=f9 wait=700 key=down wait=400 key=f9 wait=600 key=ctrl+m \
+wait=700 key=escape wait=700 key=f9 wait=700"
+for _ in $(seq 1 100); do
+    [ "$(grep -c 'menu view: showing' "$out/win.err")" = 3 ] && break
+    sleep 0.2
+done
+sleep 0.3
+test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 4
+kill -TERM $vpid; wait $vpid || true
+grep -q "mouse grabbed: 1351 mouse in port 1" "$out/win.err"
+# Ctrl+P twice: pause, then resume (the toggle follows the answers)
+python3 - "$out/disc.log" <<'PYEOF2'
+import sys
+log = [l for l in open(sys.argv[1]).read().splitlines()
+       if l.startswith("PUT /v1/machine:pause") or l.startswith("PUT /v1/machine:resume")]
+assert log == ["PUT /v1/machine:pause", "PUT /v1/machine:resume"], log
+PYEOF2
+grep -q '{"kind":"mouse","move":{"x":12,"y":-4}}' "$out/disc.log"
+grep -q '{"kind":"mouse","inputs":\["left"\],"transition":"press"}' "$out/disc.log"
+grep -q '{"kind":"mouse","inputs":\["left"\],"transition":"release"}' "$out/disc.log"
+! grep -q '"x":50' "$out/disc.log" # released: motion stays on the PC
+grep -q "machine:menu_screen available" "$out/win.err"
+grep -q "menu view closed" "$out/win.err"
+grep -q '"inputs":\["cursor_up_down"\],"transition":"press"' "$out/disc.log"
+grep -q "menu view: the menu closed on the machine" "$out/win.err"
+test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 5 # quit closed it
+timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen 2>/dev/null && exit 1
+echo "windowed mouse + menu view test passed"
+
+# The same grab on firmware without mouse events (and with --mouse-joy on
+# any): the mouse steers the joystick, on port 1 for GEOS's JOYSTICK
+# driver, held while it moves and released after --mouse-hold.
+curl -s -X PUT "http://127.0.0.42:8064/test/mouse?value=0" >/dev/null
+: > "$out/disc.log"
+viewer mjoy "ready wait=300 key=ctrl+g wait=200 move=30,0 wait=500 \
+button=left:1 wait=200 button=left:0 wait=400"
+for _ in $(seq 1 100); do
+    grep -q '"inputs":\["fire"\],"transition":"release"' "$out/disc.log" && break
+    sleep 0.2
+done
+kill -TERM $vpid; wait $vpid || true
+curl -s -X PUT "http://127.0.0.42:8064/test/mouse?value=1" >/dev/null
+grep -q "mouse grabbed: joystick on port 1" "$out/mjoy.err"
+grep -q '"port":1,"inputs":\["right"\],"transition":"press"' "$out/disc.log"
+grep -q '"port":1,"inputs":\["right"\],"transition":"release"' "$out/disc.log"
+grep -q '"port":1,"inputs":\["fire"\],"transition":"press"' "$out/disc.log"
+! grep -q '"kind":"mouse"' "$out/disc.log"
+: > "$out/disc.log"
+viewer mjoy2 "ready wait=300 key=ctrl+g wait=200 move=0,30 wait=500" --mouse-joy --joy-port 2
+for _ in $(seq 1 100); do
+    grep -q '"inputs":\["down"\],"transition":"release"' "$out/disc.log" && break
+    sleep 0.2
+done
+kill -TERM $vpid; wait $vpid || true
+grep -q '"port":2,"inputs":\["down"\],"transition":"press"' "$out/disc.log"
+echo "windowed mouse joystick test passed"
+
 # ---------------------------------------------------------------- joystick
 # --joy presses and releases the named inputs on the given control port
 # through machine:input; a bad input name is a usage-level refusal.
@@ -241,17 +385,55 @@ if timeout 10 ./c64uv --host 127.0.0.42:8064 --joy jump 2>/dev/null; then
     echo "--joy accepted a bad input name"; exit 1
 fi
 ! grep -q 'machine:input' "$out/disc.log"
+# Joystick Swapper on "Swapped" (the machine's default): the API's ports
+# trade places, so the C64's port 2 goes out as API port 1.
+curl -s -X PUT "http://127.0.0.42:8064/v1/configs/U64%20Specific%20Settings/Joystick%20Swapper?value=Swapped" >/dev/null
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --joy 2:fire 2> "$out/swap.err"
+grep -q '"port":1,"inputs":\["fire"\],"transition":"press"' "$out/disc.log"
+grep -q 'joystick port 2: fire OK' "$out/swap.err"
+curl -s -X PUT "http://127.0.0.42:8064/v1/configs/U64%20Specific%20Settings/Joystick%20Swapper?value=Normal" >/dev/null
 echo "joystick test passed"
+
+# ------------------------------------------------------------ services off
+# After a firmware update the Ultimate answers pings but refuses every TCP
+# service. A closed loopback port stands in: each path must say which
+# service is off instead of "no response", and discovery must name a
+# machine whose wired MAC it saw while port 80 refused.
+
+if ./c64uv --host 127.0.0.44:8064 --do reset 2> "$out/off.err"; then
+    echo "--do against a closed port succeeded"; exit 1
+fi
+grep -q "Web Remote Control service is off" "$out/off.err"
+C64U_DMA_PORT=8068 ./c64uv --host 127.0.0.42:8064 --type hi 2> "$out/off.err" && exit 1
+grep -q "Ultimate DMA Service is off" "$out/off.err"
+./c64uv --host 127.0.0.44 --term-test 2> "$out/off.err" && exit 1
+grep -q "Telnet Remote Menu Service is off" "$out/off.err"
+printf '%s\n%s\n' \
+    "IP address       HW type     Flags       HW address            Mask     Device" \
+    "127.0.0.77       0x1         0x2         02:15:41:aa:bb:cc     *        eth0" \
+    > "$out/arp.txt"
+C64U_ARP_TABLE="$out/arp.txt" C64U_DISCOVER_NET=127.0.0.0 \
+    C64U_DISCOVER_PORT=8068 ./c64uv --discover 2> "$out/off.err" && exit 1
+grep -q "switched on at 127.0.0.77" "$out/off.err"
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+    timeout 5 ./c64uv --host 127.0.0.44:8064 --dest 127.0.0.1 \
+    --port "$VPORT" --no-audio 2> "$out/off.err" || true
+grep -q "stream start: connection refused" "$out/off.err"
+echo "services-off test passed"
 
 # ----------------------------------------------------------------- gamepad
 # The windowed path with a virtual pad (uinput; skipped where that is not
 # writable, e.g. CI containers): buttons, d-pad and stick become joystick
 # events on port 2, Back swaps to port 1, unplugging releases what is held.
 
+# A real controller connected to this PC would take the first pad slot, so
+# the viewers under test only accept the virtual pad's USB ids.
 if [ -w /dev/uinput ]; then
     : > "$out/disc.log"
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
         SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 \
+        SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x045E/0x028E \
         timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
         --port "$VPORT" --no-audio 2> "$out/pad.err" &
     padpid=$!
@@ -272,8 +454,94 @@ if [ -w /dev/uinput ]; then
     done
     grep -q "joystick on port 1" "$out/pad.err"
     echo "gamepad test passed"
+
+    # Two pads: the first drives port 2, the second port 1; Back on either
+    # swaps both, and unplugging one releases only its own port.
+    : > "$out/disc.log"
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+        SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 \
+        SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x045E/0x028E \
+        timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
+        --port "$VPORT" --no-audio 2> "$out/pad2.err" &
+    padpid=$!
+    pids+=($padpid)
+    for _ in $(seq 1 80); do
+        grep -q "machine:input available" "$out/pad2.err" && break
+        sleep 0.25
+    done
+    python3 tests/virtualpad.py wait=1.5 a=1 2:left=1 a=0 2:left=0 \
+        2:back=1 2:back=0 a=1 2:x=1 unplug=1 wait=0.3 2:x=0 wait=0.3
+    kill -TERM $padpid; wait $padpid || true
+    for want in "2 fire press" "1 left press" "2 fire release" \
+        "1 left release" "1 fire press" "2 fire2 press" "1 fire release" \
+        "2 fire2 release"; do
+        # shellcheck disable=SC2086,SC2059
+        grep -q "$(printf "$j" $want)" "$out/disc.log"
+    done
+    grep -q "drives joystick port 1" "$out/pad2.err"
+    grep -q "gamepad on port 1 unplugged" "$out/pad2.err"
+    echo "two-gamepad test passed"
+
+    # The REST menu view, driven by the pad: Start opens the menu (one
+    # menu_button press, then the screen is polled), the d-pad becomes
+    # cursor keys instead of joystick lines, Start closes it again (the
+    # second press), and A is fire again.
+    : > "$out/disc.log"
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+        SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 \
+        SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x045E/0x028E \
+        timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
+        --port "$VPORT" --no-audio 2> "$out/menu.err" &
+    padpid=$!
+    pids+=($padpid)
+    for _ in $(seq 1 80); do
+        grep -q "machine:menu_screen available" "$out/menu.err" && break
+        sleep 0.25
+    done
+    python3 tests/virtualpad.py wait=1.5 start=1 start=0 wait=0.6 down=1 \
+        down=0 wait=0.3 start=1 start=0 wait=0.6 a=1 a=0 wait=0.3
+    grep -q "menu view: showing the Ultimate menu" "$out/menu.err"
+    grep -q "menu view closed" "$out/menu.err"
+    test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 2
+    grep -q '"inputs":\["cursor_up_down"\],"transition":"press"' "$out/disc.log"
+    ! grep -q '"kind":"joystick".*"down"' "$out/disc.log" # not a joystick there
+    grep -q '"port":2,"inputs":\["fire"\],"transition":"press"' "$out/disc.log"
+    # quitting with the view open closes the menu on the machine
+    python3 tests/virtualpad.py wait=1 start=1 start=0 wait=0.8
+    test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 3
+    kill -TERM $padpid; wait $padpid || true
+    test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 4
+    timeout 10 ./c64uv --host 127.0.0.42:8064 --menu-screen 2>/dev/null && exit 1
+    echo "menu view test passed"
 else
     echo "gamepad test skipped (/dev/uinput not writable)"
+fi
+
+# ------------------------------------------------------- dead stream link
+# The machine answers REST but not a ping out of the interface the stream
+# should arrive on (seen for real: the wired interface lost its subnet
+# route to an address-conflict false alarm, and everything went over
+# WiFi). In a private network namespace with echo replies switched off the
+# viewer must say so. Skipped where unprivileged namespaces are not allowed.
+
+if unshare -Urn true 2>/dev/null; then
+    cat > "$out/linkdead.sh" <<'LDEOF'
+set -e
+ip link set lo up
+sysctl -qw net.ipv4.icmp_echo_ignore_all=1
+python3 tests/fakeultimate.py 127.0.0.42 80 "$1/ld.log" &
+fp=$!
+sleep 0.4
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy timeout 13 ./c64uv \
+    --host 127.0.0.42 --dest 127.0.0.1 --port 21000 --no-audio \
+    2> "$1/ld.err" || true
+kill $fp
+LDEOF
+    unshare -Urn bash "$out/linkdead.sh" "$out"
+    grep -q "answers its REST API but no ping sent out of lo" "$out/ld.err"
+    echo "dead stream link test passed"
+else
+    echo "dead stream link test skipped (no unprivileged namespaces)"
 fi
 
 # ------------------------------------------------------- exit with host gone

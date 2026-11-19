@@ -109,6 +109,105 @@ static int mk_packet(uint8_t *p, uint16_t frame, uint16_t line, bool last,
     return VIDEO_HDR_LEN + 768;
 }
 
+static void test_menu_screen(void)
+{
+    // a payload the way the firmware lays it out: characters, then colours
+    static uint8_t scr[MENU_BYTES];
+    memset(scr, ' ', MENU_COLS * MENU_ROWS);
+    memset(scr + MENU_COLS * MENU_ROWS, 0x0F, MENU_COLS * MENU_ROWS);
+    scr[0] = 0x01; // top-left corner, edge, top-right corner
+    memset(scr + 1, 0x02, MENU_COLS - 2);
+    scr[MENU_COLS - 1] = 0x03;
+    scr[MENU_COLS] = 0x04;
+    memcpy(scr + MENU_COLS + 2, "Disk File Browser", 17);
+    // row 2 is the selected one: bit 7 on characters and colours, white
+    // on light blue the way firmware 1.2.1 sends it (0xE1)
+    const char *sel = "Run Disk";
+    for (int i = 0; i < MENU_COLS; i++) {
+        uint8_t c = i >= 2 && i < 10 ? (uint8_t)sel[i - 2] : ' ';
+        scr[2 * MENU_COLS + i] = c | 0x80;
+        scr[MENU_COLS * MENU_ROWS + 2 * MENU_COLS + i] = 0xE1;
+    }
+    scr[5 * MENU_COLS + 2] = 'X' | 0x80; // a reversed heading cell: plain
+    scr[5 * MENU_COLS + 3] = 0x1C;       // colour byte; and a logo piece
+    scr[3 * MENU_COLS] = 0x0B; // progress block
+    scr[3 * MENU_COLS + 1] = 0x13; // marker
+
+    char line[MENU_COLS + 1];
+    menu_row_text(scr, 0, line);
+    CHECK(line[0] == '+' && line[1] == '-' && line[MENU_COLS - 1] == '+');
+    CHECK(strlen(line) == MENU_COLS);
+    menu_row_text(scr, 1, line);
+    CHECK(line[0] == '|' && !strncmp(line + 2, "Disk File Browser", 17));
+    menu_row_text(scr, 2, line);
+    CHECK(!strncmp(line, "  Run Disk ", 11)); // bit 7 stripped, case kept
+    menu_row_text(scr, 3, line);
+    CHECK(line[0] == '#' && line[1] == '*');
+    CHECK(menu_row_selected(scr, 2) && !menu_row_selected(scr, 1));
+    CHECK(!menu_row_selected(scr, 5)); // reverse alone is a heading
+    menu_row_text(scr, 5, line);
+    CHECK(line[2] == 'X' && line[3] == ' '); // unknown shape: a blank
+
+    static uint32_t px[MENU_PX_W * MENU_PX_H];
+    CHECK(menu_guess_bg(scr) == 14); // from the selected row's 0xE1
+    menu_render(scr, 0, px, MENU_PX_W);
+    const uint32_t black = 0xFF000000, white = 0xFFFFFFFF, grey = 0xFFB2B2B2;
+    // the corner's arms: nothing top-left, the stroke runs right and down
+    CHECK(px[0] == black);
+    CHECK(px[3 * MENU_PX_W + 7] == grey && px[7 * MENU_PX_W + 3] == grey);
+    CHECK(px[3 * MENU_PX_W + 0] == black && px[0 * MENU_PX_W + 3] == black);
+    // edge joins the corner: the stroke is continuous across cells
+    CHECK(px[3 * MENU_PX_W + 8] == grey && px[4 * MENU_PX_W + 15] == grey);
+    // selected row: reverse video, so a blank cell is all foreground
+    // (white) and the letters show in the background colour (light blue)
+    CHECK(px[(2 * 8 + 1) * MENU_PX_W + 0] == white);
+    // unselected blank cell stays black
+    CHECK(px[(5 * 8 + 1) * MENU_PX_W + 0] == black);
+    int lb = 0, wh = 0;
+    for (int y = 16; y < 24; y++)
+        for (int x = 16; x < 24; x++) { // the 'R' of "Run Disk"
+            lb += px[y * MENU_PX_W + x] == 0xFF706DEB;
+            wh += px[y * MENU_PX_W + x] == white;
+        }
+    CHECK(lb > 8 && lb + wh == 64);
+    // on a light blue screen ("Commodore Blue") the empty cells are light
+    // blue, the strokes keep their colour, the selected bar stays white
+    menu_render(scr, 14, px, MENU_PX_W);
+    CHECK(px[0] == 0xFF706DEB && px[(5 * 8 + 1) * MENU_PX_W] == 0xFF706DEB);
+    CHECK(px[3 * MENU_PX_W + 7] == grey);
+    CHECK(px[(2 * 8 + 1) * MENU_PX_W + 0] == white);
+    CHECK(term_vic_color(6) == 0xFF2E2C9B);
+    // progress block fills the cell below its first pixel row
+    CHECK(px[(3 * 8 + 4) * MENU_PX_W + 4] == grey);
+}
+
+// A screen captured from a C64 Ultimate on firmware 1.2.1 (main menu just
+// opened, first entry selected).
+static void test_menu_screen_real(void)
+{
+    static uint8_t scr[MENU_BYTES];
+    FILE *f = fopen("tests/menu_screen.bin", "rb");
+    CHECK(f != NULL);
+    if (!f)
+        return;
+    CHECK(fread(scr, 1, MENU_BYTES, f) == MENU_BYTES);
+    fclose(f);
+    char line[MENU_COLS + 1];
+    menu_row_text(scr, 0, line);
+    CHECK(strstr(line, " COMMODORE 64 ") != NULL);
+    menu_row_text(scr, 2, line);
+    CHECK(!strcmp(line, "+--------------------------------------+"));
+    menu_row_text(scr, 3, line);
+    CHECK(!strncmp(line, "|DISK FILE BROWSER ", 19) && line[39] == '|');
+    menu_row_text(scr, 24, line);
+    CHECK(strstr(line, "F7=Help") != NULL); // mixed case survives
+    int selected = 0;
+    for (int row = 0; row < MENU_ROWS; row++)
+        selected += menu_row_selected(scr, row);
+    CHECK(selected == 1 && menu_row_selected(scr, 3));
+    CHECK(menu_guess_bg(scr) == 14); // the machine was on "Commodore Blue"
+}
+
 static void test_video_assembly(void)
 {
     static struct frame_buf fb;
@@ -196,6 +295,36 @@ static void test_matrix_keys(void)
     CHECK(!matrix_event_json(one, 1, "press", buf, 16)); // too small
 }
 
+static void test_matrix_typing(void)
+{
+    const char *n[2];
+    CHECK(ascii_to_c64_matrix('a', n) == 1 && !strcmp(n[0], "a"));
+    CHECK(ascii_to_c64_matrix('Q', n) == 1 && !strcmp(n[0], "q")); // unshifted
+    CHECK(ascii_to_c64_matrix('7', n) == 1 && !strcmp(n[0], "7"));
+    CHECK(ascii_to_c64_matrix('\n', n) == 1 && !strcmp(n[0], "return"));
+    CHECK(ascii_to_c64_matrix(' ', n) == 1 && !strcmp(n[0], "space"));
+    CHECK(ascii_to_c64_matrix('*', n) == 1 && !strcmp(n[0], "star"));
+    CHECK(ascii_to_c64_matrix('"', n) == 2 && !strcmp(n[0], "left_shift") &&
+          !strcmp(n[1], "2"));
+    CHECK(ascii_to_c64_matrix('?', n) == 2 && !strcmp(n[1], "slash"));
+    CHECK(ascii_to_c64_matrix('$', n) == 2 && !strcmp(n[1], "4"));
+    CHECK(ascii_to_c64_matrix('~', n) == 0); // no such key
+    CHECK(ascii_to_c64_matrix(0xE9, n) == 0);
+    // every character a BASIC line needs resolves to valid API names
+    for (const char *p = "LOAD\"*\",8,1:PRINT(A$+B$)<>3;?"; *p; p++) {
+        int k = ascii_to_c64_matrix((unsigned char)*p, n);
+        CHECK(k >= 1);
+        for (int i = 0; i < k; i++)
+            CHECK(matrix_key_valid(n[i]));
+    }
+    CHECK(matrix_key_valid("run_stop") && matrix_key_valid("f1") &&
+          matrix_key_valid("z") && matrix_key_valid("0") &&
+          matrix_key_valid("restore"));
+    CHECK(!matrix_key_valid("f2") && !matrix_key_valid("enter") &&
+          !matrix_key_valid("") && !matrix_key_valid("A") &&
+          !matrix_key_valid("aa"));
+}
+
 static void test_joystick(void)
 {
     CHECK(pad_button_joy(SDL_GAMEPAD_BUTTON_DPAD_LEFT) == JOY_LEFT);
@@ -211,6 +340,20 @@ static void test_joystick(void)
     CHECK(pad_stick_joy(-32768, 0) == JOY_LEFT);
     CHECK(pad_stick_joy(32767, 32767) == (JOY_RIGHT | JOY_DOWN));
     CHECK(pad_stick_joy(0, -20000) == JOY_UP);
+
+    CHECK(mouse_joy_dir(0, 0, 2) == 0);
+    CHECK(mouse_joy_dir(1, -1, 2) == 0); // dead zone
+    CHECK(mouse_joy_dir(-3, 0, 2) == JOY_LEFT);
+    CHECK(mouse_joy_dir(3, 0, 2) == JOY_RIGHT);
+    CHECK(mouse_joy_dir(0, -3, 2) == JOY_UP); // screen y grows downwards
+    CHECK(mouse_joy_dir(0, 3, 2) == JOY_DOWN);
+    CHECK(mouse_joy_dir(3, -3, 2) == (JOY_RIGHT | JOY_UP));
+
+    // in the menu view the pad steers the menu instead
+    CHECK(pad_menu_key(SDL_GAMEPAD_BUTTON_DPAD_DOWN) == SDLK_DOWN);
+    CHECK(pad_menu_key(SDL_GAMEPAD_BUTTON_SOUTH) == SDLK_RETURN);
+    CHECK(pad_menu_key(SDL_GAMEPAD_BUTTON_EAST) == SDLK_LEFT); // back
+    CHECK(pad_menu_key(SDL_GAMEPAD_BUTTON_START) == SDLK_UNKNOWN);
 
     CHECK(joy_parse("fire") == JOY_FIRE);
     CHECK(joy_parse("up,left,fire2") == (JOY_UP | JOY_LEFT | JOY_FIRE2));
@@ -234,6 +377,51 @@ static void test_joystick(void)
     CHECK(!joy_event_json(2, 0, 0x7f, buf, 40)); // too small
 }
 
+static void test_mouse(void)
+{
+    char b[512];
+    struct mouse_btn_ev ev[2] = {{MOUSE_LEFT, true},
+                                 {MOUSE_LEFT | MOUSE_RIGHT, false}};
+    CHECK(mouse_event_json(5, -3, NULL, 0, b, sizeof b) &&
+          !strcmp(b, "{\"events\":[{\"kind\":\"mouse\",\"move\":{\"x\":5,"
+                     "\"y\":-3}}]}"));
+    CHECK(mouse_event_json(0, 0, ev, 2, b, sizeof b) &&
+          !strcmp(b, "{\"events\":[{\"kind\":\"mouse\",\"inputs\":[\"left\"],"
+                     "\"transition\":\"press\"},{\"kind\":\"mouse\",\"inputs\":"
+                     "[\"left\",\"right\"],\"transition\":\"release\"}]}"));
+    CHECK(mouse_event_json(-127, 127, ev, 1, b, sizeof b) &&
+          strstr(b, "\"move\":{\"x\":-127,\"y\":127}},{\"kind\":\"mouse\","
+                    "\"inputs\":[\"left\"]"));
+    CHECK(!mouse_event_json(0, 0, NULL, 0, b, sizeof b)); // nothing to send
+    CHECK(!mouse_event_json(128, 0, NULL, 0, b, sizeof b)); // beyond a report
+    CHECK(!mouse_event_json(5, 5, ev, 2, b, 40)); // too small
+
+    CHECK(mouse_send_json("left", b, sizeof b) &&
+          !strcmp(b, "{\"events\":[{\"kind\":\"mouse\",\"inputs\":[\"left\"],"
+                     "\"transition\":\"tap\"}]}"));
+    CHECK(mouse_send_json("right:down", b, sizeof b) &&
+          strstr(b, "[\"right\"],\"transition\":\"press\""));
+    CHECK(mouse_send_json("middle:up", b, sizeof b) &&
+          strstr(b, "[\"middle\"],\"transition\":\"release\""));
+    CHECK(mouse_send_json("move:40:-10", b, sizeof b) &&
+          !strcmp(b, "{\"events\":[{\"kind\":\"mouse\",\"move\":{\"x\":40,"
+                     "\"y\":-10}}]}"));
+    // a long move becomes a path whose steps fit a report and add up
+    CHECK(mouse_send_json("move:300:-10", b, sizeof b) &&
+          !strcmp(b, "{\"events\":[{\"kind\":\"mouse\",\"path\":[[100,-3],"
+                     "[100,-3],[100,-4]]}]}"));
+    CHECK(mouse_send_json("wheel:-2", b, sizeof b) &&
+          strstr(b, "\"wheel\":{\"vertical\":-2}"));
+    CHECK(!mouse_send_json("move:0:0", b, sizeof b));
+    CHECK(!mouse_send_json("move:5", b, sizeof b));
+    CHECK(!mouse_send_json("move:5:x", b, sizeof b));
+    CHECK(!mouse_send_json("move:9999:0", b, sizeof b));
+    CHECK(!mouse_send_json("wheel:0", b, sizeof b));
+    CHECK(!mouse_send_json("left:click", b, sizeof b));
+    CHECK(!mouse_send_json("fire", b, sizeof b));
+    CHECK(!mouse_send_json("", b, sizeof b));
+}
+
 static void test_bindings(void)
 {
     // dispatch side of the shared table
@@ -246,6 +434,8 @@ static void test_bindings(void)
     CHECK(viewer_binding_match(SDLK_F10, 0) == VA_HELP);
     CHECK(viewer_binding_match(SDLK_F10, SDL_KMOD_NUM) == VA_HELP); // stray mod
     CHECK(viewer_binding_match(SDLK_M, SDL_KMOD_RCTRL) == VA_MENU_BTN);
+    CHECK(viewer_binding_match(SDLK_G, SDL_KMOD_LCTRL) == VA_MOUSE);
+    CHECK(viewer_binding_match(SDLK_G, 0) == VA_NONE); // plain G types
 
     // table integrity: every row renders in help, no dispatch collisions
     for (int i = 0; i < viewer_bindings_count; i++) {
@@ -365,10 +555,14 @@ int main(void)
     test_term_basics();
     test_term_geometry();
     test_term_keys();
+    test_menu_screen();
+    test_menu_screen_real();
     test_video_assembly();
     test_petscii();
     test_matrix_keys();
+    test_matrix_typing();
     test_joystick();
+    test_mouse();
     test_bindings();
     test_json();
     test_arp_wired();

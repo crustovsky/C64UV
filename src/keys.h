@@ -17,6 +17,17 @@ int special_to_petscii(SDL_Keycode key, SDL_Keymod mod);
 // 0 = unmapped. "restore" is tap-only per the API; check names[0] for it.
 int key_to_c64_matrix(SDL_Keycode key, const char *names[2]);
 
+// ASCII -> C64 matrix key name(s) for scripted typing (--type --matrix):
+// the key that prints the character with the default character set, plus
+// a shift where the C64 needs one ('"' = shift+2, '?' = shift+slash).
+// Letters come out unshifted in either case, like --type. '\n' and '\r'
+// are RETURN. Returns the count, 0 = no such key.
+int ascii_to_c64_matrix(unsigned char c, const char *names[2]);
+
+// True for a key name the machine:input API accepts ("a", "f1",
+// "run_stop", "cursor_up_down", "restore"...).
+bool matrix_key_valid(const char *name);
+
 // Builds the machine:input POST body for one keyboard event. transition is
 // "press", "release", or "tap". Returns false if buf is too small.
 bool matrix_event_json(const char *names[], int n, const char *transition,
@@ -32,8 +43,35 @@ enum {
 // (A/cross) = fire, west (X/square) = fire2, north (Y/triangle) = fire3,
 // east (B/circle) = up, the jump button platformers lack.
 unsigned pad_button_joy(SDL_GamepadButton b);
+// The pad in the Ultimate menu view: d-pad = cursor keys, south (A) =
+// RETURN, east (B) = cursor left, which is "back" in the menu. SDLK_UNKNOWN
+// for the rest.
+SDL_Keycode pad_menu_key(SDL_GamepadButton b);
 // Left stick -> direction bits; inside the dead zone = 0.
 unsigned pad_stick_joy(int x, int y);
+// Mouse motion -> direction bits for the joystick-emulation path. dx/dy are
+// screen pixels (y grows downwards); an axis within `dz` pixels is ignored.
+// Diagonals set two bits. This drives a joystick, never a 1351.
+unsigned mouse_joy_dir(float dx, float dy, float dz);
+// ---- Mouse events for machine:input (firmware with `kind: mouse`, 1.2.1+):
+// the firmware treats them like a USB mouse's reports, i.e. a 1351 on
+// control port 1.
+enum { MOUSE_LEFT = 1, MOUSE_RIGHT = 2, MOUSE_MIDDLE = 4 };
+struct mouse_btn_ev {
+    unsigned buttons; // MOUSE_* bits changing together
+    bool down;
+};
+// One POST body: a move of (dx, dy) counts (each within -127..127, omitted
+// when both are 0) followed by the button transitions in order. False when
+// there is nothing to send or buf is too small.
+bool mouse_event_json(int dx, int dy, const struct mouse_btn_ev *ev, int nev,
+                      char *buf, size_t cap);
+// One item of --mouse-send as a POST body: "move:DX:DY" (up to 4000 counts
+// per axis, split into a path of steps the API accepts), "left" / "right"
+// / "middle" (a tap), "left:down", "left:up", "wheel:N" (-64..64 detents,
+// not 0). False for anything else.
+bool mouse_send_json(const char *item, char *buf, size_t cap);
+
 // Parses "up,fire" style lists (the API's input names); 0 = invalid.
 unsigned joy_parse(const char *list);
 // machine:input body taking control port `port` from state `from` to state
@@ -54,6 +92,7 @@ enum viewer_action {
     VA_REBOOT,
     VA_PAUSE,
     VA_MENU_BTN,
+    VA_MOUSE, // grab / release the pointer
     VA_JOY_PORT,
 };
 

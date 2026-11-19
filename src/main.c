@@ -1,12 +1,13 @@
 // c64uv - Commodore 64 Ultimate Viewer
 //
-// Streams the Ultimate's video/audio into an SDL3 window, forwards keystrokes,
-// and shows the Ultimate menu over telnet. Protocol notes live in CLAUDE.md.
+// Streams the Ultimate's video/audio into an SDL3 window, forwards keys,
+// gamepads and the mouse, and shows the Ultimate menu (REST on firmware
+// 1.2+, telnet before). Protocol notes live in CLAUDE.md.
 
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.3.5"
+#define C64UV_VERSION "0.4.0"
 
 #include "compat.h"
 #include "discover.h"
@@ -26,8 +27,17 @@ struct config {
     const char *do_action;  // one-shot machine control, then exit
     const char *run_path;   // one-shot: run this .prg/.crt/.sid/.d64, then exit
     const char *type_text;  // one-shot: type this into the C64, then exit
+    bool type_matrix;       // --type through the matrix, not the KERNAL buffer
+    const char *keys;       // one-shot: press these matrix keys, then exit
     const char *joy_spec;   // one-shot: tap these joystick inputs, then exit
     int joy_port;           // control port the gamepad drives (1 or 2)
+    bool joy_port_set;      // --joy-port was given explicitly
+    bool mouse;             // start with the mouse grabbed
+    bool mouse_joy;         // the mouse steers the joystick even where the
+                            // firmware has real mouse events
+    float mouse_speed;      // 1351 counts per pixel of mouse travel
+    const char *mouse_send; // one-shot: send these mouse events, then exit
+    int mouse_hold;         // ms a direction stays held after motion stops
     bool screen;            // one-shot: print the C64 text screen, then exit
     const char *dest;       // ip[:port] the stream should be sent to (auto if NULL)
     int listen_port;        // video; audio uses listen_port + 1
@@ -38,6 +48,7 @@ struct config {
     bool no_keyb;
     const char *dump_path;  // write first complete frame as PPM and exit
     bool term_test;         // headless telnet check: dump menu grid, exit
+    bool menu_screen;       // headless: print the REST menu screen, exit
     bool discover;          // sweep the local subnets for Ultimates and exit
     bool verbose;
 };
@@ -51,14 +62,80 @@ static atomic_bool g_quit;
 static atomic_bool g_run_busy;
 static atomic_int g_run_pct = -1;
 static char g_run_name[64]; // written before the run thread starts
+// Outcome of the last drop for the event loop to announce: 0 nothing new,
+// 1 started, 2 failed (the log has the reason).
+static atomic_int g_run_result;
+// Set when the matrix keyboard gave up after repeated failures, for the
+// same purpose.
+static atomic_bool g_minput_lost;
 // machine:input capability (probed once per session): -1 unknown, 0 no, 1 yes
 static atomic_int g_minput = -1;
+// The Ultimate's "Joystick Swapper" setting, read once next to that probe.
+// With "Swapped" the API's port 1 drives $DC00, which is the C64's control
+// port 2, and the other way round (verified on 1.2.1). The viewer talks in
+// C64 port numbers everywhere and converts in joy_api_port().
+static atomic_bool g_joy_swapped;
+// `kind: mouse` events in machine:input (1.2.1 has them, the first builds
+// with the input API do not): -1 unknown, 0 no, 1 yes. Read off the same
+// probe answer, which lists a "mouse" object when the firmware has one.
+static atomic_int g_mouse = -1;
+// machine:menu_screen capability (probed with machine:input): -1 unknown,
+// 0 no (the F9 view uses telnet), 1 yes (the F9 view is the real menu).
+static atomic_int g_menu_rest = -1;
+// The menu's screen background and border as VIC colours, from the
+// machine's Color Scheme setting; -1 = a scheme this code does not know
+// (the background is then guessed from the selected row).
+static atomic_int g_menu_bg = -1, g_menu_border = -1;
+// Set once the API answered, so a later transport failure is reported as
+// "stopped responding" rather than as unsupported firmware.
+static atomic_bool g_minput_up;
 // Network password (firmware 3.12+), sent as X-Password on every REST call.
 // Set once at startup, before any thread starts.
 static const char *g_password;
 // --store folder on the Ultimate: dropped disk images are uploaded there
 // (FTP) and mounted by path instead of going to the firmware's temp area.
 static const char *g_store;
+// A firmware update switches every network service off: the machine then
+// answers pings but refuses the TCP ports. t_refused records that the last
+// REST call on this thread died that way, g_rest_off that the keepalive
+// keeps running into it (the window says so instead of "waiting").
+static _Thread_local bool t_refused;
+static atomic_bool g_rest_off;
+// The machine answers REST but not a ping sent out of the interface the
+// stream is meant to arrive on: that link has no working path (cable, a
+// missing route, an address conflict), and the stream will not make it
+// either. Set by the keepalive after two such cycles in a row.
+static atomic_bool g_link_dead;
+static char g_link_if[32]; // written before g_link_dead is set
+#define SERVICES_WHERE "enable it on the machine: menu > Network Services & Timezone"
+// the same for a line of the status grid or a toast (46 characters at most)
+#define SERVICES_SHORT "enable it: menu > Network Services & Timezone"
+
+// libcurl keeps the OS error of a failed connect.
+static bool curl_refused(CURL *curl, CURLcode res)
+{
+    long os_err = 0;
+    return res == CURLE_COULDNT_CONNECT &&
+           curl_easy_getinfo(curl, CURLINFO_OS_ERRNO, &os_err) == CURLE_OK &&
+           compat_errno_refused(os_err);
+}
+
+// Why a REST call got no HTTP answer, for the log.
+static const char *rest_no_answer(void)
+{
+    return t_refused ? "connection refused: the Ultimate is on, but its Web "
+                       "Remote Control service is off (" SERVICES_WHERE ")"
+                     : "no response from Ultimate";
+}
+
+// The same for a DMA socket connect that just failed.
+static const char *dma_no_answer(void)
+{
+    return compat_neterr_refused()
+               ? "port 64 refused the connection: the Ultimate DMA Service "
+                 "is off (" SERVICES_WHERE ")"
+               : compat_neterr();
+}
 
 // ---------------------------------------------------------------- REST control
 
@@ -74,13 +151,11 @@ struct rest_ctx {
 
 static size_t curl_sink(char *data, size_t size, size_t nmemb, void *userp)
 {
-    char *buf = userp; // 512-byte response buffer, keeps first chunk only
-    size_t n = size * nmemb;
-    if (buf[0] == '\0') {
-        size_t cap = 511 < n ? 511 : n;
-        memcpy(buf, data, cap);
-        buf[cap] = '\0';
-    }
+    char *buf = userp; // 512-byte response buffer: the head of the body
+    size_t n = size * nmemb, have = strlen(buf);
+    size_t take = 511 - have < n ? 511 - have : n;
+    memcpy(buf + have, data, take);
+    buf[have + take] = '\0';
     return n;
 }
 
@@ -134,11 +209,40 @@ static long rest_req(CURL *curl, const char *method, const char *url,
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     CURLcode res = curl_easy_perform(curl);
     curl_slist_free_all(hdrs);
+    t_refused = curl_refused(curl, res);
     if (res != CURLE_OK)
         return -1;
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     return code;
+}
+
+#define JOY_SWAPPER_PATH "configs/U64%20Specific%20Settings/Joystick%20Swapper"
+
+// Reads the Joystick Swapper setting into g_joy_swapped. An Ultimate
+// without the setting (or an unreadable answer) counts as not swapped.
+static void joy_swapper_read(CURL *curl, const char *host,
+                             const atomic_bool *cancel)
+{
+    char url[256], resp[512], cur[32];
+    snprintf(url, sizeof url, "http://%s/v1/%s", host, JOY_SWAPPER_PATH);
+    long code = rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp, cancel);
+    bool known = code == 200 &&
+                 json_find_str(resp, "current", cur, sizeof cur);
+    bool swapped = known && !SDL_strcasecmp(cur, "Swapped");
+    atomic_store(&g_joy_swapped, swapped);
+    if (known)
+        SDL_Log("Joystick Swapper is \"%s\": C64 port 2 is the API's port %d",
+                cur, swapped ? 1 : 2);
+    else
+        SDL_Log("Joystick Swapper setting not readable (HTTP %ld): taking "
+                "the API's port numbers as the C64's", code);
+}
+
+// C64 control port (what the game reads) -> the API's port number.
+static int joy_api_port(int c64_port)
+{
+    return atomic_load(&g_joy_swapped) ? 3 - c64_port : c64_port;
 }
 
 static long rest_put(CURL *curl, const char *url, char *resp)
@@ -158,6 +262,7 @@ static int keepalive_thread(void *arg)
     CURL *curl = curl_easy_init();
     char resp[512];
     long last_code[2] = {-2, -2};
+    int prime_misses = 0; // cycles in a row without an echo reply
     while (!atomic_load(&g_quit)) {
         // The Ultimate refuses to start a stream toward an address missing
         // from its ARP table ("Network Host Resolve Error") and never ARPs on
@@ -166,7 +271,8 @@ static int keepalive_thread(void *arg)
         // interface when policy routing claims the LAN (Tailscale
         // accept-routes does), so the prime is forced out of the subnet's
         // interface whenever one was found (see compat_arp_prime).
-        compat_arp_prime(rc->sock, rc->host, rc->prime_if);
+        bool echoed = compat_arp_prime(rc->sock, rc->host, rc->prime_if);
+        bool answered = false; // an HTTP answer in this cycle
         // Capability probe (GET is side-effect free), retried until the
         // machine gives an HTTP answer, then cached for the session.
         if (rc->input_url[0] && atomic_load(&g_minput) < 0) {
@@ -175,12 +281,71 @@ static int keepalive_thread(void *arg)
             if (atomic_load(&g_quit))
                 break;
             if (code == 200) {
+                bool mouse = strstr(resp, "\"mouse\"") != NULL;
+                atomic_store(&g_mouse, mouse);
+                SDL_Log("machine:input mouse events %s", mouse
+                            ? "available: Ctrl+G is a 1351 mouse"
+                            : "not supported: Ctrl+G steers the joystick");
+                // before g_minput flips: no joystick event may go out with
+                // the port mapping still unknown
+                joy_swapper_read(curl, rc->host, &g_quit);
+                if (atomic_load(&g_quit))
+                    break;
+                // menu_screen answers 404 "Menu screen unavailable." while
+                // the menu is closed; firmware without the call answers
+                // 404 with something else
+                char murl[256];
+                snprintf(murl, sizeof murl, "http://%s/v1/machine:menu_screen",
+                         rc->host);
+                long mcode = rest_req(curl, "GET", murl, NULL, 0, NULL, 3000,
+                                      resp, &g_quit);
+                if (atomic_load(&g_quit))
+                    break;
+                bool menu = mcode == 200 ||
+                            (mcode == 404 &&
+                             strstr(resp, "Menu screen unavailable"));
+                atomic_store(&g_menu_rest, menu);
+                if (menu) { // colours the screen payload does not carry
+                    char surl[256], scheme[32] = "";
+                    snprintf(surl, sizeof surl, "http://%s/v1/%s", rc->host,
+                             "configs/User%20Interface%20Settings/"
+                             "Color%20Scheme");
+                    if (rest_req(curl, "GET", surl, NULL, 0, NULL, 3000, resp,
+                                 &g_quit) == 200)
+                        json_find_str(resp, "current", scheme, sizeof scheme);
+                    if (atomic_load(&g_quit))
+                        break;
+                    // seen on a C64 Ultimate, 1.2.1: light blue screen in
+                    // a blue border; "Ultimate Black" is black on black
+                    if (!strcmp(scheme, "Commodore Blue")) {
+                        atomic_store(&g_menu_bg, 14);
+                        atomic_store(&g_menu_border, 6);
+                    } else if (!strcmp(scheme, "Ultimate Black")) {
+                        atomic_store(&g_menu_bg, 0);
+                        atomic_store(&g_menu_border, 0);
+                    }
+                    SDL_Log("menu colour scheme \"%s\"%s", scheme,
+                            atomic_load(&g_menu_bg) < 0
+                                ? ": not known here, background taken from "
+                                  "the selected row" : "");
+                }
+                SDL_Log("machine:menu_screen %s", menu
+                            ? "available: F9 shows the Ultimate's own menu"
+                            : "not supported: F9 uses the telnet menu");
                 atomic_store(&g_minput, 1);
+                atomic_store(&g_minput_up, true);
                 SDL_Log("machine:input available: matrix-level keyboard");
             } else if (code > 0) {
                 atomic_store(&g_minput, 0);
                 SDL_Log("machine:input not supported (HTTP %ld): typing goes "
                         "via the KERNAL buffer", code);
+            } else {
+                static bool logged;
+                if (!logged && !t_refused) { // refused: the start call says so
+                    logged = true;
+                    SDL_Log("machine:input probe: no response from the "
+                            "Ultimate; retrying");
+                }
             }
         }
         for (int i = 0; i < rc->nstreams && !atomic_load(&g_quit); i++) {
@@ -188,11 +353,16 @@ static int keepalive_thread(void *arg)
                                  NULL, 3000, resp, &g_quit);
             if (atomic_load(&g_quit))
                 break; // cancelled: the result says nothing about the machine
+            if (i == 0)
+                atomic_store(&g_rest_off, code == -1 && t_refused);
+            answered |= code > 0;
+            if (code == -1 && t_refused)
+                code = -3; // refused: its own state for the log below
             if (code != last_code[i]) { // log only on state change
                 if (code == 200)
                     SDL_Log("stream start OK (%s)", rc->start_url[i]);
-                else if (code == -1)
-                    SDL_Log("stream start: no response from Ultimate");
+                else if (code < 0)
+                    SDL_Log("stream start: %s", rest_no_answer());
                 else
                     SDL_Log("stream start HTTP %ld: %s%s", code, resp,
                             strstr(resp, "No Operational Network Interface")
@@ -203,6 +373,19 @@ static int keepalive_thread(void *arg)
                 last_code[i] = code;
             }
         }
+        // alive over REST, silent over the stream's interface
+        bool dead = !echoed && answered && rc->prime_if[0];
+        prime_misses = dead ? prime_misses + 1 : 0;
+        if (prime_misses == 2) {
+            snprintf(g_link_if, sizeof g_link_if, "%s", rc->prime_if);
+            SDL_Log("the Ultimate answers its REST API but no ping sent out "
+                    "of %s: the stream is requested over that interface and "
+                    "will not arrive; check its cable and that the local "
+                    "subnet is routed through it (ip route)", rc->prime_if);
+        }
+        if (prime_misses == 0 && atomic_load(&g_link_dead))
+            SDL_Log("the Ultimate answers over %s again", rc->prime_if);
+        atomic_store(&g_link_dead, prime_misses >= 2);
         for (int i = 0; i < 50 && !atomic_load(&g_quit); i++)
             SDL_Delay(100);
     }
@@ -211,7 +394,7 @@ static int keepalive_thread(void *arg)
     // there answers well within a second. Anything longer would hold the
     // exit, and the window with it, past the compositor's patience.
     for (int i = 0; i < rc->nstreams; i++)
-        if (last_code[i] != -1)
+        if (last_code[i] >= 0)
             rest_req(curl, "PUT", rc->stop_url[i], NULL, 0, NULL, 1000, resp,
                      NULL);
     curl_easy_cleanup(curl);
@@ -376,17 +559,40 @@ static bool discovery_choose(struct discovered *found, int n, char *out,
     return true;
 }
 
+// What to tell someone whose sweep came back empty (stderr, headless).
+static void discovery_empty_hint(void)
+{
+    char ip[COMPAT_IP_STRLEN];
+    if (discover_services_off(ip, sizeof ip))
+        fprintf(stderr,
+                "an Ultimate is switched on at %s, but its Web Remote "
+                "Control service is off\n(" SERVICES_WHERE "; a firmware "
+                "update turns the network services off)\n", ip);
+    else
+        fprintf(stderr,
+                "no Ultimate found on your network: pass --host <ip> or "
+                "set C64U_HOST\n"
+                "(find it on the machine: F5 menu on the Ultimate shows "
+                "its IP, or check your router;\n after a firmware update "
+                "its network services are off: " SERVICES_WHERE ")\n");
+}
+
 // Background discovery for the windowed no-host start: the window opens
 // immediately and shows progress while the sweep runs here.
 struct disc_async {
     struct discovered found[DISCOVER_MAX];
     atomic_int n; // -1 while a sweep runs, result count when done
+    char off_ip[COMPAT_IP_STRLEN]; // nothing found, but this one is up
 };
 
 static int discover_thread(void *arg)
 {
     struct disc_async *d = arg;
-    atomic_store(&d->n, discover_scan(d->found, DISCOVER_MAX, false));
+    int n = discover_scan(d->found, DISCOVER_MAX, false);
+    d->off_ip[0] = '\0';
+    if (n == 0)
+        discover_services_off(d->off_ip, sizeof d->off_ip);
+    atomic_store(&d->n, n); // last: the event loop reads off_ip after this
     return 0;
 }
 
@@ -486,13 +692,14 @@ static compat_sock dma_connect(const char *host, int timeout_s)
 //
 // KEYB (0xFF03) drops chars into the KERNAL keyboard buffer ($0277/$C6) -
 // works for BASIC and anything else that reads input the normal way; games
-// polling the matrix won't see it (needs the machine:input firmware
-// feature, not shipped yet).
+// polling the matrix won't see it (firmware 1.2+ has machine:input for
+// that, see the matrix keyboard section below).
 
 struct keyb {
     compat_sock fd; // COMPAT_BAD_SOCK when disconnected
     bool enabled;
     bool reclaim; // reconnect as soon as the running drop releases port 64
+    bool refused_logged;
     const char *host;
     Uint64 last_try;
     Uint64 last_send;
@@ -507,8 +714,12 @@ static void keyb_try_connect(struct keyb *k)
         return;
     k->last_try = SDL_GetTicks();
     k->fd = dma_connect(k->host, 1);
-    if (k->fd != COMPAT_BAD_SOCK)
+    if (k->fd != COMPAT_BAD_SOCK) {
         SDL_Log("keyboard channel connected (port 64)");
+    } else if (compat_neterr_refused() && !k->refused_logged) {
+        k->refused_logged = true; // once: this runs again on every keypress
+        SDL_Log("keyboard channel: %s", dma_no_answer());
+    }
 }
 
 static void keyb_raw(struct keyb *k, Uint16 cmd, const Uint8 *data, int n)
@@ -566,7 +777,7 @@ static bool machine_ctl(const char *host, const char *action)
     if (code == 200)
         SDL_Log("machine:%s OK", action);
     else if (code == -1)
-        SDL_Log("machine:%s: no response from Ultimate", action);
+        SDL_Log("machine:%s: %s", action, rest_no_answer());
     else
         SDL_Log("machine:%s HTTP %ld: %s", action, code, resp);
     return code == 200;
@@ -616,7 +827,7 @@ static const char *image_type_for(const char *path)
 }
 
 struct binbuf {
-    uint8_t data[1000]; // a full 40x25 text screen
+    uint8_t data[2048]; // a text screen (1000) or a menu screen (2000)
     int len;
 };
 
@@ -629,19 +840,21 @@ static size_t bin_sink(char *d, size_t size, size_t nmemb, void *userp)
     return n;
 }
 
-// GET machine:readmem: `len` bytes from hex address `addr` into b (capped
-// at the buffer). False on a transport error.
-static bool readmem(CURL *curl, const char *host, const char *addr, int len,
-                    struct binbuf *b)
+// GET a binary body into b (capped at the buffer). Returns the HTTP status
+// or -1 on a transport error; `cancel` as in rest_req.
+static long rest_get_bin(CURL *curl, const char *url, struct binbuf *b,
+                         long timeout_ms, const atomic_bool *cancel)
 {
-    char url[256];
-    snprintf(url, sizeof url,
-             "http://%s/v1/machine:readmem?address=%s&length=%d", host, addr,
-             len);
     b->len = 0;
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+    if (cancel) {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, rest_cancel_cb);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)cancel);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+    }
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, bin_sink);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, b);
     struct curl_slist *hdrs = NULL;
@@ -651,9 +864,26 @@ static bool readmem(CURL *curl, const char *host, const char *addr, int len,
         hdrs = curl_slist_append(NULL, pwhdr);
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     }
-    bool ok = curl_easy_perform(curl) == CURLE_OK;
+    CURLcode res = curl_easy_perform(curl);
     curl_slist_free_all(hdrs);
-    return ok;
+    t_refused = curl_refused(curl, res);
+    if (res != CURLE_OK)
+        return -1;
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    return code;
+}
+
+// GET machine:readmem: `len` bytes from hex address `addr` into b. False
+// unless the machine answered with the memory.
+static bool readmem(CURL *curl, const char *host, const char *addr, int len,
+                    struct binbuf *b)
+{
+    char url[256];
+    snprintf(url, sizeof url,
+             "http://%s/v1/machine:readmem?address=%s&length=%d", host, addr,
+             len);
+    return rest_get_bin(curl, url, b, 3000, NULL) == 200;
 }
 
 // Readiness gate: the KERNAL zeroes $CC when it sits at a prompt with the
@@ -785,7 +1015,10 @@ static bool ftp_upload(CURL *curl, const char *host, const char *rpath,
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
     CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK)
+    if (curl_refused(curl, res))
+        SDL_Log("FTP upload to %s refused: the Ultimate's FTP File Service is off "
+                "(" SERVICES_WHERE ")", url);
+    else if (res != CURLE_OK)
         SDL_Log("FTP upload to %s failed: %s", url, curl_easy_strerror(res));
     return res == CURLE_OK;
 }
@@ -879,7 +1112,7 @@ static long store_image(CURL *curl, const char *host, const char *path,
     }
     if (!typed)
         SDL_Log("mounted on drive A, but the DMA socket (port 64) failed "
-                "(%s): type LOAD\"*\",8,1 yourself", compat_neterr());
+                "(%s): type LOAD\"*\",8,1 yourself", dma_no_answer());
     else
         SDL_Log("%s mounted read-write on drive A and started", shown);
     return typed ? 200 : -1;
@@ -938,7 +1171,7 @@ static bool run_file(const char *host, const char *path)
         if (code == 200)
             SDL_Log("runners:%s %s OK (%ld bytes)", ep, path, len);
         else if (code == -1)
-            SDL_Log("runners:%s: no response from Ultimate", ep);
+            SDL_Log("runners:%s: %s", ep, rest_no_answer());
         else
             SDL_Log("runners:%s HTTP %ld: %s", ep, code, resp);
     } else if (store) {
@@ -952,8 +1185,8 @@ static bool run_file(const char *host, const char *path)
         } else {
             compat_sock s = dma_connect(host, 3);
             if (s == COMPAT_BAD_SOCK)
-                SDL_Log("%s: DMA socket (port 64) unreachable; is the "
-                        "Ultimate DMA Service enabled?", path);
+                SDL_Log("%s: DMA socket (port 64): %s", path,
+                        dma_no_answer());
             else if (dma_send(s, DMA_CMD_RUN_IMG, data, (size_t)len, true))
                 code = 200;
             else
@@ -975,7 +1208,7 @@ static bool run_file(const char *host, const char *path)
             SDL_Log("%s mounted on drive A (%ld bytes); no autostart for "
                     ".%s, type LOAD\"*\",8,1 yourself", path, len, img);
         else if (code == -1)
-            SDL_Log("drives/a:mount: no response from Ultimate");
+            SDL_Log("drives/a:mount: %s", rest_no_answer());
         else
             SDL_Log("drives/a:mount HTTP %ld: %s", code, resp);
     }
@@ -1007,7 +1240,7 @@ struct runjob {
 static int run_thread(void *arg)
 {
     struct runjob *j = arg;
-    run_file(j->host, j->path);
+    atomic_store(&g_run_result, run_file(j->host, j->path) ? 1 : 2);
     free(j);
     atomic_store(&g_run_pct, -1);
     atomic_store(&g_run_busy, false);
@@ -1017,12 +1250,12 @@ static int run_thread(void *arg)
 // Called from the event loop; hands port 64 to the transfer by dropping
 // the keyboard connection (it reconnects on the next keypress after the
 // run). NULL kb for the headless --run path.
-static void run_file_async(const char *host, const char *path,
+static bool run_file_async(const char *host, const char *path,
                            struct keyb *kb)
 {
     if (atomic_exchange(&g_run_busy, true)) {
         SDL_Log("still busy with the previous file");
-        return;
+        return false;
     }
     if (kb) {
         compat_close(kb->fd);
@@ -1035,6 +1268,7 @@ static void run_file_async(const char *host, const char *path,
     snprintf(j->host, sizeof j->host, "%s", host);
     snprintf(j->path, sizeof j->path, "%s", path);
     SDL_DetachThread(SDL_CreateThread(run_thread, "runfile", j));
+    return true;
 }
 
 // ------------------------------------------------------ headless type/screen
@@ -1067,10 +1301,157 @@ static bool type_text(const char *host, const char *text)
     CURL *curl = curl_easy_init();
     bool ok = dma_type(curl, host, buf);
     if (!ok)
-        SDL_Log("typing failed (%s); is the Ultimate DMA Service enabled?",
-                compat_neterr());
+        SDL_Log("typing failed: %s", dma_no_answer());
     curl_easy_cleanup(curl);
     return ok;
+}
+
+// Matrix-level twins (firmware with machine:input): keys pressed on the
+// CIA1 matrix, so games that scan the keyboard themselves see them too.
+// A `tap` returns before the firmware releases the key and back-to-back
+// taps overlap (characters went missing on 1.2.1), hence press, hold,
+// release, gap: the hold spans at least two KERNAL scans (60 Hz), the gap
+// lets a repeated key be seen as released.
+#define MATRIX_HOLD_MS 50
+#define MATRIX_GAP_MS 50
+
+static long matrix_stroke(CURL *curl, const char *url, const char *names[],
+                          int n, int hold_ms, char *resp)
+{
+    char body[256];
+    bool tap = !strcmp(names[0], "restore"); // not in the matrix: tap-only
+    long code = -1;
+    for (int pass = 0; pass < (tap ? 1 : 2); pass++) {
+        if (!matrix_event_json(names, n,
+                               tap ? "tap" : pass ? "release" : "press",
+                               body, sizeof body))
+            return 400;
+        code = rest_req(curl, "POST", url, body, (long)strlen(body),
+                        "application/json", 3000, resp, NULL);
+        if (code != 200)
+            return code;
+        SDL_Delay(pass ? MATRIX_GAP_MS : (Uint32)hold_ms);
+    }
+    return code;
+}
+
+static bool matrix_report(long code, const char *resp)
+{
+    if (code == -1)
+        SDL_Log("machine:input: %s", rest_no_answer());
+    else if (code != 200)
+        SDL_Log("machine:input HTTP %ld: %s (matrix-level keys need "
+                "firmware 1.2.0 or newer; --type without --matrix uses the "
+                "KERNAL buffer)", code, resp);
+    return code == 200;
+}
+
+// --type TEXT --matrix
+static bool type_matrix(const char *host, const char *text)
+{
+    char url[256], resp[512] = "";
+    snprintf(url, sizeof url, "http://%s/v1/machine:input", host);
+    CURL *curl = curl_easy_init();
+    long code = 200;
+    for (const char *p = text; *p && code == 200; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\\' && p[1] == 'n') { // "\n" in the argument = RETURN
+            c = '\n';
+            p++;
+        }
+        const char *names[2];
+        int n = ascii_to_c64_matrix(c, names);
+        if (n)
+            code = matrix_stroke(curl, url, names, n, MATRIX_HOLD_MS, resp);
+    }
+    curl_easy_cleanup(curl);
+    return matrix_report(code, resp);
+}
+
+// --keys LIST: strokes separated by commas or spaces, each a key name or a
+// chord joined with '+', optionally held for :MS milliseconds
+// ("f1 left_shift+a space:500"). Parsed completely before anything is
+// sent. Returns the exit status (2 = bad list).
+#define KEYS_MAX_STROKES 256
+static int press_keys(const char *host, const char *list)
+{
+    struct stroke {
+        const char *names[8];
+        int n, hold_ms;
+    };
+    char *copy = SDL_strdup(list);
+    struct stroke *st = calloc(KEYS_MAX_STROKES, sizeof *st);
+    int count = 0;
+    bool bad = false;
+    char *save = NULL;
+    for (char *item = SDL_strtok_r(copy, ", ", &save); item && !bad;
+         item = SDL_strtok_r(NULL, ", ", &save)) {
+        if (count == KEYS_MAX_STROKES) {
+            fprintf(stderr, "--keys: more than %d strokes\n",
+                    KEYS_MAX_STROKES);
+            bad = true;
+            break;
+        }
+        struct stroke *k = &st[count++];
+        k->hold_ms = MATRIX_HOLD_MS;
+        char *colon = strchr(item, ':');
+        if (colon) {
+            *colon = '\0';
+            k->hold_ms = atoi(colon + 1);
+            if (k->hold_ms < 20 || k->hold_ms > 10000) {
+                fprintf(stderr, "--keys: hold time '%s' out of range "
+                        "(20-10000 ms)\n", colon + 1);
+                bad = true;
+            }
+        }
+        char *save2 = NULL;
+        for (char *name = SDL_strtok_r(item, "+", &save2); name && !bad;
+             name = SDL_strtok_r(NULL, "+", &save2)) {
+            if (!matrix_key_valid(name) || k->n == 8) {
+                fprintf(stderr, "--keys: unknown key '%s' (API names: a-z "
+                        "0-9 space return run_stop f1 f3 f5 f7 left_shift "
+                        "right_shift ctrl commodore cursor_up_down "
+                        "cursor_left_right inst_del clr_home plus minus "
+                        "star slash equals colon semicolon comma period at "
+                        "pound arrow_up arrow_left restore)\n", name);
+                bad = true;
+            } else {
+                k->names[k->n++] = name;
+            }
+        }
+        if (!bad && k->n == 0) {
+            fprintf(stderr, "--keys: empty stroke\n");
+            bad = true;
+        }
+        // restore is wired to NMI, not the matrix: alone and tap-only
+        for (int i = 0; i < k->n && !bad; i++)
+            if (!strcmp(k->names[i], "restore") && k->n > 1) {
+                fprintf(stderr, "--keys: restore cannot be part of a "
+                        "chord\n");
+                bad = true;
+            }
+    }
+    if (!bad && count == 0) {
+        fprintf(stderr, "--keys: nothing to press\n");
+        bad = true;
+    }
+    int rc = 2;
+    if (!bad) {
+        char url[256], resp[512] = "";
+        snprintf(url, sizeof url, "http://%s/v1/machine:input", host);
+        CURL *curl = curl_easy_init();
+        long code = 200;
+        for (int i = 0; i < count && code == 200; i++)
+            code = matrix_stroke(curl, url, st[i].names, st[i].n,
+                                 st[i].hold_ms, resp);
+        curl_easy_cleanup(curl);
+        rc = matrix_report(code, resp) ? 0 : 1;
+        if (rc == 0)
+            SDL_Log("%d key stroke%s OK", count, count == 1 ? "" : "s");
+    }
+    free(st);
+    SDL_free(copy);
+    return rc;
 }
 
 // Screen codes to text, upper-case/graphics set assumed (the default);
@@ -1092,7 +1473,10 @@ static bool print_screen(const char *host)
     bool ok = readmem(curl, host, "0400", 1000, &b) && b.len == 1000;
     curl_easy_cleanup(curl);
     if (!ok) {
-        SDL_Log("machine:readmem failed (%d bytes)", b.len);
+        if (t_refused)
+            SDL_Log("machine:readmem: %s", rest_no_answer());
+        else
+            SDL_Log("machine:readmem failed (%d bytes)", b.len);
         return false;
     }
     for (int row = 0; row < 25; row++) {
@@ -1121,10 +1505,11 @@ static bool joy_tap(const char *host, const char *spec, int port)
     char url[256], body[320], resp[512];
     snprintf(url, sizeof url, "http://%s/v1/machine:input", host);
     CURL *curl = curl_easy_init();
+    joy_swapper_read(curl, host, NULL);
     long code = -1;
     for (int pass = 0; pass < 2; pass++) { // press, then release
-        joy_event_json(port, pass ? mask : 0, pass ? 0 : mask, body,
-                       sizeof body);
+        joy_event_json(joy_api_port(port), pass ? mask : 0, pass ? 0 : mask,
+                       body, sizeof body);
         code = rest_req(curl, "POST", url, body, (long)strlen(body),
                         "application/json", 3000, resp, NULL);
         if (code != 200)
@@ -1136,7 +1521,7 @@ static bool joy_tap(const char *host, const char *spec, int port)
     if (code == 200)
         SDL_Log("joystick port %d: %s OK", port, spec);
     else if (code == -1)
-        SDL_Log("machine:input: no response from Ultimate");
+        SDL_Log("machine:input: %s", rest_no_answer());
     else
         SDL_Log("machine:input HTTP %ld: %s (joysticks need firmware 1.2.0 "
                 "or newer)", code, resp);
@@ -1155,8 +1540,9 @@ struct minput {
     CURL *curl;
     char url[256];
     int fails;
-    int joy_port;      // control port the gamepad drives
-    unsigned joy_sent; // JOY_* bits the firmware holds for us
+    int joy_port;         // C64 control port the first gamepad drives
+    unsigned joy_sent[2]; // JOY_* bits the firmware holds for us, per
+                          // C64 port ([0] = port 1)
 };
 
 static void minput_post(struct minput *mi, const char *body)
@@ -1168,11 +1554,13 @@ static void minput_post(struct minput *mi, const char *body)
                  "application/json", 250, resp, NULL) == -1) {
         if (++mi->fails >= 3) {
             atomic_store(&g_minput, 0);
+            atomic_store(&g_minput_lost, true);
             SDL_Log("machine:input unreachable, falling back to the KERNAL "
                     "buffer");
         }
     } else {
         mi->fails = 0;
+        atomic_store(&g_minput_up, true);
     }
 }
 
@@ -1191,15 +1579,16 @@ static void minput_key(struct minput *mi, SDL_Keycode key, bool down)
         minput_post(mi, body);
 }
 
-// Fired on focus loss, view switches, and exit so no key stays held down.
-// Brings the firmware's joystick lines to `want` (JOY_* bits): one POST
-// with the releases and presses that differ from what it holds.
-static void minput_joy(struct minput *mi, unsigned want)
+// Brings the joystick lines of C64 control port `port` to `want` (JOY_*
+// bits): one POST with the releases and presses that differ from what the
+// firmware holds there.
+static void minput_joy(struct minput *mi, int port, unsigned want)
 {
     char body[320];
-    if (joy_event_json(mi->joy_port, mi->joy_sent, want, body, sizeof body))
+    if (joy_event_json(joy_api_port(port), mi->joy_sent[port - 1], want,
+                       body, sizeof body))
         minput_post(mi, body);
-    mi->joy_sent = want;
+    mi->joy_sent[port - 1] = want;
 }
 
 // What the pad holds right now, as JOY_* bits. Polled as a whole instead
@@ -1216,10 +1605,498 @@ static unsigned pad_state(SDL_Gamepad *pad)
     return m;
 }
 
+// Fired on focus loss, view switches, and exit so no key stays held down.
 static void minput_release_all(struct minput *mi)
 {
-    mi->joy_sent = 0; // release_all drops the joystick lines too
+    mi->joy_sent[0] = mi->joy_sent[1] = 0; // it drops the joystick lines too
     minput_post(mi, "{\"events\":[{\"kind\":\"release_all\"}]}");
+}
+
+// ------------------------------------------------------ mouse -> 1351
+//
+// Firmware with `kind: mouse` events (1.2.1) treats them like the reports
+// of a USB mouse: a 1351 on control port 1, sent to the C64 at least 20 ms
+// apart from a 1024-report queue (429 when a batch does not fit). The
+// event loop only adds up motion and queues button changes; a thread turns
+// them into POSTs, one move of up to 127 counts per axis at a time, so a
+// slow answer delays the pointer but never the window. Motion beyond one
+// report's worth that piles up while a request is in flight is dropped:
+// catching up later would make the pointer run on after the hand stopped.
+
+struct mfwd {
+    char url[256];
+    SDL_Mutex *lock;  // guards ax, ay, q, qn
+    SDL_Thread *thr;
+    atomic_bool done;   // the thread has left its loop
+    atomic_bool failed; // the machine stopped answering: let go of the grab
+    float ax, ay;       // motion not sent yet, in counts
+    struct mouse_btn_ev q[16];
+    int qn;
+    unsigned held;      // event-loop side: buttons we pressed
+};
+
+// mouse.pending from a machine:input answer (reports the firmware has not
+// sent to the C64 yet); 0 when absent. The firmware pretty-prints its
+// JSON ("pending" : 0), hence the tolerant scan.
+static int mouse_pending(const char *resp)
+{
+    const char *p = strstr(resp, "\"pending\"");
+    if (!p)
+        return 0;
+    p += 9;
+    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')
+        p++;
+    return atoi(p);
+}
+
+static int mfwd_thread(void *arg)
+{
+    struct mfwd *mf = arg;
+    CURL *curl = curl_easy_init();
+    char body[512], resp[512];
+    int fails = 0;
+    bool told = false;
+    while (!atomic_load(&g_quit)) {
+        struct mouse_btn_ev ev[16];
+        SDL_LockMutex(mf->lock);
+        int dx = (int)mf->ax, dy = (int)mf->ay; // the fraction stays
+        dx = dx < -127 ? -127 : dx > 127 ? 127 : dx;
+        dy = dy < -127 ? -127 : dy > 127 ? 127 : dy;
+        mf->ax -= (float)dx;
+        mf->ay -= (float)dy;
+        if (mf->ax > 127 || mf->ax < -127)
+            mf->ax = 0;
+        if (mf->ay > 127 || mf->ay < -127)
+            mf->ay = 0;
+        int n = mf->qn;
+        memcpy(ev, mf->q, sizeof ev);
+        mf->qn = 0;
+        SDL_UnlockMutex(mf->lock);
+        if (!mouse_event_json(dx, dy, ev, n, body, sizeof body)) {
+            SDL_Delay(4);
+            continue;
+        }
+        long code = rest_req(curl, "POST", mf->url, body, (long)strlen(body),
+                             "application/json", 1000, resp, &g_quit);
+        int pending = 0;
+        if (code == -1) {
+            if (++fails >= 5 && !atomic_load(&g_quit)) {
+                fails = 0;
+                atomic_store(&mf->failed, true);
+            }
+        } else {
+            fails = 0;
+            if (code != 200 && !told) {
+                told = true; // 429 = its queue is full; others say why
+                SDL_Log("mouse: machine:input HTTP %ld: %s", code, resp);
+            }
+            pending = mouse_pending(resp);
+        }
+        // one report leaves the firmware every 20 ms: do not feed it
+        // faster, and back off while it works through a backlog
+        SDL_Delay(20 + 20 * (Uint32)(pending > 10 ? 10 : pending));
+    }
+    curl_easy_cleanup(curl);
+    atomic_store(&mf->done, true);
+    return 0;
+}
+
+static void mfwd_start(struct mfwd *mf, const char *host)
+{
+    if (mf->thr)
+        return;
+    snprintf(mf->url, sizeof mf->url, "http://%s/v1/machine:input", host);
+    mf->lock = SDL_CreateMutex();
+    mf->thr = SDL_CreateThread(mfwd_thread, "mouse", mf);
+}
+
+static void mfwd_motion(struct mfwd *mf, float dx, float dy)
+{
+    SDL_LockMutex(mf->lock);
+    mf->ax += dx;
+    mf->ay += dy;
+    SDL_UnlockMutex(mf->lock);
+}
+
+static void mfwd_button(struct mfwd *mf, unsigned bit, bool down)
+{
+    if (!bit || down == ((mf->held & bit) != 0))
+        return;
+    mf->held ^= bit;
+    SDL_LockMutex(mf->lock);
+    if (mf->qn < 16)
+        mf->q[mf->qn++] = (struct mouse_btn_ev){bit, down};
+    SDL_UnlockMutex(mf->lock);
+}
+
+// Lets go of every button we hold and forgets unsent motion. A no-op
+// before the first mouse event.
+static void mfwd_release(struct mfwd *mf)
+{
+    if (!mf->thr)
+        return;
+    SDL_LockMutex(mf->lock);
+    mf->ax = mf->ay = 0;
+    mf->qn = 0;
+    if (mf->held)
+        mf->q[mf->qn++] = (struct mouse_btn_ev){mf->held, false};
+    mf->held = 0;
+    SDL_UnlockMutex(mf->lock);
+}
+
+static unsigned mouse_button_bit(Uint8 button)
+{
+    switch (button) {
+    case SDL_BUTTON_LEFT: return MOUSE_LEFT;
+    case SDL_BUTTON_RIGHT: return MOUSE_RIGHT;
+    case SDL_BUTTON_MIDDLE: return MOUSE_MIDDLE;
+    default: return 0;
+    }
+}
+
+// --mouse-send LIST: the headless twin. Items split by spaces or commas
+// (see mouse_send_json), all checked before the first one is sent; then
+// waits for the firmware to have sent every report, so a following
+// --screen or screenshot sees the result. Returns the exit status.
+static int mouse_send(const char *host, const char *list)
+{
+    char body[2048], resp[512] = "";
+    char *copy = SDL_strdup(list), *save = NULL;
+    int count = 0;
+    for (char *item = SDL_strtok_r(copy, ", ", &save); item;
+         item = SDL_strtok_r(NULL, ", ", &save), count++)
+        if (!mouse_send_json(item, body, sizeof body)) {
+            fprintf(stderr, "--mouse-send: bad item '%s' (move:DX:DY, "
+                    "left, right, middle, left:down, left:up, wheel:N)\n",
+                    item);
+            SDL_free(copy);
+            return 2;
+        }
+    SDL_free(copy);
+    if (count == 0) {
+        fprintf(stderr, "--mouse-send: nothing to send\n");
+        return 2;
+    }
+    char url[256];
+    snprintf(url, sizeof url, "http://%s/v1/machine:input", host);
+    CURL *curl = curl_easy_init();
+    long code = 200;
+    copy = SDL_strdup(list);
+    for (char *item = SDL_strtok_r(copy, ", ", &save); item && code == 200;
+         item = SDL_strtok_r(NULL, ", ", &save)) {
+        mouse_send_json(item, body, sizeof body);
+        code = rest_req(curl, "POST", url, body, (long)strlen(body),
+                        "application/json", 3000, resp, NULL);
+        SDL_Delay(60); // a tap holds for 40 ms on the firmware side
+    }
+    SDL_free(copy);
+    for (int t = 0; code == 200 && t < 100; t++) { // up to 5 s
+        if (mouse_pending(resp) == 0)
+            break;
+        SDL_Delay(50);
+        code = rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp, NULL);
+    }
+    curl_easy_cleanup(curl);
+    if (code == 200)
+        SDL_Log("%d mouse event%s OK", count, count == 1 ? "" : "s");
+    else if (code == -1)
+        SDL_Log("machine:input: %s", rest_no_answer());
+    else
+        SDL_Log("machine:input HTTP %ld: %s (mouse events need firmware "
+                "1.2.1 or newer)", code, resp);
+    return code == 200 ? 0 : 1;
+}
+
+// ------------------------------------------------------- mouse -> joystick
+//
+// The fallback for firmware whose machine:input has no mouse event (the
+// first builds with the input API, e.g. 3.15a), and what --mouse-joy
+// selects on purpose: the 1351's POT registers cannot be written from
+// outside, so the pointer is steered with joystick levels. The GEOS
+// JOYSTICK driver (its built-in default) moves the pointer at a constant
+// rate while a direction line is held. A direction is held while the mouse
+// moves and released shortly after it stops, so one gesture costs two
+// POSTs instead of one per pixel. COMM 1351 software sees nothing.
+
+#define MOUSE_DEADZONE 3.0f
+#define MOUSE_TRAVEL_MAX 24.0f // motion since the last tick
+
+struct mousejoy {
+    bool enabled;       // pointer grabbed, motion drives the joystick
+    float ax, ay;       // motion since the last tick; ay positive = down
+    Uint64 hold_until;  // release the direction when now >= this
+    unsigned dir;       // direction bits currently held
+    unsigned btn;       // fire bits held by the mouse buttons
+    int hold_ms;        // how long motion keeps a direction held
+};
+
+static unsigned mouse_button_joy(Uint8 button)
+{
+    switch (button) {
+    case SDL_BUTTON_LEFT: return JOY_FIRE;
+    case SDL_BUTTON_RIGHT: return JOY_FIRE2;
+    case SDL_BUTTON_MIDDLE: return JOY_FIRE3;
+    default: return 0;
+    }
+}
+
+static void mousejoy_clear(struct mousejoy *mj)
+{
+    mj->ax = mj->ay = 0;
+    mj->dir = mj->btn = 0;
+    mj->hold_until = 0;
+}
+
+static bool mousejoy_set(struct mousejoy *mj, SDL_Window *win, bool on)
+{
+    if (on == mj->enabled)
+        return true;
+    if (on) {
+        // Relative mode also hides the cursor and keeps it in the window.
+        if (!SDL_SetWindowRelativeMouseMode(win, true)) {
+            SDL_Log("mouse joystick: relative mode failed: %s",
+                    SDL_GetError());
+            return false;
+        }
+    } else {
+        SDL_SetWindowRelativeMouseMode(win, false);
+    }
+    mj->enabled = on;
+    mousejoy_clear(mj);
+    return true;
+}
+
+static void mousejoy_motion(struct mousejoy *mj, float dx, float dy)
+{
+    if (!mj->enabled)
+        return;
+    mj->ax += dx;
+    mj->ay += dy; // screen y grows down, and so does the joystick's DOWN
+    if (mj->ax > MOUSE_TRAVEL_MAX)
+        mj->ax = MOUSE_TRAVEL_MAX;
+    if (mj->ax < -MOUSE_TRAVEL_MAX)
+        mj->ax = -MOUSE_TRAVEL_MAX;
+    if (mj->ay > MOUSE_TRAVEL_MAX)
+        mj->ay = MOUSE_TRAVEL_MAX;
+    if (mj->ay < -MOUSE_TRAVEL_MAX)
+        mj->ay = -MOUSE_TRAVEL_MAX;
+}
+
+// Ends a held direction shortly after the motion that caused it, and starts
+// or changes one when new motion arrives. Returns true when the wanted
+// joystick state changed, so the caller can POST it to machine:input (two
+// requests per gesture, not one per pixel).
+static bool mousejoy_tick(struct mousejoy *mj)
+{
+    if (!mj->enabled)
+        return false;
+    bool changed = false;
+    Uint64 now = SDL_GetTicks();
+    unsigned d = mouse_joy_dir(mj->ax, mj->ay, MOUSE_DEADZONE);
+    if (d) {
+        mj->ax = mj->ay = 0;
+        mj->hold_until = now + (Uint64)mj->hold_ms;
+        if (d != mj->dir) {
+            mj->dir = d;
+            changed = true;
+        }
+    }
+    if (mj->dir && now >= mj->hold_until) {
+        mj->dir = 0;
+        changed = true;
+    }
+    return changed;
+}
+
+// ---------------------------------------------------- REST menu view
+//
+// Firmware 1.2+ serves the screen of the Ultimate's real menu (GET
+// machine:menu_screen: 2000 bytes while it is open, 404 while it is not)
+// and routes machine:input keys into it. The F9 view then shows that menu:
+// the same one the machine's own video output shows, working over WiFi
+// too. A worker thread polls the screen so the event loop never waits for
+// the network; the keys travel the normal machine:input path.
+//
+// Commands and states carry a generation number (value = gen << 3 | code)
+// so a state left over from an earlier session can never be mistaken for
+// the answer to the newest command.
+
+enum { RM_NONE, RM_OPEN, RM_ATTACH, RM_CLOSE }; // commands
+// RM_OPEN presses the menu button if the menu is closed; RM_ATTACH is for
+// a button press that already happened (Ctrl+M); RM_CLOSE presses it
+// again if the menu is still open.
+enum { RMS_OFF, RMS_OPENING, RMS_LIVE, RMS_GONE, RMS_FAILED }; // states
+// RMS_GONE: the menu closed on the machine (left with RUN/STOP, started a
+// program, or never opened). RMS_FAILED: the machine stopped answering.
+
+#define RMENU_POLL_MS 100
+#define RMENU_OPEN_WAIT_MS 2500
+
+struct rmenu {
+    char screen_url[256], button_url[256];
+    atomic_uint cmd, state;
+    atomic_bool kick; // a key went out: poll now, not at the next interval
+    atomic_bool done; // the thread has left its loop
+    atomic_uint seq;  // bumped whenever `screen` changes
+    SDL_Mutex *lock;  // guards `screen`
+    uint8_t screen[MENU_BYTES];
+    SDL_Thread *thr;
+    unsigned gen;     // event-loop side: generation of the last command
+};
+
+static void rmenu_press_button(CURL *curl, const struct rmenu *rm)
+{
+    char resp[512];
+    rest_req(curl, "PUT", rm->button_url, NULL, 0, NULL, 1500, resp, NULL);
+}
+
+static int rmenu_thread(void *arg)
+{
+    struct rmenu *rm = arg;
+    CURL *curl = curl_easy_init();
+    struct binbuf *b = malloc(sizeof *b);
+    bool active = false, pressed = false, live = false;
+    unsigned gen = 0;
+    int fails = 0;
+    Uint64 t0 = 0;
+    while (!atomic_load(&g_quit)) {
+        unsigned c = atomic_exchange(&rm->cmd, RM_NONE);
+        if ((c & 7) == RM_OPEN || (c & 7) == RM_ATTACH) {
+            gen = c >> 3;
+            active = true;
+            pressed = (c & 7) == RM_ATTACH;
+            live = false;
+            fails = 0;
+            t0 = SDL_GetTicks();
+            atomic_store(&rm->state, gen << 3 | RMS_OPENING);
+        } else if ((c & 7) == RM_CLOSE) {
+            gen = c >> 3;
+            if (active &&
+                rest_get_bin(curl, rm->screen_url, b, 1500, &g_quit) == 200)
+                rmenu_press_button(curl, rm); // still open: close it
+            active = false;
+            atomic_store(&rm->state, gen << 3 | RMS_OFF);
+        }
+        if (!active) {
+            SDL_Delay(15);
+            continue;
+        }
+        long code = rest_get_bin(curl, rm->screen_url, b, 1500, &g_quit);
+        if (atomic_load(&g_quit))
+            break;
+        int end = -1; // state that ends this session, if any
+        if (code == 200 && b->len == MENU_BYTES) {
+            fails = 0;
+            SDL_LockMutex(rm->lock);
+            if (!live || memcmp(rm->screen, b->data, MENU_BYTES)) {
+                memcpy(rm->screen, b->data, MENU_BYTES);
+                atomic_fetch_add(&rm->seq, 1);
+            }
+            SDL_UnlockMutex(rm->lock);
+            if (!live) {
+                live = true;
+                atomic_store(&rm->state, gen << 3 | RMS_LIVE);
+            }
+        } else if (code == 404) {
+            fails = 0;
+            if (live) {
+                end = RMS_GONE; // closed on the machine
+            } else if (!pressed) {
+                rmenu_press_button(curl, rm);
+                pressed = true;
+                t0 = SDL_GetTicks();
+            } else if (SDL_GetTicks() - t0 > RMENU_OPEN_WAIT_MS) {
+                end = RMS_GONE; // the press did not bring a menu up
+            }
+        } else if (++fails >= 5) {
+            end = RMS_FAILED;
+        }
+        if (end >= 0) {
+            active = false;
+            atomic_store(&rm->state, gen << 3 | (unsigned)end);
+            continue;
+        }
+        // the next poll: at once after a key, else after the interval
+        for (int t = 0; t < RMENU_POLL_MS && !atomic_load(&g_quit); t += 10) {
+            if (atomic_exchange(&rm->kick, false)) {
+                SDL_Delay(25); // let the menu draw the answer to the key
+                break;
+            }
+            if (atomic_load(&rm->cmd) != RM_NONE)
+                break;
+            SDL_Delay(10);
+        }
+    }
+    // quitting with the view up: do not leave the machine sitting in its
+    // menu (bounded like the keepalive's stop calls)
+    unsigned c = atomic_exchange(&rm->cmd, RM_NONE);
+    if ((active || (c & 7) == RM_CLOSE) && (c & 7) != RM_OPEN &&
+        rest_get_bin(curl, rm->screen_url, b, 1000, NULL) == 200)
+        rmenu_press_button(curl, rm);
+    free(b);
+    curl_easy_cleanup(curl);
+    atomic_store(&rm->done, true);
+    return 0;
+}
+
+// Event-loop side: issue a command, starting the thread on first use.
+static void rmenu_cmd(struct rmenu *rm, const char *host, unsigned cmd)
+{
+    if (!rm->thr) {
+        snprintf(rm->screen_url, sizeof rm->screen_url,
+                 "http://%s/v1/machine:menu_screen", host);
+        snprintf(rm->button_url, sizeof rm->button_url,
+                 "http://%s/v1/machine:menu_button", host);
+        rm->lock = SDL_CreateMutex();
+        rm->thr = SDL_CreateThread(rmenu_thread, "menu", rm);
+    }
+    rm->gen++;
+    atomic_store(&rm->state, rm->gen << 3 | RMS_OPENING);
+    atomic_store(&rm->cmd, rm->gen << 3 | cmd);
+}
+
+// The state that answers the newest command (RMS_OPENING until it does).
+static int rmenu_state(struct rmenu *rm)
+{
+    unsigned st = atomic_load(&rm->state);
+    return st >> 3 == rm->gen ? (int)(st & 7) : RMS_OPENING;
+}
+
+// --menu-screen: the open menu as text, the selected row marked with '>'.
+static int print_menu_screen(const char *host)
+{
+    char url[256];
+    snprintf(url, sizeof url, "http://%s/v1/machine:menu_screen", host);
+    CURL *curl = curl_easy_init();
+    struct binbuf *b = malloc(sizeof *b);
+    long code = -1;
+    // the screen follows a menu_button press by about one request
+    for (int attempt = 0; attempt < 4; attempt++) {
+        code = rest_get_bin(curl, url, b, 3000, NULL);
+        if (code != 404)
+            break;
+        SDL_Delay(250);
+    }
+    int rc = 1;
+    if (code == 200 && b->len == MENU_BYTES) {
+        for (int row = 0; row < MENU_ROWS; row++) {
+            char line[MENU_COLS + 1];
+            menu_row_text(b->data, row, line);
+            printf("%c %s\n", menu_row_selected(b->data, row) ? '>' : ' ',
+                   line);
+        }
+        rc = 0;
+    } else if (code == 404) {
+        SDL_Log("the Ultimate menu is not open (open it with --do menu; "
+                "this needs firmware 1.2.0 or newer)");
+    } else if (code == -1) {
+        SDL_Log("machine:menu_screen: %s", rest_no_answer());
+    } else {
+        SDL_Log("machine:menu_screen HTTP %ld (%d bytes)", code, b->len);
+    }
+    free(b);
+    curl_easy_cleanup(curl);
+    return rc;
 }
 
 // ------------------------------------------------------ telnet menu terminal
@@ -1233,7 +2110,12 @@ static int run_term_test(const char *host)
 {
     compat_sock fd = compat_tcp_connect(host, 23, 3);
     if (fd == COMPAT_BAD_SOCK) {
-        fprintf(stderr, "cannot connect to %s:23\n", host);
+        if (compat_neterr_refused())
+            fprintf(stderr, "%s:23 refused the connection: the Ultimate's "
+                    "Telnet Remote Menu Service is off (" SERVICES_WHERE
+                    ")\n", host);
+        else
+            fprintf(stderr, "cannot connect to %s:23\n", host);
         return 1;
     }
     struct term *t = malloc(sizeof *t);
@@ -1262,24 +2144,35 @@ static int run_term_test(const char *host)
 // free. Same font, same colors.
 
 #define HELP_PX_W TERM_PX_W
-#define HELP_PX_H 256
 #define HELP_LINE 11 // 8 px glyphs + 3 px of air between rows
+#define HELP_GAP 8   // extra air after a group of rows
+#define HELP_TOP 40  // first row: below the title
 #define HELP_BLUE 0xFF2E2C9Bu
+
+// Buffer height for the current binding table: the rows, the footer line
+// and a margin. Derived, so a new row can never run past the buffer.
+static int help_height(void)
+{
+    int y = HELP_TOP;
+    for (int i = 0; i < viewer_bindings_count; i++)
+        y += HELP_LINE + (viewer_bindings[i].gap ? HELP_GAP : 0);
+    return y + 12 + 8 + 10; // footer offset, its glyph row, bottom margin
+}
 
 static void help_render(uint32_t *px)
 {
-    for (int i = 0; i < HELP_PX_W * HELP_PX_H; i++)
+    int h = help_height();
+    for (int i = 0; i < HELP_PX_W * h; i++)
         px[i] = HELP_BLUE;
-    int y = 14;
-    term_draw_text(px, HELP_PX_W, (HELP_PX_W - 16 * 8) / 2, y, 0xFFFFFFFF,
+    term_draw_text(px, HELP_PX_W, (HELP_PX_W - 16 * 8) / 2, 14, 0xFFFFFFFF,
                    "c64uv " C64UV_VERSION " keys");
-    y += 8 + 18;
+    int y = HELP_TOP;
     for (int i = 0; i < viewer_bindings_count; i++) {
         term_draw_text(px, HELP_PX_W, 24, y, 0xFFEDF171, // VIC yellow
                        viewer_bindings[i].label);
         term_draw_text(px, HELP_PX_W, 200, y, 0xFFB2B2B2, // light grey
                        viewer_bindings[i].desc);
-        y += HELP_LINE + (viewer_bindings[i].gap ? 8 : 0);
+        y += HELP_LINE + (viewer_bindings[i].gap ? HELP_GAP : 0);
     }
     term_draw_text(px, HELP_PX_W, 24, y + 12, 0xFF7B7B7B, // dark grey
                    "F10 or Esc closes this help");
@@ -1312,6 +2205,71 @@ static void status_set(struct term *t, const char *l1, const char *l2)
     t->dirty = true;
 }
 
+// ------------------------------------------------------------------ toast
+//
+// A notice (port swapped, mouse grabbed, pad plugged in) must not take the
+// picture away: while video is on screen it is a banner over the lower
+// edge of the picture for as long as the notice lasts. The text is what
+// status_set() put on the status grid, so every notice works both ways:
+// banner over the stream, full status screen when there is no picture.
+// SDL itself has nothing for this (its only message UI is a modal box).
+
+#define TOAST_W VIDEO_MAX_W
+#define TOAST_H 30
+#define TOAST_COLS (TOAST_W / 8)
+
+// A status grid row without its centering blanks; out takes TERM_COLS + 1.
+static void status_line(const struct term *t, int row, char *out)
+{
+    int a = 0, b = TERM_COLS;
+    while (a < TERM_COLS && t->ch[row][a] == ' ')
+        a++;
+    while (b > a && t->ch[row][b - 1] == ' ')
+        b--;
+    memcpy(out, &t->ch[row][a], (size_t)(b - a));
+    out[b - a] = '\0';
+}
+
+// False when a line is too long for the banner (the status screen shows
+// the notice then).
+static bool toast_render(const struct term *status, uint32_t *px)
+{
+    char l1[TERM_COLS + 1], l2[TERM_COLS + 1];
+    status_line(status, 12, l1);
+    status_line(status, 14, l2);
+    int n1 = (int)strlen(l1), n2 = (int)strlen(l2);
+    if (n1 > TOAST_COLS - 2 || n2 > TOAST_COLS - 2 || n1 == 0)
+        return false;
+    for (int i = 0; i < TOAST_W * TOAST_H; i++)
+        px[i] = 0xE02E2C9Bu; // C64 blue, slightly see-through
+    for (int x = 0; x < TOAST_W; x++) // a light edge on top
+        px[x] = 0xFF706DEBu;
+    int y1 = n2 ? 5 : (TOAST_H - 8) / 2 + 1;
+    term_draw_text(px, TOAST_W, (TOAST_W - n1 * 8) / 2, y1, 0xFFFFFFFFu, l1);
+    if (n2)
+        term_draw_text(px, TOAST_W, (TOAST_W - n2 * 8) / 2, 17, 0xFFB2B2B2u,
+                       l2);
+    return true;
+}
+
+// Which pad sits in which port, as a notice.
+static void pads_notice(struct term *t, SDL_Gamepad *const pads[2],
+                        int joy_port)
+{
+    char l1[TERM_COLS + 1], l2[TERM_COLS + 1] = "";
+    if (pads[0] && pads[1]) {
+        snprintf(l1, sizeof l1, "pad 1 on port %d, pad 2 on port %d",
+                 joy_port, 3 - joy_port);
+    } else {
+        int slot = pads[0] ? 0 : 1;
+        const char *name = SDL_GetGamepadName(pads[slot]);
+        snprintf(l1, sizeof l1, "gamepad %d: joystick in port %d", slot + 1,
+                 slot ? 3 - joy_port : joy_port);
+        snprintf(l2, sizeof l2, "%.44s", name ? name : "");
+    }
+    status_set(t, l1, l2[0] ? l2 : NULL);
+}
+
 // The stream-lost screen; re-issued whenever a short notice has used the
 // status grid in the meantime.
 static void status_stream_lost(struct term *t, const char *host)
@@ -1324,6 +2282,118 @@ static void status_stream_lost(struct term *t, const char *host)
     status_set(t, msg, "is the Ultimate powered on? waiting...");
 }
 
+// What the status grid says when no notice is up and there is no picture.
+static void status_idle(struct term *t, const struct config *cfg,
+                        bool stream_lost)
+{
+    char msg[TERM_COLS + 1];
+    if (atomic_load(&g_rest_off)) {
+        status_set(t, "the Ultimate is on, but its web service is off",
+                   SERVICES_SHORT);
+    } else if (atomic_load(&g_link_dead)) {
+        snprintf(msg, sizeof msg, "the Ultimate does not answer over %.16s",
+                 g_link_if);
+        status_set(t, msg, "the stream needs that link: check cable/routes");
+    } else if (stream_lost) {
+        status_stream_lost(t, cfg->host);
+    } else if (cfg->no_start) {
+        snprintf(msg, sizeof msg, "listening for a stream on UDP :%d",
+                 cfg->listen_port);
+        status_set(t, msg, NULL);
+    } else {
+        snprintf(msg, sizeof msg, "waiting for the stream from %s",
+                 cfg->host);
+        status_set(t, msg, NULL);
+    }
+}
+
+// ---------------------------------------------------------- test hook
+//
+// C64U_TEST_EVENTS scripts input for the windowed viewer, so the
+// integration suite can press keys and move the mouse under SDL's dummy
+// video driver (which has neither). Steps, split by spaces:
+//   ready          wait for the machine:input probe to answer
+//   wait=MS        pause
+//   key=ctrl+g     a key press, released 80 ms later (SDL key names: f9,
+//                  down, escape, g...)
+//   move=DX,DY     relative mouse motion
+//   button=left:1  mouse button down (1) or up (0); left, right, middle
+
+struct test_events {
+    char *script, *save, *step;
+    Uint64 at;
+    SDL_Event up; // the release of the key being held, due at `at`
+};
+
+static void test_events_pump(struct test_events *te, SDL_Window *win)
+{
+    if (!te->script || SDL_GetTicks() < te->at)
+        return;
+    if (te->up.type) { // let go of the key the last step pressed
+        SDL_PushEvent(&te->up);
+        te->up.type = 0;
+    }
+    if (!te->step) {
+        te->step = SDL_strtok_r(te->save ? NULL : te->script, " ", &te->save);
+        if (!te->step) {
+            te->script = NULL; // done
+            return;
+        }
+    }
+    const char *st = te->step;
+    SDL_Event ev;
+    SDL_zero(ev);
+    if (!strcmp(st, "ready")) {
+        if (atomic_load(&g_minput) < 0)
+            return; // ask again on the next loop
+    } else if (!strncmp(st, "wait=", 5)) {
+        te->at = SDL_GetTicks() + (Uint64)atoi(st + 5);
+    } else if (!strncmp(st, "key=", 4)) {
+        const char *name = st + 4;
+        SDL_Keymod mod = SDL_KMOD_NONE;
+        for (;;) {
+            if (!strncmp(name, "ctrl+", 5)) {
+                mod |= SDL_KMOD_LCTRL;
+                name += 5;
+            } else if (!strncmp(name, "shift+", 6)) {
+                mod |= SDL_KMOD_LSHIFT;
+                name += 6;
+            } else
+                break;
+        }
+        ev.key.key = SDL_GetKeyFromName(name);
+        ev.key.mod = mod;
+        ev.key.windowID = SDL_GetWindowID(win);
+        ev.type = SDL_EVENT_KEY_DOWN;
+        ev.key.down = true;
+        SDL_PushEvent(&ev);
+        // held like a finger would: a press and release 10 ms apart is
+        // over before the real menu (or a game) looks at the keyboard
+        ev.type = SDL_EVENT_KEY_UP;
+        ev.key.down = false;
+        te->up = ev;
+        te->at = SDL_GetTicks() + 80;
+    } else if (!strncmp(st, "move=", 5)) {
+        ev.type = SDL_EVENT_MOUSE_MOTION;
+        ev.motion.windowID = SDL_GetWindowID(win);
+        ev.motion.xrel = (float)atof(st + 5);
+        const char *comma = strchr(st, ',');
+        ev.motion.yrel = comma ? (float)atof(comma + 1) : 0;
+        SDL_PushEvent(&ev);
+    } else if (!strncmp(st, "button=", 7)) {
+        bool down = strstr(st, ":1") != NULL;
+        ev.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN
+                       : SDL_EVENT_MOUSE_BUTTON_UP;
+        ev.button.windowID = SDL_GetWindowID(win);
+        ev.button.down = down;
+        ev.button.button = !strncmp(st + 7, "right", 5) ? SDL_BUTTON_RIGHT
+                           : !strncmp(st + 7, "middle", 6) ? SDL_BUTTON_MIDDLE
+                           : SDL_BUTTON_LEFT;
+        SDL_PushEvent(&ev);
+    }
+    te->step = NULL;
+}
+
 // ---------------------------------------------------------------- main
 
 static void usage(const char *argv0)
@@ -1332,8 +2402,11 @@ static void usage(const char *argv0)
             "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
             "          [--multicast] [--no-start] [--no-audio] [--no-keyb]\n"
             "          [--password PW] [--do ACTION] [--run FILE] [--store DIR]\n"
-            "          [--type TEXT] [--screen] [--joy INPUTS] [--joy-port N]\n"
-            "          [--dump FILE.ppm] [--term-test] [--discover] [--verbose]\n"
+            "          [--type TEXT [--matrix]] [--keys LIST] [--screen]\n"
+            "          [--joy INPUTS] [--joy-port N]\n"
+            "          [--mouse] [--mouse-joy] [--mouse-speed F] [--mouse-hold MS]\n"
+            "          [--mouse-send LIST] [--dump FILE.ppm]\n"
+            "          [--term-test] [--menu-screen] [--discover] [--verbose]\n"
             "          [--version]\n"
             "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
             "auto-discover)\n"
@@ -1352,14 +2425,33 @@ static void usage(const char *argv0)
             "            the Ultimate (FTP, e.g. /Temp or /Usb0/games), mount from\n"
             "            there read-write and autostart (or set C64U_STORE)\n"
             "  --type    type TEXT into the C64 (\\n = RETURN), then exit\n"
+            "  --matrix  with --type: press the keys on the keyboard matrix\n"
+            "            instead of filling the KERNAL buffer, so games see\n"
+            "            them (firmware 1.2.0+; about 10 characters a second)\n"
+            "  --keys    press matrix keys by name, then exit: strokes split\n"
+            "            by commas, chords with +, hold time with :MS\n"
+            "            (e.g. --keys \"f1,left_shift+a,space:500,run_stop\")\n"
             "  --screen  print the C64 text screen (40x25), then exit\n"
             "  --joy     tap joystick inputs, then exit: [PORT:]up,down,left,\n"
             "            right,fire,fire2,fire3 (e.g. --joy 1:left,fire)\n"
             "  --joy-port  control port the gamepad drives, 1 or 2 (default 2;\n"
             "            Ctrl+J or the pad's Back button swaps it)\n"
+            "  --mouse   start with the mouse grabbed (Ctrl+G toggles): a 1351\n"
+            "            mouse in port 1 on firmware 1.2.1+, else it steers\n"
+            "            the joystick (for GEOS's JOYSTICK driver)\n"
+            "  --mouse-speed  1351 counts per pixel of mouse travel (default 1)\n"
+            "  --mouse-joy  steer the joystick with the mouse on any firmware\n"
+            "  --mouse-hold  joystick mode: ms a direction stays held after\n"
+            "            the mouse stops (default 50)\n"
+            "  --mouse-send  send 1351 mouse events, then exit: move:DX:DY,\n"
+            "            left, right, middle, left:down, left:up, wheel:N\n"
+            "            (e.g. --mouse-send \"move:40:-10 left\")\n"
             "  --no-start  don't issue REST start/stop (e.g. mock stream test)\n"
             "  --dump    write first complete frame as PPM, then exit\n"
             "  --term-test  print the telnet menu screen as text, then exit\n"
+            "  --menu-screen  print the open Ultimate menu (40x25, selected\n"
+            "            row marked >) as text, then exit; firmware 1.2.0+,\n"
+            "            open it with --do menu, drive it with --keys\n"
             "  --discover  scan the local subnets for Ultimates, then exit\n",
             argv0);
     fprintf(stderr, "keys in the viewer window (F10 shows this in-window):\n");
@@ -1373,7 +2465,9 @@ int main(int argc, char **argv)
     struct config cfg = {.host = getenv("C64U_HOST"),
                          .listen_port = 11000,
                          .scale = 2,
-                         .joy_port = 2}; // most games read port 2
+                         .joy_port = 2, // most games read port 2
+                         .mouse_hold = 50,
+                         .mouse_speed = 1.0f};
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--host") && i + 1 < argc)
             cfg.host = argv[++i];
@@ -1387,6 +2481,10 @@ int main(int argc, char **argv)
             g_store = argv[++i];
         else if (!strcmp(argv[i], "--type") && i + 1 < argc)
             cfg.type_text = argv[++i];
+        else if (!strcmp(argv[i], "--matrix"))
+            cfg.type_matrix = true;
+        else if (!strcmp(argv[i], "--keys") && i + 1 < argc)
+            cfg.keys = argv[++i];
         else if (!strcmp(argv[i], "--screen"))
             cfg.screen = true;
         else if (!strcmp(argv[i], "--dest") && i + 1 < argc)
@@ -1412,11 +2510,36 @@ int main(int argc, char **argv)
                 fprintf(stderr, "--joy-port takes 1 or 2\n");
                 return 2;
             }
+            cfg.joy_port_set = true;
+        }
+        else if (!strcmp(argv[i], "--mouse"))
+            cfg.mouse = true;
+        else if (!strcmp(argv[i], "--mouse-joy"))
+            cfg.mouse_joy = true;
+        else if (!strcmp(argv[i], "--mouse-send") && i + 1 < argc)
+            cfg.mouse_send = argv[++i];
+        else if (!strcmp(argv[i], "--mouse-speed") && i + 1 < argc) {
+            cfg.mouse_speed = (float)atof(argv[++i]);
+            if (!(cfg.mouse_speed >= 0.1f && cfg.mouse_speed <= 10.0f)) {
+                fprintf(stderr, "--mouse-speed takes a factor, 0.1-10\n");
+                return 2;
+            }
+        }
+        else if (!strcmp(argv[i], "--mouse-hold") && i + 1 < argc) {
+            char *end = NULL;
+            long ms = strtol(argv[++i], &end, 10);
+            if (!end || *end || ms < 20 || ms > 1000) {
+                fprintf(stderr, "--mouse-hold takes milliseconds, 20-1000\n");
+                return 2;
+            }
+            cfg.mouse_hold = (int)ms;
         }
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc)
             cfg.dump_path = argv[++i];
         else if (!strcmp(argv[i], "--term-test"))
             cfg.term_test = true;
+        else if (!strcmp(argv[i], "--menu-screen"))
+            cfg.menu_screen = true;
         else if (!strcmp(argv[i], "--discover"))
             cfg.discover = true;
         else if (!strcmp(argv[i], "--verbose"))
@@ -1472,7 +2595,7 @@ int main(int argc, char **argv)
                    discover_ip_is_wired(found[i].ip)
                        ? "  (wired)" : "");
         if (n == 0)
-            fprintf(stderr, "no Ultimate found\n");
+            discovery_empty_hint();
         return n > 0 ? 0 : 1;
     }
 
@@ -1480,9 +2603,10 @@ int main(int argc, char **argv)
     // the answer before doing their one thing); the windowed viewer opens
     // immediately and discovers in the background instead.
     static char auto_host[46];
-    bool headless = cfg.dump_path || cfg.term_test || cfg.do_action ||
+    bool headless = cfg.dump_path || cfg.term_test || cfg.menu_screen ||
+                    cfg.do_action ||
                     cfg.run_path || cfg.type_text || cfg.screen ||
-                    cfg.joy_spec;
+                    cfg.joy_spec || cfg.keys || cfg.mouse_send;
     if (!cfg.host && !cfg.no_start && headless) {
         struct discovered found[DISCOVER_MAX];
         fprintf(stderr, "no --host given, discovering...\n");
@@ -1490,11 +2614,7 @@ int main(int argc, char **argv)
         if (discovery_choose(found, n, auto_host, sizeof auto_host)) {
             cfg.host = auto_host;
         } else {
-            fprintf(stderr,
-                    "no Ultimate found on your network: pass --host <ip> or "
-                    "set C64U_HOST\n"
-                    "(find it on the machine: F5 menu on the Ultimate shows "
-                    "its IP, or check your router)\n");
+            discovery_empty_hint();
             return 2;
         }
     }
@@ -1511,7 +2631,19 @@ int main(int argc, char **argv)
     if (cfg.joy_spec)
         return joy_tap(cfg.host, cfg.joy_spec, cfg.joy_port) ? 0 : 1;
 
-    if (cfg.type_text && !type_text(cfg.host, cfg.type_text))
+    if (cfg.mouse_send) {
+        int rc = mouse_send(cfg.host, cfg.mouse_send);
+        if (rc || !(cfg.keys || cfg.type_text || cfg.screen))
+            return rc;
+    }
+    if (cfg.keys) {
+        int rc = press_keys(cfg.host, cfg.keys);
+        if (rc || !(cfg.type_text || cfg.screen))
+            return rc;
+    }
+    if (cfg.type_text && !(cfg.type_matrix
+                               ? type_matrix(cfg.host, cfg.type_text)
+                               : type_text(cfg.host, cfg.type_text)))
         return 1;
     if (cfg.screen)
         return print_screen(cfg.host) ? 0 : 1;
@@ -1520,6 +2652,8 @@ int main(int argc, char **argv)
 
     if (cfg.term_test)
         return run_term_test(cfg.host);
+    if (cfg.menu_screen)
+        return print_menu_screen(cfg.host);
 
     if (cfg.dump_path)
         cfg.no_audio = true; // headless frame grab needs no sound
@@ -1624,12 +2758,28 @@ int main(int argc, char **argv)
 
     struct keyb kb = {.fd = COMPAT_BAD_SOCK, .host = cfg.host};
     struct minput mi = {.joy_port = cfg.joy_port};
-    // Gamepad -> joystick: the first pad that shows up, until it leaves.
-    SDL_Gamepad *pad = NULL;
-    bool pad_warned = false;
+    struct mousejoy mj = {.hold_ms = cfg.mouse_hold};
+    static struct mfwd mf;
+    bool mouse_desired = cfg.mouse; // grab again when the window regains focus
+    // Joystick mode only: GEOS's built-in JOYSTICK driver reads control
+    // port 1 (JS1) while the gamepad default of port 2 is for games, so the
+    // first grab in that mode moves the joystick to port 1, unless
+    // --joy-port chose one. Ctrl+J after that is respected.
+    bool mouse_port_done = cfg.joy_port_set;
+    struct test_events tev = {0};
+    if (getenv("C64U_TEST_EVENTS"))
+        tev.script = SDL_strdup(getenv("C64U_TEST_EVENTS"));
+    // Gamepads -> joysticks: the first pad that shows up drives
+    // mi.joy_port, a second one the other port (two players). A pad keeps
+    // its slot until it leaves; the other one is not moved when it does.
+    SDL_Gamepad *pads[2] = {NULL, NULL};
+    bool joy_warned = false;
+    bool joy_was_ok = false;
     bool want_keyb = windowed && !cfg.no_keyb && !cfg.no_start;
     if (want_keyb)
         SDL_StartTextInput(win);
+    if (mouse_desired && want_keyb && cfg.host)
+        mousejoy_set(&mj, win, true);
     if (want_keyb && cfg.host) {
         kb.enabled = true;
         keyb_try_connect(&kb);
@@ -1641,7 +2791,8 @@ int main(int argc, char **argv)
     struct term *trm = calloc(1, sizeof *trm);
     term_init(trm);
     // Help overlay (F10): own pixel buffer, spaced lines don't fit the grid.
-    uint32_t *help_px = calloc(HELP_PX_W * HELP_PX_H, sizeof(Uint32));
+    const int help_h = help_height();
+    uint32_t *help_px = calloc((size_t)HELP_PX_W * help_h, sizeof(Uint32));
     SDL_Texture *help_tex = NULL;
     bool help_active = false;
     bool term_active = false, term_present = false;
@@ -1649,19 +2800,11 @@ int main(int argc, char **argv)
     // Status screen: shown until the first video frame arrives.
     struct term *status = calloc(1, sizeof *status);
     {
-        char msg[TERM_COLS + 1];
         if (discovering)
             status_set(status, "looking for your Ultimate...",
                        "scanning the local subnets");
-        else if (cfg.no_start) {
-            snprintf(msg, sizeof msg, "listening for a stream on UDP :%d",
-                     cfg.listen_port);
-            status_set(status, msg, NULL);
-        } else {
-            snprintf(msg, sizeof msg, "waiting for the stream from %s",
-                     cfg.host);
-            status_set(status, msg, NULL);
-        }
+        else
+            status_idle(status, &cfg, false);
     }
 
     // Background discovery (windowed start with no host).
@@ -1675,7 +2818,18 @@ int main(int argc, char **argv)
     compat_sock tfd = COMPAT_BAD_SOCK;
     int shown_pct = -1; // drop progress currently in the window title
     Uint64 tfd_last_try = 0;
+    bool tfd_refused = false; // the last telnet connect was refused
     SDL_Texture *term_tex = NULL;
+    // REST menu view (F9 on firmware 1.2+): its own 40x25 texture
+    static struct rmenu rm;
+    bool rmenu_active = false; // the view is requested (opening or live)
+    bool rmenu_live = false;   // a screen arrived: the view is on display
+    unsigned rmenu_seq_shown = 0;
+    int rmenu_bg_guess = 0; // background for a scheme this code does not know
+    SDL_Texture *menu_tex = NULL;
+    SDL_Texture *toast_tex = NULL;
+    Uint32 *toast_px = calloc(TOAST_W * TOAST_H, sizeof(Uint32));
+    Uint32 *menu_px = calloc(MENU_PX_W * MENU_PX_H, sizeof(Uint32));
     Uint32 *term_px = calloc(TERM_PX_W * TERM_PX_H, sizeof(Uint32));
 
     struct frame_buf *fb = calloc(1, sizeof *fb);
@@ -1696,6 +2850,8 @@ int main(int argc, char **argv)
     // A short notice on the status grid (menu unreachable, link lost)
     // shows until this tick, then the regular status text comes back.
     Uint64 notice_until = 0;
+    int shown_idle = 0; // g_rest_off / g_link_dead as the status grid has them
+    bool pad_notice_due = false; // a pad arrived while there was no picture
     bool paused = false; // Ctrl+P toggle state (viewer-side best guess)
     // Audio latency control: startup fill and jitter leave a standing queue
     // that never drains on its own (input and output rates match). A servo on
@@ -1730,7 +2886,17 @@ int main(int argc, char **argv)
                         keyb_try_connect(&kb);
                         snprintf(mi.url, sizeof mi.url,
                                  "http://%s/v1/machine:input", cfg.host);
+                        if (mouse_desired)
+                            mousejoy_set(&mj, win, true);
                     }
+                } else if (da.off_ip[0]) {
+                    char msg[TERM_COLS + 1];
+                    snprintf(msg, sizeof msg,
+                             "found %s, but its web service is off",
+                             da.off_ip);
+                    status_set(status, msg, SERVICES_SHORT);
+                    term_present = true;
+                    next_scan = SDL_GetTicks() + 10000;
                 } else {
                     status_set(status, "no Ultimate found on your network",
                                "is it powered on? retrying in 10 s");
@@ -1747,28 +2913,112 @@ int main(int argc, char **argv)
         }
         if (windowed) {
             SDL_Event ev;
-            bool pad_event = false, joy_swap = false;
+            bool pad_event = false, joy_swap = false, mouse_event = false;
+            bool menu_toggle = false, menu_attach = false;
+            bool mouse_toggle = false;
+            // the grabbed mouse belongs to the C64 only while its screen
+            // is what the window shows
+            bool mouse_1351 = !cfg.mouse_joy && atomic_load(&g_mouse) == 1;
+            bool mouse_live = mj.enabled && kb.enabled &&
+                              atomic_load(&g_minput) == 1 && !term_active &&
+                              !rmenu_active && !help_active;
+            if (windowed)
+                test_events_pump(&tev, win);
             while (SDL_PollEvent(&ev)) {
                 if (ev.type == SDL_EVENT_QUIT) {
                     atomic_store(&g_quit, true);
                 } else if (ev.type == SDL_EVENT_GAMEPAD_ADDED) {
-                    if (!pad && (pad = SDL_OpenGamepad(ev.gdevice.which)))
+                    int slot = !pads[0] ? 0 : !pads[1] ? 1 : -1;
+                    bool open = false; // SDL can announce a pad twice
+                    for (int k = 0; k < 2; k++)
+                        open |= pads[k] && SDL_GetGamepadID(pads[k]) ==
+                                               ev.gdevice.which;
+                    if (slot < 0 && !open)
+                        SDL_Log("third gamepad ignored: the C64 has two "
+                                "control ports");
+                    else if (!open &&
+                             (pads[slot] = SDL_OpenGamepad(ev.gdevice.which))) {
+                        int port = slot ? 3 - mi.joy_port : mi.joy_port;
+                        const char *name = SDL_GetGamepadName(pads[slot]);
                         SDL_Log("gamepad '%s' drives joystick port %d",
-                                SDL_GetGamepadName(pad), mi.joy_port);
-                } else if (ev.type == SDL_EVENT_GAMEPAD_REMOVED) {
-                    if (pad && SDL_GetGamepadID(pad) == ev.gdevice.which) {
-                        SDL_CloseGamepad(pad);
-                        pad = NULL;
-                        pad_event = true; // let go of what it held
-                        SDL_Log("gamepad unplugged");
+                                name ? name : "?", port);
+                        // a banner over the picture; with no picture yet
+                        // (start-up) it waits for the first frame instead
+                        // of covering the connecting message
+                        if (got_any && !stream_lost) {
+                            pads_notice(status, pads, mi.joy_port);
+                            notice_until = SDL_GetTicks() + 3000;
+                            term_present = true;
+                        } else {
+                            pad_notice_due = true;
+                        }
                     }
+                } else if (ev.type == SDL_EVENT_GAMEPAD_REMOVED) {
+                    for (int k = 0; k < 2; k++)
+                        if (pads[k] && SDL_GetGamepadID(pads[k]) ==
+                                           ev.gdevice.which) {
+                            SDL_CloseGamepad(pads[k]);
+                            pads[k] = NULL;
+                            pad_event = true; // let go of what it held
+                            SDL_Log("gamepad on port %d unplugged",
+                                    k ? 3 - mi.joy_port : mi.joy_port);
+                            if (got_any && !stream_lost) {
+                                char l1[TERM_COLS + 1];
+                                snprintf(l1, sizeof l1, "gamepad %d "
+                                         "unplugged (port %d)", k + 1,
+                                         k ? 3 - mi.joy_port : mi.joy_port);
+                                status_set(status, l1, NULL);
+                                notice_until = SDL_GetTicks() + 3000;
+                                term_present = true;
+                            }
+                            pad_notice_due = false;
+                        }
                 } else if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
                            ev.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
                            ev.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
-                    pad_event = true;
-                    if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
-                        ev.gbutton.button == SDL_GAMEPAD_BUTTON_BACK)
-                        joy_swap = true;
+                    bool down = ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+                    bool button = ev.type != SDL_EVENT_GAMEPAD_AXIS_MOTION;
+                    if (down && ev.gbutton.button == SDL_GAMEPAD_BUTTON_START) {
+                        menu_toggle = true; // the pad's F9
+                    } else if (rmenu_active) {
+                        // in the menu the pad steers the menu, not a
+                        // joystick: d-pad = cursor keys, A = RETURN, B = back
+                        SDL_Keycode k = button ? pad_menu_key(
+                                                     ev.gbutton.button)
+                                               : SDLK_UNKNOWN;
+                        if (k != SDLK_UNKNOWN &&
+                            atomic_load(&g_minput) == 1) {
+                            minput_key(&mi, k, down);
+                            atomic_store(&rm.kick, true);
+                        }
+                    } else {
+                        pad_event = true;
+                        if (down &&
+                            ev.gbutton.button == SDL_GAMEPAD_BUTTON_BACK)
+                            joy_swap = true;
+                    }
+                } else if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+                    if (mouse_live && mouse_1351) {
+                        mfwd_start(&mf, cfg.host);
+                        mfwd_motion(&mf, ev.motion.xrel * cfg.mouse_speed,
+                                    ev.motion.yrel * cfg.mouse_speed);
+                    } else if (mouse_live) {
+                        mousejoy_motion(&mj, ev.motion.xrel, ev.motion.yrel);
+                    }
+                } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                           ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+                    unsigned bit = mouse_button_joy(ev.button.button);
+                    if (mouse_live && mouse_1351) {
+                        mfwd_start(&mf, cfg.host);
+                        mfwd_button(&mf, mouse_button_bit(ev.button.button),
+                                    ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+                    } else if (mouse_live && bit) {
+                        if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+                            mj.btn |= bit;
+                        else
+                            mj.btn &= ~bit;
+                        mouse_event = true;
+                    }
                 } else if (ev.type == SDL_EVENT_KEY_DOWN) {
                     enum viewer_action va =
                         viewer_binding_match(ev.key.key, ev.key.mod);
@@ -1776,57 +3026,59 @@ int main(int argc, char **argv)
                         atomic_store(&g_quit, true);
                     } else if (va == VA_HELP) {
                         help_active = !help_active;
+                        mousejoy_clear(&mj); // the overlay takes the mouse
+                        mfwd_release(&mf);
+                        mouse_event = true;
                         term_present = true;
                     } else if (help_active) {
                         if (ev.key.key == SDLK_ESCAPE) {
                             help_active = false;
                             term_present = true;
                         } // anything else stays local while help is up
-                    } else if (va == VA_RESET && !cfg.no_start && cfg.host) {
-                        machine_ctl(cfg.host, "reset");
-                    } else if (va == VA_REBOOT && !cfg.no_start && cfg.host) {
-                        machine_ctl(cfg.host, "reboot");
-                    } else if (va == VA_PAUSE && !cfg.no_start && cfg.host) {
-                        paused = !paused;
-                        machine_ctl(cfg.host, paused ? "pause" : "resume");
-                    } else if (va == VA_MENU_BTN && !cfg.no_start &&
-                               cfg.host) {
-                        machine_ctl(cfg.host, "menu_button");
+                    } else if ((va == VA_RESET || va == VA_REBOOT ||
+                                va == VA_PAUSE || va == VA_MENU_BTN) &&
+                               !cfg.no_start && cfg.host) {
+                        const char *act = "menu_button", *said = NULL;
+                        if (va == VA_RESET) {
+                            act = "reset";
+                            said = "C64 reset";
+                        } else if (va == VA_REBOOT) {
+                            act = "reboot";
+                            said = "rebooting the Ultimate";
+                        } else if (va == VA_PAUSE) {
+                            act = paused ? "resume" : "pause";
+                            said = paused ? "machine resumed"
+                                          : "machine paused";
+                        }
+                        if (!machine_ctl(cfg.host, act)) {
+                            char l1[TERM_COLS + 1];
+                            snprintf(l1, sizeof l1, "%s failed", act);
+                            status_set(status, l1,
+                                       t_refused
+                                           ? "the Ultimate's web service is "
+                                             "off"
+                                           : "no answer from the Ultimate "
+                                             "(see the log)");
+                            notice_until = SDL_GetTicks() + 3000;
+                        } else {
+                            if (va == VA_PAUSE)
+                                paused = !paused;
+                            if (said) {
+                                status_set(status, said,
+                                           va == VA_PAUSE && paused
+                                               ? "Ctrl+P resumes" : NULL);
+                                notice_until = SDL_GetTicks() + 2000;
+                            }
+                            if (va == VA_MENU_BTN)
+                                menu_attach = true; // show it where possible
+                        }
+                        term_present = true;
                     } else if (va == VA_JOY_PORT) {
                         joy_swap = true;
-                    } else if (va == VA_MENU_VIEW && !cfg.no_start &&
-                               cfg.host) {
-                        term_present = true; // repaint whichever view we land in
-                        if (term_active) {
-                            term_active = false;
-                        } else {
-                            if (tfd == COMPAT_BAD_SOCK &&
-                                (tfd_last_try == 0 ||
-                                 SDL_GetTicks() - tfd_last_try > 3000)) {
-                                tfd_last_try = SDL_GetTicks();
-                                tfd = compat_tcp_connect(cfg.host, 23, 1);
-                                if (tfd != COMPAT_BAD_SOCK) {
-                                    term_init(trm);
-                                    SDL_Log("menu terminal connected "
-                                            "(port 23)");
-                                } else
-                                    SDL_Log("menu terminal: connect failed");
-                            }
-                            // no connection, no menu view: a blank or stale
-                            // grid would pass for the machine's own screen
-                            if (tfd != COMPAT_BAD_SOCK) {
-                                term_active = true;
-                                if (atomic_load(&g_minput) == 1)
-                                    minput_release_all(&mi); // no keys held
-                            } else {
-                                status_set(status,
-                                           "cannot reach the Ultimate menu "
-                                           "(telnet, port 23)",
-                                           "is it powered on? is telnet "
-                                           "enabled?");
-                                notice_until = SDL_GetTicks() + 3000;
-                            }
-                        }
+                    } else if (va == VA_MOUSE) {
+                        mouse_toggle = true;
+                    } else if (va == VA_MENU_VIEW) {
+                        menu_toggle = true;
                     } else if (term_active) {
                         Uint8 seq[8];
                         int n = term_encode_key(ev.key.key, ev.key.mod, seq);
@@ -1839,6 +3091,8 @@ int main(int argc, char **argv)
                         if (atomic_load(&g_minput) == 1) {
                             if (!ev.key.repeat) // the matrix has no repeat
                                 minput_key(&mi, ev.key.key, true);
+                            if (rmenu_active)
+                                atomic_store(&rm.kick, true);
                         } else if (ev.key.key == SDLK_ESCAPE) {
                             keyb_stop(&kb); // Esc = RUN/STOP
                         } else {
@@ -1851,7 +3105,15 @@ int main(int argc, char **argv)
                     if (!term_active && kb.enabled &&
                         atomic_load(&g_minput) == 1)
                         minput_key(&mi, ev.key.key, false);
+                } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_GAINED) {
+                    if (mouse_desired && kb.enabled && !mj.enabled)
+                        mousejoy_set(&mj, win, true);
                 } else if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+                    if (mj.enabled)
+                        mousejoy_set(&mj, win, false); // release the pointer
+                    else
+                        mousejoy_clear(&mj);
+                    mfwd_release(&mf);
                     if (atomic_load(&g_minput) == 1)
                         minput_release_all(&mi);
                 } else if (ev.type == SDL_EVENT_WINDOW_RESIZED ||
@@ -1868,8 +3130,19 @@ int main(int argc, char **argv)
                         SDL_Log("drop: shift %s", (SDL_GetModState() &
                                                    SDL_KMOD_SHIFT)
                                                       ? "held" : "not held");
-                    if (!cfg.no_start && cfg.host && ev.drop.data)
-                        run_file_async(cfg.host, ev.drop.data, &kb);
+                    if (!cfg.no_start && cfg.host && ev.drop.data) {
+                        char l1[TERM_COLS + 1];
+                        if (run_file_async(cfg.host, ev.drop.data, &kb)) {
+                            snprintf(l1, sizeof l1, "sending %.36s",
+                                     g_run_name);
+                            status_set(status, l1, NULL);
+                        } else {
+                            status_set(status, "still busy with the "
+                                       "previous file", NULL);
+                        }
+                        notice_until = SDL_GetTicks() + 2500;
+                        term_present = true;
+                    }
                 } else if (ev.type == SDL_EVENT_TEXT_INPUT && !help_active) {
                     for (const char *p = ev.text.text; *p; p++) {
                         if (term_active) {
@@ -1889,31 +3162,226 @@ int main(int argc, char **argv)
                     }
                 }
             }
-            // gamepad -> joystick lines, once per batch of events
+            // Ctrl+G: grab or release the pointer. What the grabbed mouse
+            // is depends on the firmware: a 1351 where machine:input takes
+            // mouse events, else (or with --mouse-joy) the joystick.
+            if (atomic_exchange(&mf.failed, false) && mouse_desired) {
+                mouse_desired = false;
+                mousejoy_set(&mj, win, false);
+                mfwd_release(&mf);
+                status_set(status, "mouse released: the Ultimate stopped "
+                           "answering", "Ctrl+G grabs it again");
+                notice_until = SDL_GetTicks() + 3000;
+                SDL_Log("mouse: no answer from the Ultimate, released");
+            }
+            if (mouse_toggle && windowed) {
+                int cap = atomic_load(&g_minput);
+                if (mouse_desired) {
+                    mouse_desired = false;
+                    mousejoy_set(&mj, win, false);
+                    mfwd_release(&mf);
+                    SDL_Log("mouse released");
+                    status_set(status, "mouse released", NULL);
+                    notice_until = SDL_GetTicks() + 2500;
+                } else if (!kb.enabled || cap < 0) {
+                    status_set(status, "not connected yet",
+                               "waiting for the Ultimate");
+                    notice_until = SDL_GetTicks() + 2000;
+                } else if (cap == 0) {
+                    bool was_up = atomic_load(&g_minput_up);
+                    SDL_Log("mouse ignored: machine:input %s",
+                            was_up ? "stopped responding" : "not available");
+                    status_set(status,
+                               was_up ? "machine:input stopped responding"
+                                      : "the mouse needs firmware 1.2.0 or "
+                                        "newer",
+                               was_up ? "check the network connection"
+                                      : "this Ultimate has no machine:input");
+                    notice_until = SDL_GetTicks() + 3000;
+                } else {
+                    mouse_desired = true; // a failed grab is retried when
+                                          // the window gains focus
+                    if (!mouse_1351 && !mouse_port_done) {
+                        mouse_port_done = true;
+                        if (mi.joy_port != 1) {
+                            minput_joy(&mi, 1, 0);
+                            minput_joy(&mi, 2, 0);
+                            mi.joy_port = 1;
+                            pad_event = true;
+                        }
+                    }
+                    if (!mousejoy_set(&mj, win, true)) {
+                        status_set(status, "could not grab the mouse",
+                                   "click the window and press Ctrl+G");
+                    } else if (mouse_1351) {
+                        SDL_Log("mouse grabbed: 1351 mouse in port 1");
+                        status_set(status, "mouse grabbed: a 1351 mouse in "
+                                   "port 1", "Ctrl+G releases it");
+                    } else {
+                        char l1[TERM_COLS + 1];
+                        snprintf(l1, sizeof l1, "mouse grabbed: the "
+                                 "joystick in port %d", mi.joy_port);
+                        SDL_Log("mouse grabbed: joystick on port %d (hold "
+                                "%d ms)", mi.joy_port, mj.hold_ms);
+                        status_set(status, l1,
+                                   "Ctrl+G releases it, Ctrl+J swaps the "
+                                   "port");
+                    }
+                    notice_until = SDL_GetTicks() + 2000;
+                }
+                mouse_event = true;
+            }
+
+            // F9 / pad Start: the Ultimate menu view. On firmware with
+            // menu_screen it is the machine's real menu over REST; before
+            // that the telnet remote menu.
+            bool rmenu_ok = kb.enabled && atomic_load(&g_minput) == 1 &&
+                            atomic_load(&g_menu_rest) == 1;
+            if (menu_toggle && !cfg.no_start && cfg.host && !help_active) {
+                term_present = true; // repaint whichever view we land in
+                if (term_active) {
+                    term_active = false;
+                } else if (rmenu_active) {
+                    rmenu_cmd(&rm, cfg.host, RM_CLOSE);
+                    rmenu_active = rmenu_live = false;
+                    minput_release_all(&mi);
+                    pad_event = true; // the pad is a joystick again
+                    SDL_Log("menu view closed");
+                } else if (rmenu_ok) {
+                    minput_release_all(&mi); // no key held into the menu
+                    mousejoy_clear(&mj);
+                    mfwd_release(&mf);
+                    rmenu_cmd(&rm, cfg.host, RM_OPEN);
+                    rmenu_active = true;
+                    rmenu_live = false;
+                } else {
+                    if (tfd == COMPAT_BAD_SOCK &&
+                        (tfd_last_try == 0 ||
+                         SDL_GetTicks() - tfd_last_try > 3000)) {
+                        tfd_last_try = SDL_GetTicks();
+                        tfd = compat_tcp_connect(cfg.host, 23, 1);
+                        if (tfd != COMPAT_BAD_SOCK) {
+                            term_init(trm);
+                            SDL_Log("menu terminal connected (port 23)");
+                        } else {
+                            tfd_refused = compat_neterr_refused();
+                            SDL_Log("menu terminal: connect %s",
+                                    tfd_refused ? "refused (telnet service "
+                                                  "off)"
+                                                : "failed");
+                        }
+                    }
+                    // no connection, no menu view: a blank or stale grid
+                    // would pass for the machine's own screen
+                    if (tfd != COMPAT_BAD_SOCK) {
+                        term_active = true;
+                        mousejoy_clear(&mj);
+                        mfwd_release(&mf);
+                        if (atomic_load(&g_minput) == 1)
+                            minput_release_all(&mi); // no keys held
+                    } else {
+                        if (tfd_refused)
+                            status_set(status,
+                                       "the Ultimate's telnet menu service "
+                                       "is off", SERVICES_SHORT);
+                        else
+                            status_set(status,
+                                       "cannot reach the Ultimate menu "
+                                       "(telnet)",
+                                       "is it powered on? is telnet "
+                                       "enabled?");
+                        notice_until = SDL_GetTicks() + 3000;
+                    }
+                }
+            }
+            // Ctrl+M pressed the button: where the menu screen is
+            // readable, show the menu it opened (a press that closed one
+            // ends the view through RMS_GONE instead)
+            if (menu_attach && rmenu_ok && !rmenu_active && !term_active) {
+                minput_release_all(&mi);
+                mousejoy_clear(&mj);
+                mfwd_release(&mf);
+                rmenu_cmd(&rm, cfg.host, RM_ATTACH);
+                rmenu_active = true;
+                rmenu_live = false;
+            }
+            if (rmenu_active) {
+                int st = rmenu_state(&rm);
+                if (st == RMS_LIVE && !rmenu_live) {
+                    rmenu_live = true;
+                    term_present = true;
+                    SDL_Log("menu view: showing the Ultimate menu");
+                } else if (st == RMS_GONE || st == RMS_FAILED) {
+                    rmenu_active = rmenu_live = false;
+                    term_present = true;
+                    pad_event = true; // the pad is a joystick again
+                    minput_release_all(&mi); // a key may still be down
+                    if (st == RMS_FAILED) {
+                        status_set(status, "the Ultimate menu stopped "
+                                   "answering", "F9 tries again");
+                        notice_until = SDL_GetTicks() + 3000;
+                    }
+                    SDL_Log("menu view: %s", st == RMS_GONE
+                                ? "the menu closed on the machine"
+                                : "no answer from the Ultimate");
+                }
+            }
+
+            // joystick lines, once per loop: the pad's current state merged
+            // with any mouse pulse that started or ended this iteration
             bool joy_ok = kb.enabled && atomic_load(&g_minput) == 1;
+            if (joy_ok && !joy_was_ok) {
+                pad_event = true; // the probe just answered: send what a
+                                  // pad already holds
+                if (mouse_desired && !mouse_1351 && !mouse_port_done) {
+                    mouse_port_done = true; // --mouse in joystick mode
+                    mi.joy_port = 1;
+                    SDL_Log("mouse steers the joystick in port 1");
+                }
+            }
+            joy_was_ok = joy_ok;
+            bool mouse_changed = mousejoy_tick(&mj);
             if (joy_swap) {
-                if (joy_ok)
-                    minput_joy(&mi, 0); // nothing stays held on the old port
+                if (joy_ok) { // nothing stays held on the old ports
+                    minput_joy(&mi, 1, 0);
+                    minput_joy(&mi, 2, 0);
+                }
                 mi.joy_port = 3 - mi.joy_port;
                 pad_event = true;
                 SDL_Log("joystick on port %d", mi.joy_port);
-                status_set(status, mi.joy_port == 1 ? "joystick on port 1"
-                                                    : "joystick on port 2",
+                char l1[TERM_COLS + 1];
+                if (pads[0] && pads[1])
+                    snprintf(l1, sizeof l1, "pad 1 on port %d, pad 2 on "
+                             "port %d", mi.joy_port, 3 - mi.joy_port);
+                else
+                    snprintf(l1, sizeof l1, "joystick on port %d",
+                             mi.joy_port);
+                status_set(status, l1,
                            "Ctrl+J or the pad's Back button swaps");
-                notice_until = SDL_GetTicks() + 1500;
+                notice_until = SDL_GetTicks() + 2500;
             }
-            if (pad_event && joy_ok) {
-                unsigned want = pad ? pad_state(pad) : 0;
-                if (cfg.verbose && want != mi.joy_sent)
-                    SDL_Log("pad: port %d state %02x", mi.joy_port, want);
-                minput_joy(&mi, want);
-            } else if (pad_event && pad && !pad_warned &&
-                       atomic_load(&g_minput) == 0) {
-                pad_warned = true;
-                SDL_Log("gamepad ignored: joysticks need machine:input "
-                        "(firmware 1.2.0 or newer)");
-                status_set(status, "the gamepad needs firmware 1.2.0 or newer",
-                           "this Ultimate has no machine:input");
+            if ((pad_event || mouse_event || mouse_changed) && joy_ok) {
+                // first pad (and the mouse joystick) on mi.joy_port, a
+                // second pad on the other port
+                for (int k = 0; k < 2; k++) {
+                    int port = k ? 3 - mi.joy_port : mi.joy_port;
+                    unsigned want = (pads[k] ? pad_state(pads[k]) : 0) |
+                                    (k ? 0 : mj.dir | mj.btn);
+                    if (cfg.verbose && want != mi.joy_sent[port - 1])
+                        SDL_Log("joystick: port %d state %02x", port, want);
+                    minput_joy(&mi, port, want);
+                }
+            } else if ((pad_event || mouse_event || mouse_changed) &&
+                       !joy_warned && atomic_load(&g_minput) == 0) {
+                joy_warned = true;
+                bool was_up = atomic_load(&g_minput_up);
+                SDL_Log("joystick ignored: machine:input %s",
+                        was_up ? "stopped responding" : "not available");
+                status_set(status,
+                           was_up ? "machine:input stopped responding"
+                                  : "joysticks need firmware 1.2.0 or newer",
+                           was_up ? "check the REST/network connection"
+                                  : "this Ultimate has no machine:input");
                 notice_until = SDL_GetTicks() + 3000;
             }
         }
@@ -1925,6 +3393,24 @@ int main(int argc, char **argv)
         if (kb.reclaim && !atomic_load(&g_run_busy)) {
             kb.reclaim = false;
             keyb_try_connect(&kb);
+        }
+
+        int run_result = atomic_exchange(&g_run_result, 0);
+        if (run_result) {
+            char l1[TERM_COLS + 1];
+            snprintf(l1, sizeof l1, run_result == 1 ? "%.36s started"
+                                                    : "could not run %.30s",
+                     g_run_name);
+            status_set(status, l1, run_result == 1 ? NULL
+                                                   : "the log says why");
+            notice_until = SDL_GetTicks() + 3000;
+            term_present = true;
+        }
+        if (atomic_exchange(&g_minput_lost, false)) {
+            status_set(status, "the Ultimate stopped answering key events",
+                       "typing falls back to the keyboard buffer");
+            notice_until = SDL_GetTicks() + 4000;
+            term_present = true;
         }
 
         if (windowed) { // a running drop shows its progress in the title
@@ -2007,7 +3493,7 @@ int main(int argc, char **argv)
             if (!help_tex) {
                 help_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
                                              SDL_TEXTUREACCESS_STREAMING,
-                                             HELP_PX_W, HELP_PX_H);
+                                             HELP_PX_W, help_h);
                 SDL_SetTextureScaleMode(help_tex, SDL_SCALEMODE_NEAREST);
             }
             help_render(help_px);
@@ -2015,7 +3501,7 @@ int main(int argc, char **argv)
             SDL_UpdateTexture(help_tex, NULL, help_px,
                               HELP_PX_W * (int)sizeof(Uint32));
             // same 2x vertical stretch as the terminal views
-            SDL_SetRenderLogicalPresentation(ren, HELP_PX_W, HELP_PX_H * 2,
+            SDL_SetRenderLogicalPresentation(ren, HELP_PX_W, help_h * 2,
                                              SDL_LOGICAL_PRESENTATION_LETTERBOX);
             SDL_SetRenderDrawColor(ren, 0x2E, 0x2C, 0x9B, 255);
             SDL_RenderClear(ren);
@@ -2025,7 +3511,7 @@ int main(int argc, char **argv)
 
         if (got_any && !stream_lost && SDL_GetTicks() - last_frame > 2000) {
             stream_lost = true;
-            status_stream_lost(status, cfg.host);
+            status_idle(status, &cfg, true);
             notice_until = 0;
             term_present = true;
             if (windowed)
@@ -2041,20 +3527,69 @@ int main(int argc, char **argv)
         }
         if (notice_until && SDL_GetTicks() >= notice_until) {
             notice_until = 0;
-            if (stream_lost)
-                status_stream_lost(status, cfg.host);
-            else if (!got_any && !discovering && cfg.host) {
-                char msg[TERM_COLS + 1];
-                snprintf(msg, sizeof msg, "waiting for the stream from %s",
-                         cfg.host);
-                status_set(status, msg, NULL);
-            }
+            if (stream_lost || (!got_any && !discovering && cfg.host))
+                status_idle(status, &cfg, stream_lost);
             term_present = true;
         }
+        // the keepalive found the REST port refusing (or answering again)
+        int idle_now = atomic_load(&g_rest_off) | atomic_load(&g_link_dead) << 1;
+        if (idle_now != shown_idle) {
+            shown_idle = idle_now;
+            if (!notice_until && !discovering && cfg.host &&
+                (stream_lost || !got_any)) {
+                status_idle(status, &cfg, stream_lost);
+                term_present = true;
+            }
+        }
 
+        bool rmenu_show = rmenu_active && rmenu_live && !help_active;
+        if (windowed && rmenu_show &&
+            (term_present || atomic_load(&rm.seq) != rmenu_seq_shown)) {
+            if (!menu_tex) {
+                menu_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                             SDL_TEXTUREACCESS_STREAMING,
+                                             MENU_PX_W, MENU_PX_H);
+                SDL_SetTextureScaleMode(menu_tex, SDL_SCALEMODE_NEAREST);
+            }
+            SDL_LockMutex(rm.lock);
+            rmenu_seq_shown = atomic_load(&rm.seq);
+            // the scheme's background; for an unknown scheme what the
+            // selected row hints at (kept while no row is selected)
+            int bg = atomic_load(&g_menu_bg), border = atomic_load(&g_menu_border);
+            if (bg < 0) {
+                int guess = menu_guess_bg(rm.screen);
+                if (guess >= 0)
+                    rmenu_bg_guess = guess;
+                bg = rmenu_bg_guess;
+            }
+            if (border < 0)
+                border = bg;
+            menu_render(rm.screen, bg, menu_px, MENU_PX_W);
+            SDL_UnlockMutex(rm.lock);
+            term_present = false;
+            SDL_UpdateTexture(menu_tex, NULL, menu_px,
+                              MENU_PX_W * (int)sizeof(Uint32));
+            // square pixels inside the menu's border colour, like the
+            // machine's own output
+            SDL_SetRenderLogicalPresentation(ren, MENU_PX_W, MENU_PX_H,
+                                             SDL_LOGICAL_PRESENTATION_LETTERBOX);
+            uint32_t bc = term_vic_color(border);
+            SDL_SetRenderDrawColor(ren, bc >> 16 & 0xFF, bc >> 8 & 0xFF,
+                                   bc & 0xFF, 255);
+            SDL_RenderClear(ren);
+            SDL_RenderTexture(ren, menu_tex, NULL, NULL);
+            SDL_RenderPresent(ren);
+        }
+
+        // a notice over live video is a banner; without a picture (or
+        // with a line too long for it) the status screen shows it
+        bool toast_ok = notice_until && got_any && !stream_lost &&
+                        toast_render(status, toast_px);
         struct term *view = help_active ? NULL
                             : term_active ? trm
-                            : !got_any || stream_lost || notice_until
+                            : rmenu_show ? NULL
+                            : !got_any || stream_lost ||
+                                      (notice_until && !toast_ok)
                                 ? status
                                 : NULL;
         if (windowed && view && (view->dirty || term_present)) {
@@ -2090,6 +3625,11 @@ int main(int argc, char **argv)
                     SDL_Log("receiving: %dx%d", fb->width, fb->height);
                 got_any = true;
                 stream_lost = false;
+                if (pad_notice_due && (pads[0] || pads[1])) {
+                    pads_notice(status, pads, mi.joy_port);
+                    notice_until = SDL_GetTicks() + 3000;
+                }
+                pad_notice_due = false;
                 if (windowed)
                     SDL_SetWindowTitle(
                         win, kb.enabled
@@ -2115,7 +3655,7 @@ int main(int argc, char **argv)
                 SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
                 tex_h = fb->height;
             }
-            if (!term_active && !help_active) {
+            if (!term_active && !help_active && !rmenu_show) {
                 SDL_UpdateTexture(tex, NULL, fb->px, VIDEO_MAX_W * sizeof(Uint32));
                 SDL_SetRenderLogicalPresentation(
                     ren, fb->width, fb->height,
@@ -2123,6 +3663,23 @@ int main(int argc, char **argv)
                 SDL_SetRenderDrawColor(ren, 0, 0, 0, 255); // video keeps black
                 SDL_RenderClear(ren);
                 SDL_RenderTexture(ren, tex, NULL, NULL);
+                if (toast_ok) {
+                    if (!toast_tex) {
+                        toast_tex = SDL_CreateTexture(
+                            ren, SDL_PIXELFORMAT_ARGB8888,
+                            SDL_TEXTUREACCESS_STREAMING, TOAST_W, TOAST_H);
+                        SDL_SetTextureScaleMode(toast_tex,
+                                                SDL_SCALEMODE_NEAREST);
+                        SDL_SetTextureBlendMode(toast_tex,
+                                                SDL_BLENDMODE_BLEND);
+                    }
+                    SDL_UpdateTexture(toast_tex, NULL, toast_px,
+                                      TOAST_W * (int)sizeof(Uint32));
+                    SDL_FRect dst = {0, (float)(fb->height - TOAST_H - 12),
+                                     (float)fb->width, TOAST_H};
+                    SDL_FRect src = {0, 0, (float)fb->width, TOAST_H};
+                    SDL_RenderTexture(ren, toast_tex, &src, &dst);
+                }
                 SDL_RenderPresent(ren);
             }
         }
@@ -2139,11 +3696,14 @@ int main(int argc, char **argv)
         }
     }
 
+    if (rmenu_active) // the thread closes the menu on its way out
+        atomic_store(&rm.cmd, (rm.gen + 1) << 3 | RM_CLOSE);
     atomic_store(&g_quit, true);
     if (atomic_load(&g_minput) == 1 && mi.url[0])
         minput_release_all(&mi);
-    if (pad)
-        SDL_CloseGamepad(pad);
+    for (int k = 0; k < 2; k++)
+        if (pads[k])
+            SDL_CloseGamepad(pads[k]);
     // The background threads must not outlive curl, but a blocking join
     // would leave the compositor's pings unanswered: with the Ultimate
     // powered off, the old 3 s REST timeouts added up to a ten-second
@@ -2164,6 +3724,22 @@ int main(int argc, char **argv)
         }
         SDL_WaitThread(ka, NULL);
     }
+    if (mf.thr) {
+        while (windowed && !atomic_load(&mf.done)) {
+            SDL_PumpEvents();
+            SDL_Delay(10);
+        }
+        SDL_WaitThread(mf.thr, NULL);
+        SDL_DestroyMutex(mf.lock);
+    }
+    if (rm.thr) {
+        while (windowed && !atomic_load(&rm.done)) {
+            SDL_PumpEvents();
+            SDL_Delay(10);
+        }
+        SDL_WaitThread(rm.thr, NULL);
+        SDL_DestroyMutex(rm.lock);
+    }
     if (mi.curl)
         curl_easy_cleanup(mi.curl);
     curl_global_cleanup();
@@ -2171,6 +3747,12 @@ int main(int argc, char **argv)
     compat_close(tfd);
     if (term_tex)
         SDL_DestroyTexture(term_tex);
+    if (menu_tex)
+        SDL_DestroyTexture(menu_tex);
+    if (toast_tex)
+        SDL_DestroyTexture(toast_tex);
+    free(toast_px);
+    free(menu_px);
     if (help_tex)
         SDL_DestroyTexture(help_tex);
     free(term_px);
@@ -2184,6 +3766,8 @@ int main(int argc, char **argv)
         SDL_DestroyTexture(tex);
     if (ren)
         SDL_DestroyRenderer(ren);
+    if (mj.enabled && win)
+        SDL_SetWindowRelativeMouseMode(win, false);
     if (win)
         SDL_DestroyWindow(win);
     if (windowed)

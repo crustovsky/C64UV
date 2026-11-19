@@ -90,6 +90,13 @@ const char *compat_neterr(void);
 // EWOULDBLOCK, EINTR; WSAEWOULDBLOCK, WSAETIMEDOUT), i.e. worth retrying.
 bool compat_neterr_transient(void);
 
+// True when the last socket error was a refused connection: the host is up
+// but nothing listens on the port (an Ultimate with that service off).
+bool compat_neterr_refused(void);
+// The same test for an OS error number obtained elsewhere (libcurl's
+// CURLINFO_OS_ERRNO).
+bool compat_errno_refused(long os_errno);
+
 // Source address the OS would use to reach `ip` (UDP connect +
 // getsockname). Dotted quad in out (>= COMPAT_IP_STRLEN bytes).
 bool compat_route_source_ip(const char *ip, char *out, size_t cap);
@@ -119,7 +126,10 @@ bool compat_neighbor_mac(const char *ip, char *out, size_t cap);
 // replies to, so this is an ICMP echo, never a bare datagram). With a
 // non-empty `ifname` the traffic is forced out of that interface, which on
 // Linux needs `ping -I` because policy routing (VPN accept-routes) can
-// otherwise detour LAN traffic. `s` is unused today.
-void compat_arp_prime(compat_sock s, const char *ip, const char *ifname);
+// otherwise detour LAN traffic. `s` is unused today. Returns false only
+// when the echo was sent and no reply came back within a second (the
+// machine is off, or that interface has no working path to it); true
+// otherwise, including when `ip` is not a literal and nothing was sent.
+bool compat_arp_prime(compat_sock s, const char *ip, const char *ifname);
 
 #endif
