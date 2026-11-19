@@ -231,6 +231,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                                         "WASD Port 1"],
                                              "default": "Normal"}},
                         "errors": []})
+        elif self.path == "/v1/configs/User%20Interface%20Settings/Color%20Scheme":
+            self._json({"User Interface Settings": {
+                        "Color Scheme": {"current": "Commodore Blue",
+                                         "values": ["Commodore Blue",
+                                                    "Ultimate Black"],
+                                         "default": "Commodore Blue"}},
+                        "errors": []})
         elif self.path.startswith("/v1/machine:readmem?address=0400"):
             # a text screen: READY. on row 0 (screen codes), blanks elsewhere
             screen = bytearray(b"\x20" * 1000)

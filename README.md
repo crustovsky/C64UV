@@ -44,8 +44,12 @@ card, just the Ethernet cable.
 - **Ultimate menu** - press **F9** and the window shows the Ultimate's own
   menu (file browser, disk mounting, configuration), driven from your
   keyboard; F9 again returns to the C64. On firmware 1.2.0 or newer it is
-  the machine's real menu, read over the REST API, so it also works over
-  WiFi; older firmware shows the telnet remote menu instead.
+  the machine's real menu, read over the REST API and drawn in the
+  machine's colour scheme, so it also works over WiFi; older firmware
+  shows the telnet remote menu instead.
+- **Notices that stay out of the way** - a port swap, a grabbed mouse, a
+  gamepad plugged in, a reset, a dropped file being sent: each shows as a
+  short banner over the lower edge of the picture.
 - **Discovery** - run it with no address and it finds the Ultimate on your
   LAN (preferring its wired interface, the one that can stream).
 - **Run files** - drop a `.prg`, `.crt`, `.sid` or `.d64` onto the window
@@ -104,6 +108,14 @@ Ultimate's Ethernet port**. With the machine on WiFi alone, stream start fails
 with `"No Operational Network Interface"`. Keyboard, menu, and REST work over
 either; plug in a cable for the full experience. (Your PC may be on WiFi,
 though wired is smoother - the streams total ~22 Mbit/s.)
+
+If the picture keeps cutting out ("stream stopped" / "stream resumed"),
+check that your PC really reaches the Ultimate over the interface the
+stream is sent to. The viewer says so when it does not ("the Ultimate does
+not answer over eth0"): the machine answers its REST API, but not a ping
+sent out of that interface. Seen with a laptop on cable and WiFi in the
+same network, where the wired interface had lost its local route; `ip
+route` should list the local subnet on the wired interface.
 
 ## Building and running
 
@@ -268,8 +280,12 @@ rather than a terminal.
   built-in `JOYSTICK` driver reads it; Ctrl+J swaps. The speed is GEOS's
   own mouse-speed setting. It works with joystick-as-pointer software
   only, not with `COMM 1351` or anything reading the SID POT registers.
-- The Ultimate's menu overlay is not part of the VIC stream; the F9 view
-  is how the viewer shows it. On firmware older than 1.2.0 the on-screen
+- Whether the Ultimate's menu shows up in the video stream depends on its
+  Interface Type setting: with "Freeze" (the C64 Ultimate's default) the
+  menu is part of the picture, with "Overlay on HDMI" it is not, and the
+  F9 view is how the viewer shows it. The F9 view knows the colours of the
+  "Commodore Blue" and "Ultimate Black" schemes; with the others its
+  background is a guess. On firmware older than 1.2.0 the on-screen
   menu (Ctrl+M) cannot be driven from the viewer: every remote keystroke
   is a DMA write into C64 memory, and the firmware closes its menu before
   any DMA write, so the first key you press kicks the menu out. That is

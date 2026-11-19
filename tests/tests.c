@@ -149,7 +149,8 @@ static void test_menu_screen(void)
     CHECK(line[2] == 'X' && line[3] == ' '); // unknown shape: a blank
 
     static uint32_t px[MENU_PX_W * MENU_PX_H];
-    menu_render(scr, px, MENU_PX_W);
+    CHECK(menu_guess_bg(scr) == 14); // from the selected row's 0xE1
+    menu_render(scr, 0, px, MENU_PX_W);
     const uint32_t black = 0xFF000000, white = 0xFFFFFFFF, grey = 0xFFB2B2B2;
     // the corner's arms: nothing top-left, the stroke runs right and down
     CHECK(px[0] == black);
@@ -160,6 +161,8 @@ static void test_menu_screen(void)
     // selected row: reverse video, so a blank cell is all foreground
     // (white) and the letters show in the background colour (light blue)
     CHECK(px[(2 * 8 + 1) * MENU_PX_W + 0] == white);
+    // unselected blank cell stays black
+    CHECK(px[(5 * 8 + 1) * MENU_PX_W + 0] == black);
     int lb = 0, wh = 0;
     for (int y = 16; y < 24; y++)
         for (int x = 16; x < 24; x++) { // the 'R' of "Run Disk"
@@ -167,8 +170,13 @@ static void test_menu_screen(void)
             wh += px[y * MENU_PX_W + x] == white;
         }
     CHECK(lb > 8 && lb + wh == 64);
-    // unselected blank cell stays black
-    CHECK(px[(5 * 8 + 1) * MENU_PX_W + 0] == black);
+    // on a light blue screen ("Commodore Blue") the empty cells are light
+    // blue, the strokes keep their colour, the selected bar stays white
+    menu_render(scr, 14, px, MENU_PX_W);
+    CHECK(px[0] == 0xFF706DEB && px[(5 * 8 + 1) * MENU_PX_W] == 0xFF706DEB);
+    CHECK(px[3 * MENU_PX_W + 7] == grey);
+    CHECK(px[(2 * 8 + 1) * MENU_PX_W + 0] == white);
+    CHECK(term_vic_color(6) == 0xFF2E2C9B);
     // progress block fills the cell below its first pixel row
     CHECK(px[(3 * 8 + 4) * MENU_PX_W + 4] == grey);
 }
@@ -197,6 +205,7 @@ static void test_menu_screen_real(void)
     for (int row = 0; row < MENU_ROWS; row++)
         selected += menu_row_selected(scr, row);
     CHECK(selected == 1 && menu_row_selected(scr, 3));
+    CHECK(menu_guess_bg(scr) == 14); // the machine was on "Commodore Blue"
 }
 
 static void test_video_assembly(void)

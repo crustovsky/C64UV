@@ -252,7 +252,14 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   menu is still open. Commands and states carry a generation number so a
   stale state never answers a new command. Rendering (`menu_render` in
   term.c): colour byte = foreground in the low nibble, background in the
-  high one (0 nearly everywhere), bit 7 of the character = reverse video,
+  high one, where 0 (nearly everywhere) means the menu's screen
+  background. That colour is not in the payload: the keepalive probe reads
+  `configs/User Interface Settings/Color Scheme` ("Commodore Blue" = light
+  blue 14 in a blue 6 border, as seen in the stream and on HDMI; "Ultimate
+  Black" = black; the other four, "Commodore 1-3" and "C128 Style", are
+  unknown here and fall back to `menu_guess_bg`, the high nibble of the
+  selected row). `machine:readmem` of `$D020/$D021` does not help: with
+  the menu open it returns the frozen program's values, bit 7 of the character = reverse video,
   codes below 0x20 = the firmware's frame shapes, drawn from their arms
   (the logo pieces 0x14-0x1F have no drawing here and stay blank; the
   firmware's own character set is GPL, so it is not embedded). The
@@ -265,6 +272,30 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   menu` / `--keys` / `--menu-screen`. The menu samples the keyboard
   slowly: a press released 10 ms later is missed, 50 ms is seen. Mouse
   events reach the open menu too (a `left` tap answered a popup).
+- **The menu can be in the VIC stream after all**: on the C64 Ultimate
+  with 1.2.1 a `--dump` taken while the menu was open shows the menu in
+  the stream (light blue background, white text, the logo header), so the
+  claim "the menu overlay is not in the VIC stream" only holds for the
+  HDMI-overlay interface type of the Ultimate 64. With the stream up, the
+  menu is therefore visible without F9, and typed keys reach it through
+  `machine:input`. The REST view still earns its place without a stream
+  (WiFi) and in overlay mode.
+- **A dead stream link is named**: `compat_arp_prime` reports whether the
+  echo was answered. REST answering while two primes in a row get no reply
+  out of the stream's interface sets `g_link_dead`: log line plus a status
+  screen that names the interface. Found 2026-11-19 after a reboot:
+  NetworkManager's address-conflict check on the wired interface was
+  answered by the laptop's own WiFi card (same LAN, ARP flux), it removed
+  the wired subnet route, all traffic to the machine went over WiFi and
+  the 22 Mbit/s stream kept cutting out ("stream stopped" / "stream
+  resumed" in a loop). The test runs in `unshare -Urn` with
+  `icmp_echo_ignore_all=1`.
+- **Notices are toasts**: a gamepad that is plugged in before the first
+  frame is announced once the picture is up, not over the connecting
+  screen. `status_set` text doubles as a banner over the
+  lower edge of the picture while video is live (`toast_render`, lines up
+  to 46 characters); without a picture the status screen shows it. SDL has
+  no notification API of its own, only a modal message box.
 - **Matrix typing (`--keys`, `--type --matrix`)**: press, 50 ms hold,
   release, 50 ms gap per stroke (`matrix_stroke`); never `tap` back to
   back. Verified on 1.2.1: a BASIC line with shifted characters arrived
@@ -431,5 +462,4 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
 Open follow-ups: uploading a dropped image into the folder the menu shows
 (the path line is now readable through `machine:menu_screen`), re-checking
 the matrix-keyboard mapping in a matrix-scanning game with the stream
-running, and reading the menu's colour scheme from the config instead of
-assuming a black background.
+running, and the colours of the four menu colour schemes not seen yet.

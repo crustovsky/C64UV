@@ -299,16 +299,18 @@ bool compat_neighbor_mac(const char *ip, char *out, size_t cap)
 // Error" on Windows, 2026-09-27). IcmpSendEcho needs no process and no
 // privileges. The interface hint is unused: Windows has no equivalent of
 // the policy-routing detour that made Linux force the egress device.
-void compat_arp_prime(compat_sock s, const char *ip, const char *ifname)
+bool compat_arp_prime(compat_sock s, const char *ip, const char *ifname)
 {
     (void)s; (void)ifname;
     uint32_t addr;
     if (!compat_ipv4_parse(ip, &addr))
-        return;
+        return true;
     HANDLE h = IcmpCreateFile();
     if (h == INVALID_HANDLE_VALUE)
-        return;
+        return true;
     char reply[sizeof(ICMP_ECHO_REPLY) + 8];
-    IcmpSendEcho(h, htonl(addr), "", 0, NULL, reply, sizeof reply, 1000);
+    DWORD n = IcmpSendEcho(h, htonl(addr), "", 0, NULL, reply, sizeof reply,
+                           1000);
     IcmpCloseHandle(h);
+    return n > 0;
 }

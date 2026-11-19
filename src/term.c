@@ -301,13 +301,28 @@ static uint8_t menu_glyph_row(uint8_t code, int y)
     return bits;
 }
 
-void menu_render(const uint8_t *scr, uint32_t *px, int pitch_px)
+uint32_t term_vic_color(int index)
+{
+    return vic_palette[index & 0x0F];
+}
+
+int menu_guess_bg(const uint8_t *scr)
+{
+    const int cells = MENU_COLS * MENU_ROWS;
+    for (int i = 0; i < cells; i++)
+        if (scr[i] & scr[cells + i] & 0x80)
+            return scr[cells + i] >> 4 & 0x0F;
+    return -1;
+}
+
+void menu_render(const uint8_t *scr, int bg, uint32_t *px, int pitch_px)
 {
     const int cells = MENU_COLS * MENU_ROWS;
     for (int i = 0; i < cells; i++) {
         uint8_t ch = scr[i];
         uint32_t fgc = vic_palette[scr[cells + i] & 0x0F];
-        uint32_t bgc = vic_palette[scr[cells + i] >> 4];
+        int hi = scr[cells + i] >> 4; // 0 = the screen background
+        uint32_t bgc = vic_palette[(hi ? hi : bg) & 0x0F];
         if (ch & 0x80) { uint32_t tmp = fgc; fgc = bgc; bgc = tmp; }
         int row = i / MENU_COLS, col = i % MENU_COLS;
         for (int y = 0; y < 8; y++) {

@@ -62,6 +62,12 @@ static atomic_bool g_quit;
 static atomic_bool g_run_busy;
 static atomic_int g_run_pct = -1;
 static char g_run_name[64]; // written before the run thread starts
+// Outcome of the last drop for the event loop to announce: 0 nothing new,
+// 1 started, 2 failed (the log has the reason).
+static atomic_int g_run_result;
+// Set when the matrix keyboard gave up after repeated failures, for the
+// same purpose.
+static atomic_bool g_minput_lost;
 // machine:input capability (probed once per session): -1 unknown, 0 no, 1 yes
 static atomic_int g_minput = -1;
 // The Ultimate's "Joystick Swapper" setting, read once next to that probe.
@@ -76,6 +82,10 @@ static atomic_int g_mouse = -1;
 // machine:menu_screen capability (probed with machine:input): -1 unknown,
 // 0 no (the F9 view uses telnet), 1 yes (the F9 view is the real menu).
 static atomic_int g_menu_rest = -1;
+// The menu's screen background and border as VIC colours, from the
+// machine's Color Scheme setting; -1 = a scheme this code does not know
+// (the background is then guessed from the selected row).
+static atomic_int g_menu_bg = -1, g_menu_border = -1;
 // Set once the API answered, so a later transport failure is reported as
 // "stopped responding" rather than as unsupported firmware.
 static atomic_bool g_minput_up;
@@ -91,7 +101,15 @@ static const char *g_store;
 // keeps running into it (the window says so instead of "waiting").
 static _Thread_local bool t_refused;
 static atomic_bool g_rest_off;
+// The machine answers REST but not a ping sent out of the interface the
+// stream is meant to arrive on: that link has no working path (cable, a
+// missing route, an address conflict), and the stream will not make it
+// either. Set by the keepalive after two such cycles in a row.
+static atomic_bool g_link_dead;
+static char g_link_if[32]; // written before g_link_dead is set
 #define SERVICES_WHERE "enable it on the machine: menu > Network Services & Timezone"
+// the same for a line of the status grid or a toast (46 characters at most)
+#define SERVICES_SHORT "enable it: menu > Network Services & Timezone"
 
 // libcurl keeps the OS error of a failed connect.
 static bool curl_refused(CURL *curl, CURLcode res)
@@ -244,6 +262,7 @@ static int keepalive_thread(void *arg)
     CURL *curl = curl_easy_init();
     char resp[512];
     long last_code[2] = {-2, -2};
+    int prime_misses = 0; // cycles in a row without an echo reply
     while (!atomic_load(&g_quit)) {
         // The Ultimate refuses to start a stream toward an address missing
         // from its ARP table ("Network Host Resolve Error") and never ARPs on
@@ -252,7 +271,8 @@ static int keepalive_thread(void *arg)
         // interface when policy routing claims the LAN (Tailscale
         // accept-routes does), so the prime is forced out of the subnet's
         // interface whenever one was found (see compat_arp_prime).
-        compat_arp_prime(rc->sock, rc->host, rc->prime_if);
+        bool echoed = compat_arp_prime(rc->sock, rc->host, rc->prime_if);
+        bool answered = false; // an HTTP answer in this cycle
         // Capability probe (GET is side-effect free), retried until the
         // machine gives an HTTP answer, then cached for the session.
         if (rc->input_url[0] && atomic_load(&g_minput) < 0) {
@@ -285,6 +305,30 @@ static int keepalive_thread(void *arg)
                             (mcode == 404 &&
                              strstr(resp, "Menu screen unavailable"));
                 atomic_store(&g_menu_rest, menu);
+                if (menu) { // colours the screen payload does not carry
+                    char surl[256], scheme[32] = "";
+                    snprintf(surl, sizeof surl, "http://%s/v1/%s", rc->host,
+                             "configs/User%20Interface%20Settings/"
+                             "Color%20Scheme");
+                    if (rest_req(curl, "GET", surl, NULL, 0, NULL, 3000, resp,
+                                 &g_quit) == 200)
+                        json_find_str(resp, "current", scheme, sizeof scheme);
+                    if (atomic_load(&g_quit))
+                        break;
+                    // seen on a C64 Ultimate, 1.2.1: light blue screen in
+                    // a blue border; "Ultimate Black" is black on black
+                    if (!strcmp(scheme, "Commodore Blue")) {
+                        atomic_store(&g_menu_bg, 14);
+                        atomic_store(&g_menu_border, 6);
+                    } else if (!strcmp(scheme, "Ultimate Black")) {
+                        atomic_store(&g_menu_bg, 0);
+                        atomic_store(&g_menu_border, 0);
+                    }
+                    SDL_Log("menu colour scheme \"%s\"%s", scheme,
+                            atomic_load(&g_menu_bg) < 0
+                                ? ": not known here, background taken from "
+                                  "the selected row" : "");
+                }
                 SDL_Log("machine:menu_screen %s", menu
                             ? "available: F9 shows the Ultimate's own menu"
                             : "not supported: F9 uses the telnet menu");
@@ -311,6 +355,7 @@ static int keepalive_thread(void *arg)
                 break; // cancelled: the result says nothing about the machine
             if (i == 0)
                 atomic_store(&g_rest_off, code == -1 && t_refused);
+            answered |= code > 0;
             if (code == -1 && t_refused)
                 code = -3; // refused: its own state for the log below
             if (code != last_code[i]) { // log only on state change
@@ -328,6 +373,19 @@ static int keepalive_thread(void *arg)
                 last_code[i] = code;
             }
         }
+        // alive over REST, silent over the stream's interface
+        bool dead = !echoed && answered && rc->prime_if[0];
+        prime_misses = dead ? prime_misses + 1 : 0;
+        if (prime_misses == 2) {
+            snprintf(g_link_if, sizeof g_link_if, "%s", rc->prime_if);
+            SDL_Log("the Ultimate answers its REST API but no ping sent out "
+                    "of %s: the stream is requested over that interface and "
+                    "will not arrive; check its cable and that the local "
+                    "subnet is routed through it (ip route)", rc->prime_if);
+        }
+        if (prime_misses == 0 && atomic_load(&g_link_dead))
+            SDL_Log("the Ultimate answers over %s again", rc->prime_if);
+        atomic_store(&g_link_dead, prime_misses >= 2);
         for (int i = 0; i < 50 && !atomic_load(&g_quit); i++)
             SDL_Delay(100);
     }
@@ -1182,7 +1240,7 @@ struct runjob {
 static int run_thread(void *arg)
 {
     struct runjob *j = arg;
-    run_file(j->host, j->path);
+    atomic_store(&g_run_result, run_file(j->host, j->path) ? 1 : 2);
     free(j);
     atomic_store(&g_run_pct, -1);
     atomic_store(&g_run_busy, false);
@@ -1192,12 +1250,12 @@ static int run_thread(void *arg)
 // Called from the event loop; hands port 64 to the transfer by dropping
 // the keyboard connection (it reconnects on the next keypress after the
 // run). NULL kb for the headless --run path.
-static void run_file_async(const char *host, const char *path,
+static bool run_file_async(const char *host, const char *path,
                            struct keyb *kb)
 {
     if (atomic_exchange(&g_run_busy, true)) {
         SDL_Log("still busy with the previous file");
-        return;
+        return false;
     }
     if (kb) {
         compat_close(kb->fd);
@@ -1210,6 +1268,7 @@ static void run_file_async(const char *host, const char *path,
     snprintf(j->host, sizeof j->host, "%s", host);
     snprintf(j->path, sizeof j->path, "%s", path);
     SDL_DetachThread(SDL_CreateThread(run_thread, "runfile", j));
+    return true;
 }
 
 // ------------------------------------------------------ headless type/screen
@@ -1495,6 +1554,7 @@ static void minput_post(struct minput *mi, const char *body)
                  "application/json", 250, resp, NULL) == -1) {
         if (++mi->fails >= 3) {
             atomic_store(&g_minput, 0);
+            atomic_store(&g_minput_lost, true);
             SDL_Log("machine:input unreachable, falling back to the KERNAL "
                     "buffer");
         }
@@ -2145,6 +2205,71 @@ static void status_set(struct term *t, const char *l1, const char *l2)
     t->dirty = true;
 }
 
+// ------------------------------------------------------------------ toast
+//
+// A notice (port swapped, mouse grabbed, pad plugged in) must not take the
+// picture away: while video is on screen it is a banner over the lower
+// edge of the picture for as long as the notice lasts. The text is what
+// status_set() put on the status grid, so every notice works both ways:
+// banner over the stream, full status screen when there is no picture.
+// SDL itself has nothing for this (its only message UI is a modal box).
+
+#define TOAST_W VIDEO_MAX_W
+#define TOAST_H 30
+#define TOAST_COLS (TOAST_W / 8)
+
+// A status grid row without its centering blanks; out takes TERM_COLS + 1.
+static void status_line(const struct term *t, int row, char *out)
+{
+    int a = 0, b = TERM_COLS;
+    while (a < TERM_COLS && t->ch[row][a] == ' ')
+        a++;
+    while (b > a && t->ch[row][b - 1] == ' ')
+        b--;
+    memcpy(out, &t->ch[row][a], (size_t)(b - a));
+    out[b - a] = '\0';
+}
+
+// False when a line is too long for the banner (the status screen shows
+// the notice then).
+static bool toast_render(const struct term *status, uint32_t *px)
+{
+    char l1[TERM_COLS + 1], l2[TERM_COLS + 1];
+    status_line(status, 12, l1);
+    status_line(status, 14, l2);
+    int n1 = (int)strlen(l1), n2 = (int)strlen(l2);
+    if (n1 > TOAST_COLS - 2 || n2 > TOAST_COLS - 2 || n1 == 0)
+        return false;
+    for (int i = 0; i < TOAST_W * TOAST_H; i++)
+        px[i] = 0xE02E2C9Bu; // C64 blue, slightly see-through
+    for (int x = 0; x < TOAST_W; x++) // a light edge on top
+        px[x] = 0xFF706DEBu;
+    int y1 = n2 ? 5 : (TOAST_H - 8) / 2 + 1;
+    term_draw_text(px, TOAST_W, (TOAST_W - n1 * 8) / 2, y1, 0xFFFFFFFFu, l1);
+    if (n2)
+        term_draw_text(px, TOAST_W, (TOAST_W - n2 * 8) / 2, 17, 0xFFB2B2B2u,
+                       l2);
+    return true;
+}
+
+// Which pad sits in which port, as a notice.
+static void pads_notice(struct term *t, SDL_Gamepad *const pads[2],
+                        int joy_port)
+{
+    char l1[TERM_COLS + 1], l2[TERM_COLS + 1] = "";
+    if (pads[0] && pads[1]) {
+        snprintf(l1, sizeof l1, "pad 1 on port %d, pad 2 on port %d",
+                 joy_port, 3 - joy_port);
+    } else {
+        int slot = pads[0] ? 0 : 1;
+        const char *name = SDL_GetGamepadName(pads[slot]);
+        snprintf(l1, sizeof l1, "gamepad %d: joystick in port %d", slot + 1,
+                 slot ? 3 - joy_port : joy_port);
+        snprintf(l2, sizeof l2, "%.44s", name ? name : "");
+    }
+    status_set(t, l1, l2[0] ? l2 : NULL);
+}
+
 // The stream-lost screen; re-issued whenever a short notice has used the
 // status grid in the meantime.
 static void status_stream_lost(struct term *t, const char *host)
@@ -2164,7 +2289,11 @@ static void status_idle(struct term *t, const struct config *cfg,
     char msg[TERM_COLS + 1];
     if (atomic_load(&g_rest_off)) {
         status_set(t, "the Ultimate is on, but its web service is off",
-                   SERVICES_WHERE);
+                   SERVICES_SHORT);
+    } else if (atomic_load(&g_link_dead)) {
+        snprintf(msg, sizeof msg, "the Ultimate does not answer over %.16s",
+                 g_link_if);
+        status_set(t, msg, "the stream needs that link: check cable/routes");
     } else if (stream_lost) {
         status_stream_lost(t, cfg->host);
     } else if (cfg->no_start) {
@@ -2696,7 +2825,10 @@ int main(int argc, char **argv)
     bool rmenu_active = false; // the view is requested (opening or live)
     bool rmenu_live = false;   // a screen arrived: the view is on display
     unsigned rmenu_seq_shown = 0;
+    int rmenu_bg_guess = 0; // background for a scheme this code does not know
     SDL_Texture *menu_tex = NULL;
+    SDL_Texture *toast_tex = NULL;
+    Uint32 *toast_px = calloc(TOAST_W * TOAST_H, sizeof(Uint32));
     Uint32 *menu_px = calloc(MENU_PX_W * MENU_PX_H, sizeof(Uint32));
     Uint32 *term_px = calloc(TERM_PX_W * TERM_PX_H, sizeof(Uint32));
 
@@ -2718,7 +2850,8 @@ int main(int argc, char **argv)
     // A short notice on the status grid (menu unreachable, link lost)
     // shows until this tick, then the regular status text comes back.
     Uint64 notice_until = 0;
-    bool shown_rest_off = false; // g_rest_off as the status grid has it
+    int shown_idle = 0; // g_rest_off / g_link_dead as the status grid has them
+    bool pad_notice_due = false; // a pad arrived while there was no picture
     bool paused = false; // Ctrl+P toggle state (viewer-side best guess)
     // Audio latency control: startup fill and jitter leave a standing queue
     // that never drains on its own (input and output rates match). A servo on
@@ -2761,7 +2894,7 @@ int main(int argc, char **argv)
                     snprintf(msg, sizeof msg,
                              "found %s, but its web service is off",
                              da.off_ip);
-                    status_set(status, msg, SERVICES_WHERE);
+                    status_set(status, msg, SERVICES_SHORT);
                     term_present = true;
                     next_scan = SDL_GetTicks() + 10000;
                 } else {
@@ -2804,10 +2937,22 @@ int main(int argc, char **argv)
                         SDL_Log("third gamepad ignored: the C64 has two "
                                 "control ports");
                     else if (!open &&
-                             (pads[slot] = SDL_OpenGamepad(ev.gdevice.which)))
+                             (pads[slot] = SDL_OpenGamepad(ev.gdevice.which))) {
+                        int port = slot ? 3 - mi.joy_port : mi.joy_port;
+                        const char *name = SDL_GetGamepadName(pads[slot]);
                         SDL_Log("gamepad '%s' drives joystick port %d",
-                                SDL_GetGamepadName(pads[slot]),
-                                slot ? 3 - mi.joy_port : mi.joy_port);
+                                name ? name : "?", port);
+                        // a banner over the picture; with no picture yet
+                        // (start-up) it waits for the first frame instead
+                        // of covering the connecting message
+                        if (got_any && !stream_lost) {
+                            pads_notice(status, pads, mi.joy_port);
+                            notice_until = SDL_GetTicks() + 3000;
+                            term_present = true;
+                        } else {
+                            pad_notice_due = true;
+                        }
+                    }
                 } else if (ev.type == SDL_EVENT_GAMEPAD_REMOVED) {
                     for (int k = 0; k < 2; k++)
                         if (pads[k] && SDL_GetGamepadID(pads[k]) ==
@@ -2817,6 +2962,16 @@ int main(int argc, char **argv)
                             pad_event = true; // let go of what it held
                             SDL_Log("gamepad on port %d unplugged",
                                     k ? 3 - mi.joy_port : mi.joy_port);
+                            if (got_any && !stream_lost) {
+                                char l1[TERM_COLS + 1];
+                                snprintf(l1, sizeof l1, "gamepad %d "
+                                         "unplugged (port %d)", k + 1,
+                                         k ? 3 - mi.joy_port : mi.joy_port);
+                                status_set(status, l1, NULL);
+                                notice_until = SDL_GetTicks() + 3000;
+                                term_present = true;
+                            }
+                            pad_notice_due = false;
                         }
                 } else if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
                            ev.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
@@ -2880,17 +3035,44 @@ int main(int argc, char **argv)
                             help_active = false;
                             term_present = true;
                         } // anything else stays local while help is up
-                    } else if (va == VA_RESET && !cfg.no_start && cfg.host) {
-                        machine_ctl(cfg.host, "reset");
-                    } else if (va == VA_REBOOT && !cfg.no_start && cfg.host) {
-                        machine_ctl(cfg.host, "reboot");
-                    } else if (va == VA_PAUSE && !cfg.no_start && cfg.host) {
-                        paused = !paused;
-                        machine_ctl(cfg.host, paused ? "pause" : "resume");
-                    } else if (va == VA_MENU_BTN && !cfg.no_start &&
-                               cfg.host) {
-                        machine_ctl(cfg.host, "menu_button");
-                        menu_attach = true; // show it where that is possible
+                    } else if ((va == VA_RESET || va == VA_REBOOT ||
+                                va == VA_PAUSE || va == VA_MENU_BTN) &&
+                               !cfg.no_start && cfg.host) {
+                        const char *act = "menu_button", *said = NULL;
+                        if (va == VA_RESET) {
+                            act = "reset";
+                            said = "C64 reset";
+                        } else if (va == VA_REBOOT) {
+                            act = "reboot";
+                            said = "rebooting the Ultimate";
+                        } else if (va == VA_PAUSE) {
+                            act = paused ? "resume" : "pause";
+                            said = paused ? "machine resumed"
+                                          : "machine paused";
+                        }
+                        if (!machine_ctl(cfg.host, act)) {
+                            char l1[TERM_COLS + 1];
+                            snprintf(l1, sizeof l1, "%s failed", act);
+                            status_set(status, l1,
+                                       t_refused
+                                           ? "the Ultimate's web service is "
+                                             "off"
+                                           : "no answer from the Ultimate "
+                                             "(see the log)");
+                            notice_until = SDL_GetTicks() + 3000;
+                        } else {
+                            if (va == VA_PAUSE)
+                                paused = !paused;
+                            if (said) {
+                                status_set(status, said,
+                                           va == VA_PAUSE && paused
+                                               ? "Ctrl+P resumes" : NULL);
+                                notice_until = SDL_GetTicks() + 2000;
+                            }
+                            if (va == VA_MENU_BTN)
+                                menu_attach = true; // show it where possible
+                        }
+                        term_present = true;
                     } else if (va == VA_JOY_PORT) {
                         joy_swap = true;
                     } else if (va == VA_MOUSE) {
@@ -2948,8 +3130,19 @@ int main(int argc, char **argv)
                         SDL_Log("drop: shift %s", (SDL_GetModState() &
                                                    SDL_KMOD_SHIFT)
                                                       ? "held" : "not held");
-                    if (!cfg.no_start && cfg.host && ev.drop.data)
-                        run_file_async(cfg.host, ev.drop.data, &kb);
+                    if (!cfg.no_start && cfg.host && ev.drop.data) {
+                        char l1[TERM_COLS + 1];
+                        if (run_file_async(cfg.host, ev.drop.data, &kb)) {
+                            snprintf(l1, sizeof l1, "sending %.36s",
+                                     g_run_name);
+                            status_set(status, l1, NULL);
+                        } else {
+                            status_set(status, "still busy with the "
+                                       "previous file", NULL);
+                        }
+                        notice_until = SDL_GetTicks() + 2500;
+                        term_present = true;
+                    }
                 } else if (ev.type == SDL_EVENT_TEXT_INPUT && !help_active) {
                     for (const char *p = ev.text.text; *p; p++) {
                         if (term_active) {
@@ -2989,7 +3182,7 @@ int main(int argc, char **argv)
                     mfwd_release(&mf);
                     SDL_Log("mouse released");
                     status_set(status, "mouse released", NULL);
-                    notice_until = SDL_GetTicks() + 1500;
+                    notice_until = SDL_GetTicks() + 2500;
                 } else if (!kb.enabled || cap < 0) {
                     status_set(status, "not connected yet",
                                "waiting for the Ultimate");
@@ -3026,8 +3219,8 @@ int main(int argc, char **argv)
                                    "port 1", "Ctrl+G releases it");
                     } else {
                         char l1[TERM_COLS + 1];
-                        snprintf(l1, sizeof l1, "mouse grabbed: it steers "
-                                 "the joystick in port %d", mi.joy_port);
+                        snprintf(l1, sizeof l1, "mouse grabbed: the "
+                                 "joystick in port %d", mi.joy_port);
                         SDL_Log("mouse grabbed: joystick on port %d (hold "
                                 "%d ms)", mi.joy_port, mj.hold_ms);
                         status_set(status, l1,
@@ -3090,11 +3283,11 @@ int main(int argc, char **argv)
                         if (tfd_refused)
                             status_set(status,
                                        "the Ultimate's telnet menu service "
-                                       "is off", SERVICES_WHERE);
+                                       "is off", SERVICES_SHORT);
                         else
                             status_set(status,
                                        "cannot reach the Ultimate menu "
-                                       "(telnet, port 23)",
+                                       "(telnet)",
                                        "is it powered on? is telnet "
                                        "enabled?");
                         notice_until = SDL_GetTicks() + 3000;
@@ -3165,7 +3358,7 @@ int main(int argc, char **argv)
                              mi.joy_port);
                 status_set(status, l1,
                            "Ctrl+J or the pad's Back button swaps");
-                notice_until = SDL_GetTicks() + 1500;
+                notice_until = SDL_GetTicks() + 2500;
             }
             if ((pad_event || mouse_event || mouse_changed) && joy_ok) {
                 // first pad (and the mouse joystick) on mi.joy_port, a
@@ -3200,6 +3393,24 @@ int main(int argc, char **argv)
         if (kb.reclaim && !atomic_load(&g_run_busy)) {
             kb.reclaim = false;
             keyb_try_connect(&kb);
+        }
+
+        int run_result = atomic_exchange(&g_run_result, 0);
+        if (run_result) {
+            char l1[TERM_COLS + 1];
+            snprintf(l1, sizeof l1, run_result == 1 ? "%.36s started"
+                                                    : "could not run %.30s",
+                     g_run_name);
+            status_set(status, l1, run_result == 1 ? NULL
+                                                   : "the log says why");
+            notice_until = SDL_GetTicks() + 3000;
+            term_present = true;
+        }
+        if (atomic_exchange(&g_minput_lost, false)) {
+            status_set(status, "the Ultimate stopped answering key events",
+                       "typing falls back to the keyboard buffer");
+            notice_until = SDL_GetTicks() + 4000;
+            term_present = true;
         }
 
         if (windowed) { // a running drop shows its progress in the title
@@ -3321,8 +3532,9 @@ int main(int argc, char **argv)
             term_present = true;
         }
         // the keepalive found the REST port refusing (or answering again)
-        if (atomic_load(&g_rest_off) != shown_rest_off) {
-            shown_rest_off = !shown_rest_off;
+        int idle_now = atomic_load(&g_rest_off) | atomic_load(&g_link_dead) << 1;
+        if (idle_now != shown_idle) {
+            shown_idle = idle_now;
             if (!notice_until && !discovering && cfg.host &&
                 (stream_lost || !got_any)) {
                 status_idle(status, &cfg, stream_lost);
@@ -3341,24 +3553,43 @@ int main(int argc, char **argv)
             }
             SDL_LockMutex(rm.lock);
             rmenu_seq_shown = atomic_load(&rm.seq);
-            menu_render(rm.screen, menu_px, MENU_PX_W);
+            // the scheme's background; for an unknown scheme what the
+            // selected row hints at (kept while no row is selected)
+            int bg = atomic_load(&g_menu_bg), border = atomic_load(&g_menu_border);
+            if (bg < 0) {
+                int guess = menu_guess_bg(rm.screen);
+                if (guess >= 0)
+                    rmenu_bg_guess = guess;
+                bg = rmenu_bg_guess;
+            }
+            if (border < 0)
+                border = bg;
+            menu_render(rm.screen, bg, menu_px, MENU_PX_W);
             SDL_UnlockMutex(rm.lock);
             term_present = false;
             SDL_UpdateTexture(menu_tex, NULL, menu_px,
                               MENU_PX_W * (int)sizeof(Uint32));
-            // square pixels on a black screen, like the machine's output
+            // square pixels inside the menu's border colour, like the
+            // machine's own output
             SDL_SetRenderLogicalPresentation(ren, MENU_PX_W, MENU_PX_H,
                                              SDL_LOGICAL_PRESENTATION_LETTERBOX);
-            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+            uint32_t bc = term_vic_color(border);
+            SDL_SetRenderDrawColor(ren, bc >> 16 & 0xFF, bc >> 8 & 0xFF,
+                                   bc & 0xFF, 255);
             SDL_RenderClear(ren);
             SDL_RenderTexture(ren, menu_tex, NULL, NULL);
             SDL_RenderPresent(ren);
         }
 
+        // a notice over live video is a banner; without a picture (or
+        // with a line too long for it) the status screen shows it
+        bool toast_ok = notice_until && got_any && !stream_lost &&
+                        toast_render(status, toast_px);
         struct term *view = help_active ? NULL
                             : term_active ? trm
                             : rmenu_show ? NULL
-                            : !got_any || stream_lost || notice_until
+                            : !got_any || stream_lost ||
+                                      (notice_until && !toast_ok)
                                 ? status
                                 : NULL;
         if (windowed && view && (view->dirty || term_present)) {
@@ -3394,6 +3625,11 @@ int main(int argc, char **argv)
                     SDL_Log("receiving: %dx%d", fb->width, fb->height);
                 got_any = true;
                 stream_lost = false;
+                if (pad_notice_due && (pads[0] || pads[1])) {
+                    pads_notice(status, pads, mi.joy_port);
+                    notice_until = SDL_GetTicks() + 3000;
+                }
+                pad_notice_due = false;
                 if (windowed)
                     SDL_SetWindowTitle(
                         win, kb.enabled
@@ -3427,6 +3663,23 @@ int main(int argc, char **argv)
                 SDL_SetRenderDrawColor(ren, 0, 0, 0, 255); // video keeps black
                 SDL_RenderClear(ren);
                 SDL_RenderTexture(ren, tex, NULL, NULL);
+                if (toast_ok) {
+                    if (!toast_tex) {
+                        toast_tex = SDL_CreateTexture(
+                            ren, SDL_PIXELFORMAT_ARGB8888,
+                            SDL_TEXTUREACCESS_STREAMING, TOAST_W, TOAST_H);
+                        SDL_SetTextureScaleMode(toast_tex,
+                                                SDL_SCALEMODE_NEAREST);
+                        SDL_SetTextureBlendMode(toast_tex,
+                                                SDL_BLENDMODE_BLEND);
+                    }
+                    SDL_UpdateTexture(toast_tex, NULL, toast_px,
+                                      TOAST_W * (int)sizeof(Uint32));
+                    SDL_FRect dst = {0, (float)(fb->height - TOAST_H - 12),
+                                     (float)fb->width, TOAST_H};
+                    SDL_FRect src = {0, 0, (float)fb->width, TOAST_H};
+                    SDL_RenderTexture(ren, toast_tex, &src, &dst);
+                }
                 SDL_RenderPresent(ren);
             }
         }
@@ -3496,6 +3749,9 @@ int main(int argc, char **argv)
         SDL_DestroyTexture(term_tex);
     if (menu_tex)
         SDL_DestroyTexture(menu_tex);
+    if (toast_tex)
+        SDL_DestroyTexture(toast_tex);
+    free(toast_px);
     free(menu_px);
     if (help_tex)
         SDL_DestroyTexture(help_tex);

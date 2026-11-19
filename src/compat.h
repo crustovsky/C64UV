@@ -126,7 +126,10 @@ bool compat_neighbor_mac(const char *ip, char *out, size_t cap);
 // replies to, so this is an ICMP echo, never a bare datagram). With a
 // non-empty `ifname` the traffic is forced out of that interface, which on
 // Linux needs `ping -I` because policy routing (VPN accept-routes) can
-// otherwise detour LAN traffic. `s` is unused today.
-void compat_arp_prime(compat_sock s, const char *ip, const char *ifname);
+// otherwise detour LAN traffic. `s` is unused today. Returns false only
+// when the echo was sent and no reply came back within a second (the
+// machine is off, or that interface has no working path to it); true
+// otherwise, including when `ip` is not a literal and nothing was sent.
+bool compat_arp_prime(compat_sock s, const char *ip, const char *ifname);
 
 #endif

@@ -308,7 +308,8 @@ viewer() { # viewer <logname> <events> [flags...]: runs until the script ends
     pids+=($vpid)
 }
 : > "$out/disc.log"
-viewer win "ready wait=300 key=ctrl+g wait=200 move=12,-4 wait=300 \
+viewer win "ready wait=300 key=ctrl+p wait=200 key=ctrl+p wait=200 \
+key=ctrl+g wait=200 move=12,-4 wait=300 \
 button=left:1 wait=200 button=left:0 wait=300 key=ctrl+g wait=200 move=50,50 \
 wait=300 key=f9 wait=700 key=down wait=400 key=f9 wait=600 key=ctrl+m \
 wait=700 key=escape wait=700 key=f9 wait=700"
@@ -320,6 +321,13 @@ sleep 0.3
 test "$(grep -c 'PUT /v1/machine:menu_button' "$out/disc.log")" = 4
 kill -TERM $vpid; wait $vpid || true
 grep -q "mouse grabbed: 1351 mouse in port 1" "$out/win.err"
+# Ctrl+P twice: pause, then resume (the toggle follows the answers)
+python3 - "$out/disc.log" <<'PYEOF2'
+import sys
+log = [l for l in open(sys.argv[1]).read().splitlines()
+       if l.startswith("PUT /v1/machine:pause") or l.startswith("PUT /v1/machine:resume")]
+assert log == ["PUT /v1/machine:pause", "PUT /v1/machine:resume"], log
+PYEOF2
 grep -q '{"kind":"mouse","move":{"x":12,"y":-4}}' "$out/disc.log"
 grep -q '{"kind":"mouse","inputs":\["left"\],"transition":"press"}' "$out/disc.log"
 grep -q '{"kind":"mouse","inputs":\["left"\],"transition":"release"}' "$out/disc.log"
@@ -419,10 +427,13 @@ echo "services-off test passed"
 # writable, e.g. CI containers): buttons, d-pad and stick become joystick
 # events on port 2, Back swaps to port 1, unplugging releases what is held.
 
+# A real controller connected to this PC would take the first pad slot, so
+# the viewers under test only accept the virtual pad's USB ids.
 if [ -w /dev/uinput ]; then
     : > "$out/disc.log"
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
         SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 \
+        SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x045E/0x028E \
         timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
         --port "$VPORT" --no-audio 2> "$out/pad.err" &
     padpid=$!
@@ -449,6 +460,7 @@ if [ -w /dev/uinput ]; then
     : > "$out/disc.log"
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
         SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 \
+        SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x045E/0x028E \
         timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
         --port "$VPORT" --no-audio 2> "$out/pad2.err" &
     padpid=$!
@@ -477,6 +489,7 @@ if [ -w /dev/uinput ]; then
     : > "$out/disc.log"
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
         SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 \
+        SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x045E/0x028E \
         timeout 30 ./c64uv --host 127.0.0.42:8064 --dest 127.0.0.1 \
         --port "$VPORT" --no-audio 2> "$out/menu.err" &
     padpid=$!
@@ -502,6 +515,33 @@ if [ -w /dev/uinput ]; then
     echo "menu view test passed"
 else
     echo "gamepad test skipped (/dev/uinput not writable)"
+fi
+
+# ------------------------------------------------------- dead stream link
+# The machine answers REST but not a ping out of the interface the stream
+# should arrive on (seen for real: the wired interface lost its subnet
+# route to an address-conflict false alarm, and everything went over
+# WiFi). In a private network namespace with echo replies switched off the
+# viewer must say so. Skipped where unprivileged namespaces are not allowed.
+
+if unshare -Urn true 2>/dev/null; then
+    cat > "$out/linkdead.sh" <<'LDEOF'
+set -e
+ip link set lo up
+sysctl -qw net.ipv4.icmp_echo_ignore_all=1
+python3 tests/fakeultimate.py 127.0.0.42 80 "$1/ld.log" &
+fp=$!
+sleep 0.4
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy timeout 13 ./c64uv \
+    --host 127.0.0.42 --dest 127.0.0.1 --port 21000 --no-audio \
+    2> "$1/ld.err" || true
+kill $fp
+LDEOF
+    unshare -Urn bash "$out/linkdead.sh" "$out"
+    grep -q "answers its REST API but no ping sent out of lo" "$out/ld.err"
+    echo "dead stream link test passed"
+else
+    echo "dead stream link test skipped (no unprivileged namespaces)"
 fi
 
 # ------------------------------------------------------- exit with host gone
