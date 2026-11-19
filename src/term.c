@@ -307,7 +307,7 @@ void menu_render(const uint8_t *scr, uint32_t *px, int pitch_px)
     for (int i = 0; i < cells; i++) {
         uint8_t ch = scr[i];
         uint32_t fgc = vic_palette[scr[cells + i] & 0x0F];
-        uint32_t bgc = vic_palette[0];
+        uint32_t bgc = vic_palette[scr[cells + i] >> 4];
         if (ch & 0x80) { uint32_t tmp = fgc; fgc = bgc; bgc = tmp; }
         int row = i / MENU_COLS, col = i % MENU_COLS;
         for (int y = 0; y < 8; y++) {
@@ -325,7 +325,7 @@ void menu_row_text(const uint8_t *scr, int row, char *out)
         uint8_t code = scr[row * MENU_COLS + col] & 0x7F;
         char c = (char)code;
         if (code == 0x7F) {
-            c = '?';
+            c = ' ';
         } else if (code < 0x20) {
             uint8_t sh = menu_shapes[code];
             uint8_t arms = sh & (ARM_U | ARM_D | ARM_L | ARM_R);
@@ -334,7 +334,7 @@ void menu_row_text(const uint8_t *scr, int row, char *out)
                 : (sh & SHAPE_DIAMOND) ? '*'
                 : arms == (ARM_L | ARM_R) ? '-'
                 : arms == (ARM_U | ARM_D) ? '|'
-                : arms ? '+' : '?';
+                : arms ? '+' : ' ';
         }
         out[col] = c;
     }
@@ -343,8 +343,10 @@ void menu_row_text(const uint8_t *scr, int row, char *out)
 
 bool menu_row_selected(const uint8_t *scr, int row)
 {
+    const int cells = MENU_COLS * MENU_ROWS;
     for (int col = 0; col < MENU_COLS; col++)
-        if (scr[row * MENU_COLS + col] & 0x80)
+        if (scr[row * MENU_COLS + col] & scr[cells + row * MENU_COLS + col] &
+            0x80)
             return true;
     return false;
 }

@@ -42,9 +42,11 @@ void term_draw_text(uint32_t *px, int pitch_px, int x, int y, uint32_t color,
 // ---- The Ultimate menu as GET /v1/machine:menu_screen returns it
 // (firmware 1.2+): 40x25 character bytes, then 40x25 colour bytes. The
 // characters are ASCII (0x20-0x7E), codes below 0x20 are the firmware's
-// frame and marker shapes, bit 7 of a character is reverse video (the
-// selected row). The colour byte's low nibble is the VIC colour; the menu
-// has one background, black, like on the machine's own video output.
+// frame, marker and logo shapes, bit 7 of a character is reverse video.
+// The colour byte holds two VIC colours: low nibble foreground, high
+// nibble background (0, black, nearly everywhere). The selected row has
+// bit 7 set in both bytes (0xE1 on 1.2.1: reversed white on light blue);
+// headings are reversed too, but with a plain colour byte.
 #define MENU_COLS 40
 #define MENU_ROWS 25
 #define MENU_BYTES (MENU_COLS * MENU_ROWS * 2)
@@ -54,9 +56,11 @@ void term_draw_text(uint32_t *px, int pitch_px, int x, int y, uint32_t color,
 // Renders a MENU_BYTES payload into a MENU_PX_W x MENU_PX_H ARGB8888 buffer.
 void menu_render(const uint8_t *scr, uint32_t *px, int pitch_px);
 // One row as plain text: frame shapes become + - |, the block and marker
-// shapes # and *. out takes MENU_COLS + 1 bytes.
+// shapes # and *, shapes this code has no drawing for (the logo pieces) a
+// space. out takes MENU_COLS + 1 bytes.
 void menu_row_text(const uint8_t *scr, int row, char *out);
-// True when the row is the selected one (any reverse-video cell).
+// True when the row is the selected one (a cell with bit 7 in both its
+// character and its colour byte).
 bool menu_row_selected(const uint8_t *scr, int row);
 
 // Encodes an SDL key for the firmware's VT100 keyboard parser.

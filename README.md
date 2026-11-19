@@ -4,9 +4,9 @@
 
 Use your [Commodore 64 Ultimate](https://www.commodore.net/) (or Ultimate 64)
 from a Linux or Windows PC over the network: live video and audio streamed
-into an SDL window, your keystrokes typed straight into BASIC, and the Ultimate's menu
-one keypress away - no second monitor, no capture card, just the Ethernet
-cable.
+into an SDL window, your keyboard, gamepad and mouse plugged into the C64,
+and the Ultimate's menu one keypress away - no second monitor, no capture
+card, just the Ethernet cable.
 
 ```
 ./c64uv --host <ultimate-ip>
@@ -24,28 +24,28 @@ cable.
   so and picks the picture up again by itself when it returns.
 - **Audio** - the SID output as 48 kHz stereo PCM, with an adaptive latency
   servo that holds the pipeline at ~60 ms.
-- **Keyboard** - what you type lands in the C64's keyboard buffer: full
-  PETSCII mapping, cursor keys, F1–F8, and Esc acting as RUN/STOP.
+- **Keyboard** - what you type is typed on the C64: full PETSCII mapping,
+  cursor keys, F1–F8, and Esc acting as RUN/STOP. On firmware 1.2.0 or
+  newer the keys are pressed on the real keyboard matrix, so games,
+  chords and held keys work; older firmware fills the keyboard buffer,
+  which is enough for BASIC.
 - **Gamepad** - plug in a controller and it is a C64 joystick (firmware
   1.2.0 or newer): d-pad or left stick for directions, A = fire, B = up for
-  jumping, Ctrl+J or the pad's Back button swaps between ports 2 and 1.
-- **Mouse joystick** - **Ctrl+G** grabs the pointer and drives the same C64
-  joystick, for the GEOS `JOYSTICK` driver: move the mouse and the pointer
-  steps in that direction, left/right/middle button = fire/fire2/fire3.
-  `--mouse` starts it enabled; the direction is held while the mouse moves
-  and released `--mouse-hold` ms after it stops (default 50), so one gesture
-  costs two REST calls rather than one per pixel. GEOS's `JOYSTICK` driver
-  reads control **port 1** (JS1), so the first Ctrl+G moves the joystick
-  there; `--mouse` also starts on port 1 unless `--joy-port` says otherwise.
-  Ctrl+J still swaps. The pointer's speed is GEOS's own mouse-speed setting
-  (Control Panel -> Mouse), not the mouse's DPI: lower it there for finer
-  control; `--mouse-hold` only changes how long the pointer keeps moving
-  after the mouse stops. GEOS accelerates while a direction is held, so a
-  long hold speeds the pointer up. This is a joystick, not a 1351 -
-  POT-reading software ignores it.
-- **Ultimate menu** - press **F9** to flip to the Ultimate's own menu (file
-  browser, disk mounting, configuration) rendered via its telnet remote
-  screen; F9 again returns to the C64.
+  jumping. The first pad sits in control port 2, a second one in port 1
+  for two players; Ctrl+J or the pad's Back button swaps them. Start opens
+  the Ultimate menu, where the d-pad, A and B pick a game from the couch.
+- **Mouse** - **Ctrl+G** grabs the pointer and the PC mouse is a 1351 mouse
+  in control port 1 (firmware 1.2.1 or newer): GEOS with its `COMM 1351`
+  input driver, paint programs, anything that reads a real 1351. Ctrl+G
+  again gives the pointer back; `--mouse` starts grabbed, `--mouse-speed`
+  scales it. On firmware with `machine:input` but no mouse events, or with
+  `--mouse-joy`, the mouse steers the joystick lines instead, which is
+  what GEOS's default `JOYSTICK` driver reads (see Limitations).
+- **Ultimate menu** - press **F9** and the window shows the Ultimate's own
+  menu (file browser, disk mounting, configuration), driven from your
+  keyboard; F9 again returns to the C64. On firmware 1.2.0 or newer it is
+  the machine's real menu, read over the REST API, so it also works over
+  WiFi; older firmware shows the telnet remote menu instead.
 - **Discovery** - run it with no address and it finds the Ultimate on your
   LAN (preferring its wired interface, the one that can stream).
 - **Run files** - drop a `.prg`, `.crt`, `.sid` or `.d64` onto the window
@@ -58,7 +58,7 @@ cable.
   the same machine.
 
 <p align="center">
-  <img src="assets/screenshots/menu.png" width="49%" alt="F9: the Ultimate's file browser mirrored in the viewer window">
+  <img src="assets/screenshots/menu.png" width="49%" alt="F9: the Ultimate's own menu in the viewer window">
   <img src="assets/screenshots/help.png" width="49%" alt="F10: the in-window key reference">
 </p>
 <p align="center"><sub>F9 shows the Ultimate's own menu; F10 the key reference.</sub></p>
@@ -72,22 +72,30 @@ cable.
   libcurl4-openssl-dev`; Windows builds are cross-compiled with MinGW, see
   the release workflow).
 - A C64 Ultimate / Ultimate 64 on your network. The viewer talks to its REST
-  API (HTTP), streaming ports (UDP 11000/11001), DMA socket (TCP 64), and
-  telnet menu (TCP 23).
+  API (HTTP), streaming ports (UDP 11000/11001), DMA socket (TCP 64), and,
+  on firmware before 1.2.0, its telnet menu (TCP 23).
 
-### On the Ultimate, enable (F5 → Settings → Network Settings)
+### On the Ultimate, enable (menu → Network Services & Timezone)
 
 | Service | Needed for |
 |---|---|
-| Web Remote Control Service (REST API, port 80) | discovery, starting/stopping the streams, the Ctrl+R/P/M machine controls and `--do`, running dropped `.prg`/`.crt`/`.sid` files, mounting `.g64`/`.d71`/`.g71`/`.d81` images, mounting stored images by path (`--store`), cartridge parking, and matrix-level typing on firmware that has `machine:input` |
+| Web Remote Control Service (REST API, port 80) | discovery, starting/stopping the streams, the Ctrl+R/P/M machine controls and `--do`, running dropped `.prg`/`.crt`/`.sid` files, mounting `.g64`/`.d71`/`.g71`/`.d81` images, mounting stored images by path (`--store`), cartridge parking, and on firmware 1.2.0 or newer matrix-level typing, the gamepad, the mouse and the F9 menu view |
 | Ultimate DMA Service (port 64) | typing into the C64 (KERNAL buffer), RUN/STOP, and mount-and-run of a dropped `.d64` |
-| Telnet Remote Menu Service (port 23) | the F9 menu view |
-| FTP Service (port 21, on by default) | uploading dropped images with `--store` |
+| Telnet Remote Menu Service (port 23) | the F9 menu view on firmware older than 1.2.0 |
+| FTP File Service (port 21) | uploading dropped images with `--store` |
 
 Everything else the viewer does needs no service: the video/audio streams
 arrive on UDP 11000/11001 once started. The REST API alone gets you a
-picture and sound; add the DMA service to type, and telnet to browse the
+picture and sound, and on firmware 1.2.0 or newer everything else too;
+before that add the DMA service to type, and telnet to browse the
 Ultimate's menu from the viewer.
+
+**A firmware update switches every network service off.** The machine
+then still answers on the network but refuses the connections; the viewer
+tells you which service is off (in the window, in its log, and in
+`--discover` when it sees the machine's wired interface) instead of a bare
+"no Ultimate found". Switch them back on in the machine's menu under
+Network Services & Timezone (Network Settings on older firmware).
 
 ### Wired Ethernet is required for the streams
 
@@ -121,14 +129,14 @@ refuses to start a stream toward an address missing from its ARP table.
 | any typing | typed into the C64 (lowercase = letters, Shift = PETSCII graphics) |
 | Esc | RUN/STOP |
 | F1–F8, cursors, Home, Del/Ins | the corresponding C64 keys |
-| gamepad | C64 joystick on port 2: d-pad / left stick, A = fire, B = up, X / Y = second and third fire button (needs firmware 1.2.0+) |
-| Ctrl+G | grab / release the mouse as the C64 joystick (GEOS `JOYSTICK` driver reads port 1; press Ctrl+J first; `--mouse-hold` tunes the release delay) |
-| Ctrl+J, pad Back button | move the joystick to the other control port |
-| **F9** | toggle the Ultimate menu view |
+| gamepad | C64 joystick on port 2: d-pad / left stick, A = fire, B = up, X / Y = second and third fire button; a second pad is the joystick in port 1 (needs firmware 1.2.0+) |
+| Ctrl+G | grab / release the mouse: a 1351 mouse in port 1 (firmware 1.2.1+), otherwise it steers the joystick |
+| Ctrl+J, pad Back button | swap the control ports of the joysticks |
+| **F9**, pad Start button | toggle the Ultimate menu view (in it the pad's d-pad, A and B work as cursor keys, RETURN and back) |
 | **F10** | in-window key reference (same table as `--help`) |
 | Ctrl+R / Ctrl+Shift+R | reset / reboot the machine |
 | Ctrl+P | pause / resume the machine |
-| Ctrl+M | press the Ultimate's menu button (the on-screen menu then answers the physical keyboard only; use F9 to drive a menu from the viewer) |
+| Ctrl+M | press the Ultimate's menu button; on firmware 1.2.0+ the window shows the menu it opens, like F9 (older firmware: the on-screen menu answers the physical keyboard only, use F9) |
 | Ctrl+Q | quit |
 
 **Drop a `.prg`, `.crt`, `.sid`, or `.d64` file onto the window** and the
@@ -165,8 +173,15 @@ machine without a window: `--discover`, `--do`, `--run` (with `--store`),
 `--type 'LOAD"*",8,1\n'` (types into the C64, `\n` = RETURN),
 `--screen` (prints the 40x25 text screen read from screen RAM, the way to
 check what a typed command did), `--joy 2:left,fire` (taps joystick inputs
-on a control port; needs firmware 1.2.0+), `--dump frame.ppm` (one video frame) and
-`--term-test` (the Ultimate menu as text). After `--do reset` give the C64
+on a control port), `--keys "f1,left_shift+a,space:500"` (presses keys on
+the keyboard matrix by name, chords with `+`, hold time in ms after `:`, so
+a script can press keys in a game; `--type TEXT --matrix` types text the
+same way), `--mouse-send "move:40:-10 left"` (1351 mouse motion, clicks and
+wheel), `--menu-screen` (the open Ultimate menu as text, the selected row
+marked `>`; open it with `--do menu` and drive it with `--keys`),
+`--dump frame.ppm` (one video frame) and `--term-test` (the telnet menu as
+text). `--joy`, `--keys`, `--matrix` and `--menu-screen` need firmware
+1.2.0 or newer, `--mouse-send` 1.2.1. After `--do reset` give the C64
 about three seconds to boot before typing. Exit status is 0 on success, 1
 when the Ultimate refused or did not answer, 2 for a usage error. If
 your Ultimate has a network password set (firmware 3.12+), pass it with
@@ -184,15 +199,17 @@ A custom group works too: `--dest 239.x.y.z` joins that group for video and
 group + 1 for audio. When one multicast viewer quits it stops the stream,
 and the remaining viewers' keepalive restarts it within 5 s (a short blip).
 
-The menu view is its own remote session on the firmware side: after you launch
-something from it (Run Disk, Run Program), the menu stays where it was and the
-viewer does not switch on its own - press F9 to flip back to the C64 screen
-and watch it boot.
+On firmware 1.2.0 or newer the menu view follows the machine: launch
+something from it (Run Disk, Run Program) or leave the menu with RUN/STOP
+and the window is back on the C64 screen. The telnet menu of older firmware
+is its own remote session: after you launch something from it the menu
+stays where it was, so press F9 to flip back to the C64 screen and watch
+it boot.
 
 Useful flags: `--no-audio`, `--no-keyb`, `--scale N` (window size),
 `--discover` (list Ultimates on the network and exit), `--verbose`
 (fps/packet/latency stats), `--dump f.ppm` (grab one frame headless),
-`--term-test` (print the menu screen as text and exit), `--no-start` (listen
+`--term-test` (print the telnet menu screen as text and exit), `--no-start` (listen
 only; pair with `tools/mockstream.py` to develop with no hardware).
 
 ### Installing
@@ -232,26 +249,31 @@ rather than a terminal.
 - The gamepad only works while the viewer window has focus (click it
   first). To play with another window in front, start the viewer with
   `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1` in the environment.
-- The gamepad's port numbers are the firmware's: with the Ultimate's
-  "Joystick Swapper" setting on "Swapped", ports 1 and 2 trade places. If a
-  game does not react, press Ctrl+J (or Back on the pad) to try the other
-  port.
-- The mouse joystick is a joystick, not a 1351. A direction is held while
-  the mouse moves and released `--mouse-hold` ms after it stops, so the
-  pointer travels at GEOS's fixed joystick rate - a short flick still moves
-  it further than the mouse did, and precise positioning takes small
-  nudges. It works with GEOS's built-in `JOYSTICK` driver and other
-  joystick-as-pointer software, not with `COMM 1351`, paint programs, or
-  anything reading the SID POT registers. Firmware 3.15a's `machine:input`
-  has no `mouse` event at all; if a later firmware adds one, forwarding real
-  deltas would be strictly better.
-- The Ultimate's menu overlay is not part of the VIC stream - that's what the
-  F9 telnet view is for. The on-screen menu (Ctrl+M) cannot be driven from
-  the viewer on firmware older than 1.2.0: every remote keystroke is a DMA write into
-  C64 memory, and the firmware closes its menu before any DMA write, so the
-  first key you press kicks the menu out. Firmware 1.2.0 and newer routes
-  `machine:input` keys into the menu, and the viewer uses that API
-  automatically.
+- Port numbers are the C64's own: "port 2" is the port a game reading
+  joystick 2 sees. The viewer reads the Ultimate's "Joystick Swapper"
+  setting once at start and converts; change that setting on the machine
+  and the viewer needs a restart to follow.
+- The mouse is a 1351 in control port 1, and its left button is that
+  port's fire line, shared with a gamepad sitting there. The pointer's
+  speed follows the Ultimate's Mouse Sensitivity setting (`--mouse-speed`
+  scales on top). Fast flicks are capped: the firmware sends one mouse
+  report every 20 ms, so the viewer drops motion it could only deliver
+  late.
+- In joystick mode (firmware without mouse events, or `--mouse-joy`) the
+  mouse is a joystick, not a 1351. A direction is held while the mouse
+  moves and released `--mouse-hold` ms after it stops (default 50), so the
+  pointer travels at GEOS's joystick rate, a short flick still moves it
+  further than the mouse did, and precise positioning takes small nudges.
+  The first grab in this mode moves the joystick to port 1, where GEOS's
+  built-in `JOYSTICK` driver reads it; Ctrl+J swaps. The speed is GEOS's
+  own mouse-speed setting. It works with joystick-as-pointer software
+  only, not with `COMM 1351` or anything reading the SID POT registers.
+- The Ultimate's menu overlay is not part of the VIC stream; the F9 view
+  is how the viewer shows it. On firmware older than 1.2.0 the on-screen
+  menu (Ctrl+M) cannot be driven from the viewer: every remote keystroke
+  is a DMA write into C64 memory, and the firmware closes its menu before
+  any DMA write, so the first key you press kicks the menu out. That is
+  what the telnet view is for there.
 - IPv4 only. The device streams to one destination, so it's one viewer per
   Ultimate unless everyone uses `--multicast`.
 
@@ -261,7 +283,9 @@ REST (`/v1/streams/*`, `/v1/machine:*`) for control; UDP 11000 carries
 4-bit VIC color indices (384 px × 4 lines per 780-byte packet), UDP 11001
 carries 192 stereo s16le frames per packet; TCP 64 speaks the firmware's
 socket-DMA protocol (`KEYB` 0xFF03, `DMAWRITE` 0xFF06); TCP 23 is a VT100
-session emulated in `src/term.c`. Protocol docs:
+session emulated in `src/term.c`. On firmware 1.2.0 or newer keys, joysticks
+and the mouse go through `POST /v1/machine:input`, and the menu view reads
+`GET /v1/machine:menu_screen`. Protocol docs:
 [REST API](https://1541u-documentation.readthedocs.io/en/latest/api/api_calls.html),
 [data streams](https://1541u-documentation.readthedocs.io/en/latest/data_streams.html).
 

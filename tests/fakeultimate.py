@@ -26,7 +26,7 @@ import threading
 
 SWAPPER_PATH = "/v1/configs/U64%20Specific%20Settings/Joystick%20Swapper"
 # Settings a test can change with a PUT ...?value=, like on the machine.
-# The real default is "Swapped"; "Normal" keeps the API's port numbers equal
+# "Normal" (the machine's default) keeps the API's port numbers equal
 # to the C64's, which is what most tests want to read in the log.
 # "mouse": whether machine:input lists a mouse (1.2.1 does, the first
 # firmware with the input API does not); PUT /test/mouse?value=0 clears it.
@@ -51,13 +51,13 @@ def _menu_screen():
         put(row, 0, b"\x04")
         put(row, 39, b"\x04")
     put(24, 0, b"\x05" + b"\x02" * 38 + b"\x06")
-    put(1, 2, b"fakeultimate menu")
+    put(1, 2, bytes(c | 0x80 for c in b"fakeultimate menu"))  # a heading
     for i, item in enumerate(MENU_ITEMS):
         put(3 + i, 2, item.encode())
         if i == STATE["row"]:
             for col in range(1, 39):
                 chars[(3 + i) * 40 + col] |= 0x80
-                colours[(3 + i) * 40 + col] = 0x81
+                colours[(3 + i) * 40 + col] = 0xE1
     return bytes(chars + colours)
 
 
@@ -209,7 +209,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _json(self, obj, code=200):
-        self._reply(code, json.dumps(obj).encode())
+        # spaced like the firmware's own output ("key" : value)
+        self._reply(code, json.dumps(obj, separators=(", ", " : ")).encode())
 
     def do_GET(self):
         self._log()
@@ -225,8 +226,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == SWAPPER_PATH:
             self._json({"U64 Specific Settings": {
                         "Joystick Swapper": {"current": STATE["swapper"],
-                                             "values": ["Normal", "Swapped"],
-                                             "default": "Swapped"}},
+                                             "values": ["Normal", "Swapped",
+                                                        "WASD Port 2",
+                                                        "WASD Port 1"],
+                                             "default": "Normal"}},
                         "errors": []})
         elif self.path.startswith("/v1/machine:readmem?address=0400"):
             # a text screen: READY. on row 0 (screen codes), blanks elsewhere

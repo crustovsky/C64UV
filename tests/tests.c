@@ -121,12 +121,15 @@ static void test_menu_screen(void)
     scr[MENU_COLS] = 0x04;
     memcpy(scr + MENU_COLS + 2, "Disk File Browser", 17);
     // row 2 is the selected one: bit 7 on characters and colours, white
+    // on light blue the way firmware 1.2.1 sends it (0xE1)
     const char *sel = "Run Disk";
     for (int i = 0; i < MENU_COLS; i++) {
         uint8_t c = i >= 2 && i < 10 ? (uint8_t)sel[i - 2] : ' ';
         scr[2 * MENU_COLS + i] = c | 0x80;
-        scr[MENU_COLS * MENU_ROWS + 2 * MENU_COLS + i] = 0x81;
+        scr[MENU_COLS * MENU_ROWS + 2 * MENU_COLS + i] = 0xE1;
     }
+    scr[5 * MENU_COLS + 2] = 'X' | 0x80; // a reversed heading cell: plain
+    scr[5 * MENU_COLS + 3] = 0x1C;       // colour byte; and a logo piece
     scr[3 * MENU_COLS] = 0x0B; // progress block
     scr[3 * MENU_COLS + 1] = 0x13; // marker
 
@@ -141,6 +144,9 @@ static void test_menu_screen(void)
     menu_row_text(scr, 3, line);
     CHECK(line[0] == '#' && line[1] == '*');
     CHECK(menu_row_selected(scr, 2) && !menu_row_selected(scr, 1));
+    CHECK(!menu_row_selected(scr, 5)); // reverse alone is a heading
+    menu_row_text(scr, 5, line);
+    CHECK(line[2] == 'X' && line[3] == ' '); // unknown shape: a blank
 
     static uint32_t px[MENU_PX_W * MENU_PX_H];
     menu_render(scr, px, MENU_PX_W);
@@ -151,12 +157,46 @@ static void test_menu_screen(void)
     CHECK(px[3 * MENU_PX_W + 0] == black && px[0 * MENU_PX_W + 3] == black);
     // edge joins the corner: the stroke is continuous across cells
     CHECK(px[3 * MENU_PX_W + 8] == grey && px[4 * MENU_PX_W + 15] == grey);
-    // selected row: reverse video, white background on a blank cell
+    // selected row: reverse video, so a blank cell is all foreground
+    // (white) and the letters show in the background colour (light blue)
     CHECK(px[(2 * 8 + 1) * MENU_PX_W + 0] == white);
+    int lb = 0, wh = 0;
+    for (int y = 16; y < 24; y++)
+        for (int x = 16; x < 24; x++) { // the 'R' of "Run Disk"
+            lb += px[y * MENU_PX_W + x] == 0xFF706DEB;
+            wh += px[y * MENU_PX_W + x] == white;
+        }
+    CHECK(lb > 8 && lb + wh == 64);
     // unselected blank cell stays black
     CHECK(px[(5 * 8 + 1) * MENU_PX_W + 0] == black);
     // progress block fills the cell below its first pixel row
     CHECK(px[(3 * 8 + 4) * MENU_PX_W + 4] == grey);
+}
+
+// A screen captured from a C64 Ultimate on firmware 1.2.1 (main menu just
+// opened, first entry selected).
+static void test_menu_screen_real(void)
+{
+    static uint8_t scr[MENU_BYTES];
+    FILE *f = fopen("tests/menu_screen.bin", "rb");
+    CHECK(f != NULL);
+    if (!f)
+        return;
+    CHECK(fread(scr, 1, MENU_BYTES, f) == MENU_BYTES);
+    fclose(f);
+    char line[MENU_COLS + 1];
+    menu_row_text(scr, 0, line);
+    CHECK(strstr(line, " COMMODORE 64 ") != NULL);
+    menu_row_text(scr, 2, line);
+    CHECK(!strcmp(line, "+--------------------------------------+"));
+    menu_row_text(scr, 3, line);
+    CHECK(!strncmp(line, "|DISK FILE BROWSER ", 19) && line[39] == '|');
+    menu_row_text(scr, 24, line);
+    CHECK(strstr(line, "F7=Help") != NULL); // mixed case survives
+    int selected = 0;
+    for (int row = 0; row < MENU_ROWS; row++)
+        selected += menu_row_selected(scr, row);
+    CHECK(selected == 1 && menu_row_selected(scr, 3));
 }
 
 static void test_video_assembly(void)
@@ -507,6 +547,7 @@ int main(void)
     test_term_geometry();
     test_term_keys();
     test_menu_screen();
+    test_menu_screen_real();
     test_video_assembly();
     test_petscii();
     test_matrix_keys();

@@ -1,12 +1,13 @@
 // c64uv - Commodore 64 Ultimate Viewer
 //
-// Streams the Ultimate's video/audio into an SDL3 window, forwards keystrokes,
-// and shows the Ultimate menu over telnet. Protocol notes live in CLAUDE.md.
+// Streams the Ultimate's video/audio into an SDL3 window, forwards keys,
+// gamepads and the mouse, and shows the Ultimate menu (REST on firmware
+// 1.2+, telnet before). Protocol notes live in CLAUDE.md.
 
 #include <SDL3/SDL.h>
 #include <curl/curl.h>
 
-#define C64UV_VERSION "0.3.5"
+#define C64UV_VERSION "0.4.0"
 
 #include "compat.h"
 #include "discover.h"
@@ -90,7 +91,7 @@ static const char *g_store;
 // keeps running into it (the window says so instead of "waiting").
 static _Thread_local bool t_refused;
 static atomic_bool g_rest_off;
-#define SERVICES_WHERE "enable it on the machine: F2 > Network Settings"
+#define SERVICES_WHERE "enable it on the machine: menu > Network Services & Timezone"
 
 // libcurl keeps the OS error of a failed connect.
 static bool curl_refused(CURL *curl, CURLcode res)
@@ -633,8 +634,8 @@ static compat_sock dma_connect(const char *host, int timeout_s)
 //
 // KEYB (0xFF03) drops chars into the KERNAL keyboard buffer ($0277/$C6) -
 // works for BASIC and anything else that reads input the normal way; games
-// polling the matrix won't see it (needs the machine:input firmware
-// feature, not shipped yet).
+// polling the matrix won't see it (firmware 1.2+ has machine:input for
+// that, see the matrix keyboard section below).
 
 struct keyb {
     compat_sock fd; // COMPAT_BAD_SOCK when disconnected
@@ -957,7 +958,7 @@ static bool ftp_upload(CURL *curl, const char *host, const char *rpath,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
     CURLcode res = curl_easy_perform(curl);
     if (curl_refused(curl, res))
-        SDL_Log("FTP upload to %s refused: the Ultimate's FTP Service is off "
+        SDL_Log("FTP upload to %s refused: the Ultimate's FTP File Service is off "
                 "(" SERVICES_WHERE ")", url);
     else if (res != CURLE_OK)
         SDL_Log("FTP upload to %s failed: %s", url, curl_easy_strerror(res));
@@ -1574,6 +1575,20 @@ struct mfwd {
     unsigned held;      // event-loop side: buttons we pressed
 };
 
+// mouse.pending from a machine:input answer (reports the firmware has not
+// sent to the C64 yet); 0 when absent. The firmware pretty-prints its
+// JSON ("pending" : 0), hence the tolerant scan.
+static int mouse_pending(const char *resp)
+{
+    const char *p = strstr(resp, "\"pending\"");
+    if (!p)
+        return 0;
+    p += 9;
+    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')
+        p++;
+    return atoi(p);
+}
+
 static int mfwd_thread(void *arg)
 {
     struct mfwd *mf = arg;
@@ -1615,9 +1630,7 @@ static int mfwd_thread(void *arg)
                 told = true; // 429 = its queue is full; others say why
                 SDL_Log("mouse: machine:input HTTP %ld: %s", code, resp);
             }
-            const char *pp = strstr(resp, "\"pending\":");
-            if (pp)
-                pending = atoi(pp + 10);
+            pending = mouse_pending(resp);
         }
         // one report leaves the firmware every 20 ms: do not feed it
         // faster, and back off while it works through a backlog
@@ -1718,8 +1731,7 @@ static int mouse_send(const char *host, const char *list)
     }
     SDL_free(copy);
     for (int t = 0; code == 200 && t < 100; t++) { // up to 5 s
-        const char *pp = strstr(resp, "\"pending\":");
-        if (!pp || atoi(pp + 10) == 0)
+        if (mouse_pending(resp) == 0)
             break;
         SDL_Delay(50);
         code = rest_req(curl, "GET", url, NULL, 0, NULL, 3000, resp, NULL);
@@ -2173,19 +2185,25 @@ static void status_idle(struct term *t, const struct config *cfg,
 // video driver (which has neither). Steps, split by spaces:
 //   ready          wait for the machine:input probe to answer
 //   wait=MS        pause
-//   key=ctrl+g     a key press and release (SDL key names: f9, down, g...)
+//   key=ctrl+g     a key press, released 80 ms later (SDL key names: f9,
+//                  down, escape, g...)
 //   move=DX,DY     relative mouse motion
 //   button=left:1  mouse button down (1) or up (0); left, right, middle
 
 struct test_events {
     char *script, *save, *step;
     Uint64 at;
+    SDL_Event up; // the release of the key being held, due at `at`
 };
 
 static void test_events_pump(struct test_events *te, SDL_Window *win)
 {
     if (!te->script || SDL_GetTicks() < te->at)
         return;
+    if (te->up.type) { // let go of the key the last step pressed
+        SDL_PushEvent(&te->up);
+        te->up.type = 0;
+    }
     if (!te->step) {
         te->step = SDL_strtok_r(te->save ? NULL : te->script, " ", &te->save);
         if (!te->step) {
@@ -2220,9 +2238,12 @@ static void test_events_pump(struct test_events *te, SDL_Window *win)
         ev.type = SDL_EVENT_KEY_DOWN;
         ev.key.down = true;
         SDL_PushEvent(&ev);
+        // held like a finger would: a press and release 10 ms apart is
+        // over before the real menu (or a game) looks at the keyboard
         ev.type = SDL_EVENT_KEY_UP;
         ev.key.down = false;
-        SDL_PushEvent(&ev);
+        te->up = ev;
+        te->at = SDL_GetTicks() + 80;
     } else if (!strncmp(st, "move=", 5)) {
         ev.type = SDL_EVENT_MOUSE_MOTION;
         ev.motion.windowID = SDL_GetWindowID(win);

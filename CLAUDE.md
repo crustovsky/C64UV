@@ -1,8 +1,8 @@
 # CLAUDE.md - Commodore 64 Ultimate Viewer
 
 Linux SDL3 viewer for the C64 Ultimate / Ultimate 64: streams the machine's
-video and audio into a window, forwards keystrokes, and shows the Ultimate's
-menu over telnet. User-facing docs live in README.md; this file holds what a
+video and audio into a window, forwards keystrokes, gamepads and the mouse, and shows the
+Ultimate's menu (over REST on firmware 1.2+, over telnet before). User-facing docs live in README.md; this file holds what a
 developer (or Claude) needs beyond that.
 
 ## Architecture
@@ -10,12 +10,15 @@ developer (or Claude) needs beyond that.
 Single binary, two dependencies (SDL3, libcurl):
 
 ```
-src/main.c   event loop, sockets, audio, REST keepalive, rendering
-src/keys.c   PC key -> PETSCII / C64 matrix maps + the viewer key-binding
+src/main.c   event loop, sockets, audio, REST keepalive, rendering, the
+             menu-poll and mouse-sender threads
+src/keys.c   PC key -> PETSCII / C64 matrix maps, ASCII -> matrix keys,
+             joystick and mouse event JSON + the viewer key-binding
              table (viewer_bindings drives dispatch, F10 overlay, --help)
 src/discover.c  /v1/info sweep of the local /24s (SDL-free, curl multi)
 src/video.c  VIC frame assembly (SDL-free, unit-tested)
-src/term.c   minimal VT100 emulator matched to the firmware's remote screen
+src/term.c   minimal VT100 emulator matched to the firmware's remote screen,
+             plus the decoder/renderer for machine:menu_screen payloads
 src/font8x8.h  public-domain 8x8 bitmap font (rendering for term.c)
 src/compat.h   platform layer: sockets, interface list, neighbor (ARP)
                table, ARP prime; compat_posix.c is the Linux reference
@@ -49,18 +52,30 @@ UDP :11000 -> frame assembler -> VIC palette LUT -> SDL streaming texture
 UDP :11001 -> SDL_AudioStream (resample + latency servo -> 60 ms target)
   (--multicast: both sockets also join 239.0.1.64/.65, SO_REUSEADDR)
 SDL events -> PETSCII -> TCP :64 KEYB   |   F9 view: VT100 keys -> TCP :23
-  (matrix-capable firmware: key up/down -> POST machine:input instead)
+  (firmware 1.2+: key up/down, pads, mouse -> POST machine:input instead;
+   F9 view = menu thread polling GET machine:menu_screen, keys as above)
 keepalive thread -> ARP prime (ping -I) + PUT streams/{video,audio}:start / 5 s
-                    + one-time GET machine:input capability probe
+                    + one-time capability probe: GET machine:input (keys,
+                    mouse), Joystick Swapper config, GET machine:menu_screen
 no host -> discover_scan() /v1/info sweep   |   file drop/--run -> runners:*
 Ctrl hotkeys / --do -> PUT machine:{reset,reboot,pause,resume,menu_button}
 --type -> KEYB batches over TCP :64   |   --screen -> GET machine:readmem $0400
+--keys / --type --matrix / --joy / --mouse-send -> POST machine:input
+--menu-screen -> GET machine:menu_screen
 ```
 
 Every in-window action has a headless one-shot flag (`--discover`, `--do`,
-`--run`/`--store`, `--type`, `--screen`, `--dump`, `--term-test`); keep it
-that way so scripts and agents can drive the machine. `--type` + `--screen`
-is the closed loop for checking typed input. Results go to stdout, logs to
+`--run`/`--store`, `--type`, `--keys`, `--joy`, `--mouse-send`, `--screen`,
+`--menu-screen`, `--dump`, `--term-test`); keep it that way so scripts and
+agents can drive the machine. `--type` + `--screen` is the closed loop for
+checking typed input, `--do menu` + `--keys` + `--menu-screen` the one for
+the Ultimate menu.
+
+Threads: the event loop never waits for the network longer than one
+`machine:input` POST (250 ms cap). Everything slower has a thread: the
+keepalive, discovery, a file run, the menu poll (`rmenu_thread`) and the
+mouse sender (`mfwd_thread`). Each is joined at exit behind an
+event-pumping wait (see the power-off notes under Dev workflow). Results go to stdout, logs to
 stderr; exit 0/1/2 = ok / refused or unreachable / usage.
 
 The hardware-independent pieces (video.c, term.c, keys.c, discover.c) are
@@ -72,7 +87,18 @@ SDL-bound.
 `make test` runs tests/tests.c (VT100 parser, frame assembly, PETSCII map,
 JSON scanner). `tests/integration.sh` runs the mock-stream pipeline end to
 end (frame geometry, palette, nibble order) plus REST-level tests against
-`tests/fakeultimate.py`, a fake `/v1` server that logs every request.
+`tests/fakeultimate.py`, a fake `/v1` server that logs every request
+(ports: 8064 REST, 8065 DMA, 8067 FTP; 8068 and 127.0.0.44 stay closed for
+the services-off tests). The fake keeps a little state a test can read or
+change like on the machine: the Joystick Swapper setting (PUT the config
+value), a menu that `menu_button` toggles and that `machine:input` keys
+move and leave, and whether `machine:input` lists a mouse (`PUT
+/test/mouse?value=0|1`).
+`C64U_TEST_EVENTS` scripts key and mouse input for the windowed viewer
+(`ready wait=300 key=ctrl+g move=12,-4 button=left:1 key=f9`, see
+`test_events_pump` in main.c), so Ctrl+G, F9 and Ctrl+M are tested end to
+end under `SDL_VIDEODRIVER=dummy`, in CI too; only the gamepad tests need
+`/dev/uinput`.
 Discovery is testable hermetically via env hooks: `C64U_DISCOVER_NET`
 (sweep exactly that /24, loopback allowed) and `C64U_DISCOVER_PORT`
 (override port 80; the chosen host then keeps `:port` for the REST calls
@@ -129,17 +155,19 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   `dma_load_raw_buffer` (c64_subsys.cc) releases the user-interface client
   before touching memory, so a KEYB or DMAWRITE while the Ctrl+M menu is
   open closes it (verified on 1.1.0: any key kicks the user out). Hence
-  the help copy points at F9; with `machine:input` the firmware routes
-  keys into the menu instead.
+  the telnet view on that firmware; with `machine:input` the firmware
+  routes keys into the menu instead.
 - **Firmware 1.2.1 (verified over WiFi 2026-11-18)**: the update switches
-  every network service off (ports 80/21/23/64 refuse until re-enabled in
-  F2 > Network). `machine:input` answers 200 (keyboard, joysticks, mouse)
+  every network service off (ports 80/21/23/64 refuse until re-enabled on
+  the menu page "Network Services & Timezone": Ultimate Ident Service,
+  Ultimate DMA Service, Telnet Remote Menu Service, FTP File Service, Web
+  Remote Control Service). `machine:input` answers 200 (keyboard, joysticks, mouse)
   and the key names in keys.c all match the spec, which the machine
   serves at `/openapi.yaml` (`/api.html` is the explorer). A `tap` returns
   before the key is released, so back-to-back taps overlap; press/release
   pairs do not. Joystick lines read back through `machine:readmem` of
-  `$DC00`/`$DC01`: with the default Joystick Swapper = "Swapped", API port
-  1 drives `$DC00` and port 2 `$DC01`. `machine:menu_screen` is 404 until
+  `$DC00`/`$DC01`: with Joystick Swapper on "Swapped", API port
+  1 drives `$DC00` and port 2 `$DC01` (see the Joystick Swapper entry). `machine:menu_screen` is 404 until
   the menu is up (about one request after `menu_button`), then 2000
   bytes. The characters are ASCII (0x20-0x7E, mixed case), not screen
   codes; frame lines are codes below 0x20, and the selected row has bit 7
@@ -160,19 +188,88 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   1.1.0, re-verified 2026-09-02; the docs specify 501 for hardware without
   it). Commodore's 1.0.0 = upstream v3.14, 1.1.0 = a 3.14-based build 165;
   the input API (upstream PR #698, June 2026) first appears in the v3.15
-  release candidate, so it needs a newer Commodore release. Documented
+  release candidate; Commodore ships it from 1.2.0. Documented
   limits: 1-64 events and <= 4096 bytes per POST, 1-8 keyboard names per
   event; joystick events take `port` 1|2 and up/down/left/right/fire/
   fire2/fire3. The same firmware adds `GET /v1/machine:menu_screen` (2000
   bytes: 40x25 chars + 40x25 colour attrs, reverse video = bit 7) and
-  routes keyboard events to the menu while it is open, which would make a
-  REST menu view possible without telnet. When capable, key events POST
+  routes keyboard events to the menu while it is open, which is what the
+  REST menu view (below) is built on. When capable, key events POST
   JSON batches (`{"events":[{"kind":"keyboard","inputs":[...],"transition":
   "press"|"release"|"tap"}]}`); mapping lives in keys.c
   (`key_to_c64_matrix`): cursor up/left and F2/4/6/8 are shift chords,
   Tab = C64 CTRL (PC Ctrl stays free for viewer hotkeys), PageUp = RESTORE
   (tap-only per the API). `release_all` fires on focus loss, F9, and exit.
   Three consecutive transport failures fall back to the KERNAL buffer.
+- **Services off = connection refused**: after a firmware update every
+  network service is off; the machine answers ARP and ping but each TCP
+  port sends RST. `rest_req` records that in `t_refused` (libcurl's
+  `CURLINFO_OS_ERRNO` through `compat_errno_refused`), the socket paths ask
+  `compat_neterr_refused()`, and every message then names the service
+  (`rest_no_answer`, `dma_no_answer`, the status screen via `g_rest_off`).
+  Discovery cannot get `/v1/info` from such a machine, but its sweep's SYN
+  leaves the wired 02:15:41 MAC in the neighbor table:
+  `discover_services_off` looks for that prefix and confirms with a
+  refused connect. A WiFi-only machine in that state stays anonymous.
+- **Joystick Swapper**: `GET /v1/configs/U64 Specific Settings/Joystick
+  Swapper`, `current` = `Normal` (the default), `Swapped`, `WASD Port 2`
+  or `WASD Port 1`. Verified on 1.2.1 in both states (2026-11-19, fire
+  held, `$DC00`/`$DC01` read back): with `Normal` the API's port 2 drives
+  `$DC00` = C64 control port 2; with `Swapped` the API's port 1 does. The
+  WASD values count as not swapped. A config PUT marks the settings dirty:
+  leaving a config page in the menu then asks "Save changes to Flash?".
+  The viewer speaks C64 port numbers everywhere (flags, logs, notices) and
+  converts in `joy_api_port`; the setting is read once by the keepalive
+  thread before `g_minput` flips to 1, and by `--joy` itself.
+- **Mouse (`kind: mouse`)**: firmware 1.2.1 lists a `mouse` object in the
+  `GET machine:input` answer; that is the capability test (`g_mouse`).
+  Events are handled like a USB mouse's reports: a 1351 on control port 1,
+  one report per 20 ms from a 1024-report queue, 429 when a batch does not
+  fit, `mouse.pending` = reports still queued, `release_all` detaches the
+  mouse. Verified on 1.2.1 (2026-11-19) through the POT registers:
+  `$D419`/`$D41A` read `$FF` until the first mouse event, then one count
+  moves a POT value by 2 (a 1351 step), wrapping modulo 128, y inverted
+  as on a real 1351; the left button pulls `$DC01` bit 4 (port 1 fire)
+  with the swapper on Normal. `mfwd_thread` sends one `move` (up to 127 counts per axis) plus
+  queued button changes per POST, then waits 20 ms plus 20 ms per pending
+  report (capped); motion beyond one report that piles up meanwhile is
+  dropped on purpose. Without mouse events (3.15a on a U64-II, reported by
+  the contributor of the joystick mode) or with `--mouse-joy`, the mouse
+  steers joystick levels instead (`mousejoy_tick`): a direction is held
+  while the mouse moves and released `--mouse-hold` ms after it stops, two
+  POSTs per gesture (one per pixel made the REST server miss answers).
+  Their hardware notes: GEOS's built-in JOYSTICK driver reads control port
+  1 and accelerates while a direction is held (`$8507` ramps), a
+  pulse/duty-cycle mode felt steppy and was dropped; the speed control is
+  GEOS's own mouse-speed setting.
+- **Menu view over REST**: `machine:menu_screen` answers 404 with
+  "Menu screen unavailable." while the menu is closed; firmware without
+  the call answers 404 with other text, which is how the probe tells them
+  apart (`g_menu_rest`). `rmenu_thread` polls every 100 ms (at once after a
+  key), presses `menu_button` only when the first poll says closed, and
+  ends the view when a live menu turns 404 (left with RUN/STOP, something
+  was started). `menu_button` toggles, so closing first checks that the
+  menu is still open. Commands and states carry a generation number so a
+  stale state never answers a new command. Rendering (`menu_render` in
+  term.c): colour byte = foreground in the low nibble, background in the
+  high one (0 nearly everywhere), bit 7 of the character = reverse video,
+  codes below 0x20 = the firmware's frame shapes, drawn from their arms
+  (the logo pieces 0x14-0x1F have no drawing here and stay blank; the
+  firmware's own character set is GPL, so it is not embedded). The
+  selected row has bit 7 in both bytes (colour 0xE1); headings and the
+  highlighted button of a popup are reversed with a plain colour byte, so
+  `menu_row_selected` needs both bits. `tests/menu_screen.bin` is a real
+  1.2.1 main menu. Verified on hardware 2026-11-19 (wired): F9 open and
+  close, keys reaching the menu, Ctrl+M attach, RUN/STOP at the top level
+  ending the view, quit closing the menu, and the headless loop `--do
+  menu` / `--keys` / `--menu-screen`. The menu samples the keyboard
+  slowly: a press released 10 ms later is missed, 50 ms is seen. Mouse
+  events reach the open menu too (a `left` tap answered a popup).
+- **Matrix typing (`--keys`, `--type --matrix`)**: press, 50 ms hold,
+  release, 50 ms gap per stroke (`matrix_stroke`); never `tap` back to
+  back. Verified on 1.2.1: a BASIC line with shifted characters arrived
+  intact at about 10 characters a second. `--type` without `--matrix` stays on the KERNAL buffer, which is
+  faster and works on every firmware.
 - **Telnet menu (TCP :23)**: firmware `screen_vt100.cc` emits exactly: `ESC c`
   (RIS), `ESC[y;xH`, a fixed SGR set (`0;3X` + `;1`/`;2`, `7`/`27`), `ESC(0`
   / `ESC(B` charset switches, `ESC[2J`, `ESC[r`. Screen is fixed **60x24**.
@@ -180,7 +277,8 @@ finish within 3 s while the keepalive thread is stuck in a REST call. CI
   firmware's `set_color` table back to VIC colors. Input parsing
   (`keyboard_vt100.cc`) wants xterm-style: `ESC[A-D`, `ESC[N~` (old-style
   F-keys: 11-15 = F1-F5, 17-19 = F6-F8), bare `ESC` = back. The menu overlay
-  is not in the VIC stream; telnet is the only remote view of it.
+  is not in the VIC stream; before firmware 1.2 telnet is the only remote
+  view of it.
 - Screen RAM is remotely readable: `GET /v1/machine:readmem?address=0400&
   length=1000` - used to close the loop when testing typed input.
 - **Runners (verified on firmware 1.1.0)**: `POST /v1/runners:run_prg` takes
@@ -272,9 +370,11 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
 2. **Gamepad -> machine:input joysticks** (done 2026-11-18, verified on
    firmware 1.2.1 with a virtual pad, lines read back at `$DC00`/`$DC01`,
    then played by Michal with an Xbox pad over Bluetooth): SDL_Gamepad with hotplug,
-   first pad wins. The whole pad is polled into JOY_* bits on every pad
-   event (`pad_state` in main.c) and `minput_joy` POSTs only the
-   difference, release before press in one batch; mapping and JSON live in
+   two pads: the first drives `mi.joy_port`, the second the other port,
+   and a pad keeps its slot when the other one leaves. Each pad is polled
+   into JOY_* bits on every pad event (`pad_state` in main.c) and
+   `minput_joy` POSTs only the difference per port (`joy_sent[2]`),
+   release before press in one batch; mapping and JSON live in
    keys.c (`pad_button_joy`, `pad_stick_joy`, `joy_event_json`). D-pad +
    left stick (dead zone 16000) = directions, A = fire, B = up, X/Y =
    fire2/fire3. Port 2 by default (`--joy-port`), Ctrl+J or the pad's Back
@@ -284,11 +384,14 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    no pad events to an unfocused window (tests set
    `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1`; the same variable lets a user
    play with another window focused). "No button works" is that focus
-   rule first: `--verbose` logs every pad state change (`pad: port N
-   state XX`), so an empty log means no events arrive. `tests/virtualpad.py` is a
+   rule first: `--verbose` logs every state change (`joystick: port N
+   state XX`), so an empty log means no events arrive. Start is F9; in the
+   REST menu view the pad sends keys instead of joystick lines
+   (`pad_menu_key`). `tests/virtualpad.py` is a
    dependency-free uinput pad (Xbox 360 ids, so SDL maps it); the
    integration test using it is skipped where `/dev/uinput` is not
-   writable (CI). The F10 overlay grew to 256 px for the two extra rows.
+   writable (CI). The F10 overlay's height is computed from the binding table
+   (`help_height`), after a fixed 256 px buffer overflowed by one row.
    The new Steam Controller is SDL's job: code against generic
    SDL_Gamepad.
 
@@ -320,29 +423,13 @@ control + password, drag-and-drop run, help overlay) shipped in v0.2.0.
    `C64U_FTP_PORT` (fakeultimate.py serves a passive-mode FTP stub as its
    fifth argument and logs `FTP STOR <path> len=N`).
 
-Follow-ups now that 1.2.x ships `machine:input`: a REST menu view from
-`machine:menu_screen` (keys reach the menu through `machine:input`, so it
-could replace the telnet view and fix the Ctrl+M eviction), mouse
-forwarding (`kind: mouse` events), and re-checking the matrix-keyboard
-mapping in a matrix-scanning game with the stream running.
+4. **0.4.0 (2026-11-19)**: REST menu view, 1351 mouse forwarding with the
+   contributed joystick mode as fallback, second gamepad, Joystick Swapper
+   port mapping, matrix-level `--keys` / `--type --matrix`, services-off
+   hints. Details are in the protocol facts above.
 
-Mouse-as-joystick is implemented on the joystick path instead (Ctrl+G,
-`--mouse`, `--mouse-hold`): 3.15a's `machine:input` has no `kind: mouse`
-and the 1351 POT registers are read-only, so `mousejoy_tick` in main.c
-holds a direction while the mouse moves and releases it `--mouse-hold` ms
-after motion stops (two POSTs per gesture; the REST server does not survive
-one per pixel - a 40 ms pulse rate tripped the three-failure fallback).
-`mouse_joy_dir` in keys.c is unit-tested. It shares `minput_joy`, the
-`--joy-port` selection and Ctrl+J with the gamepad; a real `kind: mouse`
-event, if a firmware ships one, should become the preferred path and leave
-level-holding as the fallback. Verified on real hardware 2026-11-19 (U64-II,
-3.15a, GEOS deskTop): GEOS's built-in JOYSTICK driver reads API control
-port 1 (pointer $3A-$3C moved 53,33 -> 90,80 with right/down held; port 2
-did nothing, $8506 stayed $FF). GEOS calls it JS1. The first Ctrl+G (or
-`--mouse` without an explicit `--joy-port`) switches the joystick to port
-1; later toggles keep whatever Ctrl+J selected, so a deliberate port 2
-choice survives. GEOS's joystick driver accelerates while a direction is
-held ($8507 ramped $1E -> $3A in 800 ms, ~150 px), so a long hold speeds the
-pointer up. A pulse/duty-cycle mode was tried and dropped (2026-11-19):
-100-200 ms release gaps only partly reset $8507 and it felt steppy, so the
-honest speed control is GEOS's Control Panel mouse speed.
+Open follow-ups: uploading a dropped image into the folder the menu shows
+(the path line is now readable through `machine:menu_screen`), re-checking
+the matrix-keyboard mapping in a matrix-scanning game with the stream
+running, and reading the menu's colour scheme from the config instead of
+assuming a black background.
