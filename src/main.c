@@ -26,6 +26,8 @@ struct config {
     const char *do_action;  // one-shot machine control, then exit
     const char *run_path;   // one-shot: run this .prg/.crt/.sid/.d64, then exit
     const char *type_text;  // one-shot: type this into the C64, then exit
+    bool type_matrix;       // --type through the matrix, not the KERNAL buffer
+    const char *keys;       // one-shot: press these matrix keys, then exit
     const char *joy_spec;   // one-shot: tap these joystick inputs, then exit
     int joy_port;           // control port the gamepad drives (1 or 2)
     bool joy_port_set;      // --joy-port was given explicitly
@@ -1194,6 +1196,154 @@ static bool type_text(const char *host, const char *text)
     return ok;
 }
 
+// Matrix-level twins (firmware with machine:input): keys pressed on the
+// CIA1 matrix, so games that scan the keyboard themselves see them too.
+// A `tap` returns before the firmware releases the key and back-to-back
+// taps overlap (characters went missing on 1.2.1), hence press, hold,
+// release, gap: the hold spans at least two KERNAL scans (60 Hz), the gap
+// lets a repeated key be seen as released.
+#define MATRIX_HOLD_MS 50
+#define MATRIX_GAP_MS 50
+
+static long matrix_stroke(CURL *curl, const char *url, const char *names[],
+                          int n, int hold_ms, char *resp)
+{
+    char body[256];
+    bool tap = !strcmp(names[0], "restore"); // not in the matrix: tap-only
+    long code = -1;
+    for (int pass = 0; pass < (tap ? 1 : 2); pass++) {
+        if (!matrix_event_json(names, n,
+                               tap ? "tap" : pass ? "release" : "press",
+                               body, sizeof body))
+            return 400;
+        code = rest_req(curl, "POST", url, body, (long)strlen(body),
+                        "application/json", 3000, resp, NULL);
+        if (code != 200)
+            return code;
+        SDL_Delay(pass ? MATRIX_GAP_MS : (Uint32)hold_ms);
+    }
+    return code;
+}
+
+static bool matrix_report(long code, const char *resp)
+{
+    if (code == -1)
+        SDL_Log("machine:input: %s", rest_no_answer());
+    else if (code != 200)
+        SDL_Log("machine:input HTTP %ld: %s (matrix-level keys need "
+                "firmware 1.2.0 or newer; --type without --matrix uses the "
+                "KERNAL buffer)", code, resp);
+    return code == 200;
+}
+
+// --type TEXT --matrix
+static bool type_matrix(const char *host, const char *text)
+{
+    char url[256], resp[512] = "";
+    snprintf(url, sizeof url, "http://%s/v1/machine:input", host);
+    CURL *curl = curl_easy_init();
+    long code = 200;
+    for (const char *p = text; *p && code == 200; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\\' && p[1] == 'n') { // "\n" in the argument = RETURN
+            c = '\n';
+            p++;
+        }
+        const char *names[2];
+        int n = ascii_to_c64_matrix(c, names);
+        if (n)
+            code = matrix_stroke(curl, url, names, n, MATRIX_HOLD_MS, resp);
+    }
+    curl_easy_cleanup(curl);
+    return matrix_report(code, resp);
+}
+
+// --keys LIST: strokes separated by commas or spaces, each a key name or a
+// chord joined with '+', optionally held for :MS milliseconds
+// ("f1 left_shift+a space:500"). Parsed completely before anything is
+// sent. Returns the exit status (2 = bad list).
+#define KEYS_MAX_STROKES 256
+static int press_keys(const char *host, const char *list)
+{
+    struct stroke {
+        const char *names[8];
+        int n, hold_ms;
+    };
+    char *copy = SDL_strdup(list);
+    struct stroke *st = calloc(KEYS_MAX_STROKES, sizeof *st);
+    int count = 0;
+    bool bad = false;
+    char *save = NULL;
+    for (char *item = SDL_strtok_r(copy, ", ", &save); item && !bad;
+         item = SDL_strtok_r(NULL, ", ", &save)) {
+        if (count == KEYS_MAX_STROKES) {
+            fprintf(stderr, "--keys: more than %d strokes\n",
+                    KEYS_MAX_STROKES);
+            bad = true;
+            break;
+        }
+        struct stroke *k = &st[count++];
+        k->hold_ms = MATRIX_HOLD_MS;
+        char *colon = strchr(item, ':');
+        if (colon) {
+            *colon = '\0';
+            k->hold_ms = atoi(colon + 1);
+            if (k->hold_ms < 20 || k->hold_ms > 10000) {
+                fprintf(stderr, "--keys: hold time '%s' out of range "
+                        "(20-10000 ms)\n", colon + 1);
+                bad = true;
+            }
+        }
+        char *save2 = NULL;
+        for (char *name = SDL_strtok_r(item, "+", &save2); name && !bad;
+             name = SDL_strtok_r(NULL, "+", &save2)) {
+            if (!matrix_key_valid(name) || k->n == 8) {
+                fprintf(stderr, "--keys: unknown key '%s' (API names: a-z "
+                        "0-9 space return run_stop f1 f3 f5 f7 left_shift "
+                        "right_shift ctrl commodore cursor_up_down "
+                        "cursor_left_right inst_del clr_home plus minus "
+                        "star slash equals colon semicolon comma period at "
+                        "pound arrow_up arrow_left restore)\n", name);
+                bad = true;
+            } else {
+                k->names[k->n++] = name;
+            }
+        }
+        if (!bad && k->n == 0) {
+            fprintf(stderr, "--keys: empty stroke\n");
+            bad = true;
+        }
+        // restore is wired to NMI, not the matrix: alone and tap-only
+        for (int i = 0; i < k->n && !bad; i++)
+            if (!strcmp(k->names[i], "restore") && k->n > 1) {
+                fprintf(stderr, "--keys: restore cannot be part of a "
+                        "chord\n");
+                bad = true;
+            }
+    }
+    if (!bad && count == 0) {
+        fprintf(stderr, "--keys: nothing to press\n");
+        bad = true;
+    }
+    int rc = 2;
+    if (!bad) {
+        char url[256], resp[512] = "";
+        snprintf(url, sizeof url, "http://%s/v1/machine:input", host);
+        CURL *curl = curl_easy_init();
+        long code = 200;
+        for (int i = 0; i < count && code == 200; i++)
+            code = matrix_stroke(curl, url, st[i].names, st[i].n,
+                                 st[i].hold_ms, resp);
+        curl_easy_cleanup(curl);
+        rc = matrix_report(code, resp) ? 0 : 1;
+        if (rc == 0)
+            SDL_Log("%d key stroke%s OK", count, count == 1 ? "" : "s");
+    }
+    free(st);
+    SDL_free(copy);
+    return rc;
+}
+
 // Screen codes to text, upper-case/graphics set assumed (the default);
 // graphics symbols print as '#', reverse video is dropped.
 static char screen_char(uint8_t sc)
@@ -1599,7 +1749,8 @@ static void usage(const char *argv0)
             "usage: %s --host IP [--dest IP[:PORT]] [--port N] [--scale N]\n"
             "          [--multicast] [--no-start] [--no-audio] [--no-keyb]\n"
             "          [--password PW] [--do ACTION] [--run FILE] [--store DIR]\n"
-            "          [--type TEXT] [--screen] [--joy INPUTS] [--joy-port N]\n"
+            "          [--type TEXT [--matrix]] [--keys LIST] [--screen]\n"
+            "          [--joy INPUTS] [--joy-port N]\n"
             "          [--mouse] [--mouse-hold MS] [--dump FILE.ppm]\n"
             "          [--term-test] [--discover] [--verbose] [--version]\n"
             "  --host    C64 Ultimate address (or set C64U_HOST; omit to "
@@ -1619,6 +1770,12 @@ static void usage(const char *argv0)
             "            the Ultimate (FTP, e.g. /Temp or /Usb0/games), mount from\n"
             "            there read-write and autostart (or set C64U_STORE)\n"
             "  --type    type TEXT into the C64 (\\n = RETURN), then exit\n"
+            "  --matrix  with --type: press the keys on the keyboard matrix\n"
+            "            instead of filling the KERNAL buffer, so games see\n"
+            "            them (firmware 1.2.0+; about 10 characters a second)\n"
+            "  --keys    press matrix keys by name, then exit: strokes split\n"
+            "            by commas, chords with +, hold time with :MS\n"
+            "            (e.g. --keys \"f1,left_shift+a,space:500,run_stop\")\n"
             "  --screen  print the C64 text screen (40x25), then exit\n"
             "  --joy     tap joystick inputs, then exit: [PORT:]up,down,left,\n"
             "            right,fire,fire2,fire3 (e.g. --joy 1:left,fire)\n"
@@ -1660,6 +1817,10 @@ int main(int argc, char **argv)
             g_store = argv[++i];
         else if (!strcmp(argv[i], "--type") && i + 1 < argc)
             cfg.type_text = argv[++i];
+        else if (!strcmp(argv[i], "--matrix"))
+            cfg.type_matrix = true;
+        else if (!strcmp(argv[i], "--keys") && i + 1 < argc)
+            cfg.keys = argv[++i];
         else if (!strcmp(argv[i], "--screen"))
             cfg.screen = true;
         else if (!strcmp(argv[i], "--dest") && i + 1 < argc)
@@ -1767,7 +1928,7 @@ int main(int argc, char **argv)
     static char auto_host[46];
     bool headless = cfg.dump_path || cfg.term_test || cfg.do_action ||
                     cfg.run_path || cfg.type_text || cfg.screen ||
-                    cfg.joy_spec;
+                    cfg.joy_spec || cfg.keys;
     if (!cfg.host && !cfg.no_start && headless) {
         struct discovered found[DISCOVER_MAX];
         fprintf(stderr, "no --host given, discovering...\n");
@@ -1792,7 +1953,14 @@ int main(int argc, char **argv)
     if (cfg.joy_spec)
         return joy_tap(cfg.host, cfg.joy_spec, cfg.joy_port) ? 0 : 1;
 
-    if (cfg.type_text && !type_text(cfg.host, cfg.type_text))
+    if (cfg.keys) {
+        int rc = press_keys(cfg.host, cfg.keys);
+        if (rc || !(cfg.type_text || cfg.screen))
+            return rc;
+    }
+    if (cfg.type_text && !(cfg.type_matrix
+                               ? type_matrix(cfg.host, cfg.type_text)
+                               : type_text(cfg.host, cfg.type_text)))
         return 1;
     if (cfg.screen)
         return print_screen(cfg.host) ? 0 : 1;

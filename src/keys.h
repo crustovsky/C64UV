@@ -17,6 +17,17 @@ int special_to_petscii(SDL_Keycode key, SDL_Keymod mod);
 // 0 = unmapped. "restore" is tap-only per the API; check names[0] for it.
 int key_to_c64_matrix(SDL_Keycode key, const char *names[2]);
 
+// ASCII -> C64 matrix key name(s) for scripted typing (--type --matrix):
+// the key that prints the character with the default character set, plus
+// a shift where the C64 needs one ('"' = shift+2, '?' = shift+slash).
+// Letters come out unshifted in either case, like --type. '\n' and '\r'
+// are RETURN. Returns the count, 0 = no such key.
+int ascii_to_c64_matrix(unsigned char c, const char *names[2]);
+
+// True for a key name the machine:input API accepts ("a", "f1",
+// "run_stop", "cursor_up_down", "restore"...).
+bool matrix_key_valid(const char *name);
+
 // Builds the machine:input POST body for one keyboard event. transition is
 // "press", "release", or "tap". Returns false if buf is too small.
 bool matrix_event_json(const char *names[], int n, const char *transition,

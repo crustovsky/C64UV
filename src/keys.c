@@ -110,6 +110,72 @@ int key_to_c64_matrix(SDL_Keycode key, const char *names[2])
     return 1;
 }
 
+// Every key name of the API (the firmware's openapi.yaml, KeyboardInput)
+// besides the single letters and digits.
+static const char *const matrix_names[] = {
+    "inst_del", "return", "cursor_left_right", "f7", "f1", "f3", "f5",
+    "cursor_up_down", "left_shift", "plus", "minus", "period", "colon", "at",
+    "comma", "pound", "star", "semicolon", "clr_home", "right_shift",
+    "equals", "arrow_up", "slash", "arrow_left", "ctrl", "space",
+    "commodore", "run_stop", "restore",
+};
+
+bool matrix_key_valid(const char *name)
+{
+    if (name[0] && !name[1] && ((name[0] >= 'a' && name[0] <= 'z') ||
+                                (name[0] >= '0' && name[0] <= '9')))
+        return true;
+    for (size_t i = 0; i < sizeof matrix_names / sizeof matrix_names[0]; i++)
+        if (!strcmp(name, matrix_names[i]))
+            return true;
+    return false;
+}
+
+int ascii_to_c64_matrix(unsigned char c, const char *names[2])
+{
+    // characters that sit on a key of their own
+    static const struct {
+        char c;
+        const char *name;
+    } plain[] = {
+        {' ', "space"}, {'\n', "return"}, {'\r', "return"}, {'+', "plus"},
+        {'-', "minus"}, {'*', "star"}, {'/', "slash"}, {'=', "equals"},
+        {':', "colon"}, {';', "semicolon"}, {',', "comma"}, {'.', "period"},
+        {'@', "at"}, {'^', "arrow_up"},
+    };
+    // shifted characters: !"#$%&'() over 1-9, and the ones over , . / : ;
+    static const struct {
+        char c;
+        const char *name;
+    } shifted[] = {
+        {'!', "1"}, {'"', "2"}, {'#', "3"}, {'$', "4"}, {'%', "5"},
+        {'&', "6"}, {'\'', "7"}, {'(', "8"}, {')', "9"}, {'<', "comma"},
+        {'>', "period"}, {'?', "slash"}, {'[', "colon"}, {']', "semicolon"},
+    };
+    if (c >= 'A' && c <= 'Z')
+        c = (unsigned char)(c - 'A' + 'a');
+    if (c >= 'a' && c <= 'z') {
+        names[0] = matrix_alnum[c - 'a'];
+        return 1;
+    }
+    if (c >= '0' && c <= '9') {
+        names[0] = matrix_alnum[26 + c - '0'];
+        return 1;
+    }
+    for (size_t i = 0; i < sizeof plain / sizeof plain[0]; i++)
+        if (plain[i].c == (char)c) {
+            names[0] = plain[i].name;
+            return 1;
+        }
+    for (size_t i = 0; i < sizeof shifted / sizeof shifted[0]; i++)
+        if (shifted[i].c == (char)c) {
+            names[0] = "left_shift";
+            names[1] = shifted[i].name;
+            return 2;
+        }
+    return 0;
+}
+
 bool matrix_event_json(const char *names[], int n, const char *transition,
                        char *buf, size_t cap)
 {

@@ -196,6 +196,36 @@ static void test_matrix_keys(void)
     CHECK(!matrix_event_json(one, 1, "press", buf, 16)); // too small
 }
 
+static void test_matrix_typing(void)
+{
+    const char *n[2];
+    CHECK(ascii_to_c64_matrix('a', n) == 1 && !strcmp(n[0], "a"));
+    CHECK(ascii_to_c64_matrix('Q', n) == 1 && !strcmp(n[0], "q")); // unshifted
+    CHECK(ascii_to_c64_matrix('7', n) == 1 && !strcmp(n[0], "7"));
+    CHECK(ascii_to_c64_matrix('\n', n) == 1 && !strcmp(n[0], "return"));
+    CHECK(ascii_to_c64_matrix(' ', n) == 1 && !strcmp(n[0], "space"));
+    CHECK(ascii_to_c64_matrix('*', n) == 1 && !strcmp(n[0], "star"));
+    CHECK(ascii_to_c64_matrix('"', n) == 2 && !strcmp(n[0], "left_shift") &&
+          !strcmp(n[1], "2"));
+    CHECK(ascii_to_c64_matrix('?', n) == 2 && !strcmp(n[1], "slash"));
+    CHECK(ascii_to_c64_matrix('$', n) == 2 && !strcmp(n[1], "4"));
+    CHECK(ascii_to_c64_matrix('~', n) == 0); // no such key
+    CHECK(ascii_to_c64_matrix(0xE9, n) == 0);
+    // every character a BASIC line needs resolves to valid API names
+    for (const char *p = "LOAD\"*\",8,1:PRINT(A$+B$)<>3;?"; *p; p++) {
+        int k = ascii_to_c64_matrix((unsigned char)*p, n);
+        CHECK(k >= 1);
+        for (int i = 0; i < k; i++)
+            CHECK(matrix_key_valid(n[i]));
+    }
+    CHECK(matrix_key_valid("run_stop") && matrix_key_valid("f1") &&
+          matrix_key_valid("z") && matrix_key_valid("0") &&
+          matrix_key_valid("restore"));
+    CHECK(!matrix_key_valid("f2") && !matrix_key_valid("enter") &&
+          !matrix_key_valid("") && !matrix_key_valid("A") &&
+          !matrix_key_valid("aa"));
+}
+
 static void test_joystick(void)
 {
     CHECK(pad_button_joy(SDL_GAMEPAD_BUTTON_DPAD_LEFT) == JOY_LEFT);
@@ -378,6 +408,7 @@ int main(void)
     test_video_assembly();
     test_petscii();
     test_matrix_keys();
+    test_matrix_typing();
     test_joystick();
     test_bindings();
     test_json();

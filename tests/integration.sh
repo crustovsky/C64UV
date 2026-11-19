@@ -224,6 +224,36 @@ test "$(wc -l < "$out/screen.txt")" = 25
 head -1 "$out/screen.txt" | grep -q '^READY\. *$'
 echo "type/screen test passed"
 
+# ------------------------------------------------------------- matrix keys
+# --keys and --type --matrix go through machine:input as press/release
+# pairs (never tap, which overlaps); a bad key name is a usage error that
+# sends nothing.
+
+matrix_log() { # the logged machine:input bodies must be exactly these strokes
+    python3 - "$out/disc.log" "$@" <<'PYEOF'
+import sys
+log = [l.split(" ", 3)[3] for l in open(sys.argv[1]).read().splitlines()
+       if l.startswith("POST /v1/machine:input")]
+k = '{"events":[{"kind":"keyboard","inputs":[%s],"transition":"%s"}]}'
+want = [k % (",".join('"%s"' % n for n in stroke.split("+")), t)
+        for stroke in sys.argv[2:] for t in ("press", "release")]
+assert log == want, log
+PYEOF
+}
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --keys "f1,left_shift+a:200 run_stop"
+matrix_log f1 left_shift+a run_stop
+: > "$out/disc.log"
+timeout 10 ./c64uv --host 127.0.0.42:8064 --matrix --type 'A"\n' --screen > "$out/screen.txt"
+matrix_log a left_shift+2 return
+test "$(wc -l < "$out/screen.txt")" = 25
+grep -q "DMA cmd" "$out/disc.log" && exit 1 # nothing through the buffer
+: > "$out/disc.log"
+rc=0; ./c64uv --host 127.0.0.42:8064 --keys "f1,enter" 2>/dev/null || rc=$?
+test "$rc" = 2
+! grep -q 'machine:input' "$out/disc.log"
+echo "matrix keys test passed"
+
 # ---------------------------------------------------------------- joystick
 # --joy presses and releases the named inputs on the given control port
 # through machine:input; a bad input name is a usage-level refusal.
