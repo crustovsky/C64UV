@@ -212,6 +212,14 @@ static void test_joystick(void)
     CHECK(pad_stick_joy(32767, 32767) == (JOY_RIGHT | JOY_DOWN));
     CHECK(pad_stick_joy(0, -20000) == JOY_UP);
 
+    CHECK(mouse_joy_dir(0, 0, 2) == 0);
+    CHECK(mouse_joy_dir(1, -1, 2) == 0); // dead zone
+    CHECK(mouse_joy_dir(-3, 0, 2) == JOY_LEFT);
+    CHECK(mouse_joy_dir(3, 0, 2) == JOY_RIGHT);
+    CHECK(mouse_joy_dir(0, -3, 2) == JOY_UP); // screen y grows downwards
+    CHECK(mouse_joy_dir(0, 3, 2) == JOY_DOWN);
+    CHECK(mouse_joy_dir(3, -3, 2) == (JOY_RIGHT | JOY_UP));
+
     CHECK(joy_parse("fire") == JOY_FIRE);
     CHECK(joy_parse("up,left,fire2") == (JOY_UP | JOY_LEFT | JOY_FIRE2));
     CHECK(joy_parse("fire,jump") == 0);
@@ -246,6 +254,8 @@ static void test_bindings(void)
     CHECK(viewer_binding_match(SDLK_F10, 0) == VA_HELP);
     CHECK(viewer_binding_match(SDLK_F10, SDL_KMOD_NUM) == VA_HELP); // stray mod
     CHECK(viewer_binding_match(SDLK_M, SDL_KMOD_RCTRL) == VA_MENU_BTN);
+    CHECK(viewer_binding_match(SDLK_G, SDL_KMOD_LCTRL) == VA_MOUSE_JOY);
+    CHECK(viewer_binding_match(SDLK_G, 0) == VA_NONE); // plain G types
 
     // table integrity: every row renders in help, no dispatch collisions
     for (int i = 0; i < viewer_bindings_count; i++) {

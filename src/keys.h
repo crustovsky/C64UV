@@ -34,6 +34,10 @@ enum {
 unsigned pad_button_joy(SDL_GamepadButton b);
 // Left stick -> direction bits; inside the dead zone = 0.
 unsigned pad_stick_joy(int x, int y);
+// Mouse motion -> direction bits for the joystick-emulation path. dx/dy are
+// screen pixels (y grows downwards); an axis within `dz` pixels is ignored.
+// Diagonals set two bits. This drives a joystick, never a 1351.
+unsigned mouse_joy_dir(float dx, float dy, float dz);
 // Parses "up,fire" style lists (the API's input names); 0 = invalid.
 unsigned joy_parse(const char *list);
 // machine:input body taking control port `port` from state `from` to state
@@ -54,6 +58,7 @@ enum viewer_action {
     VA_REBOOT,
     VA_PAUSE,
     VA_MENU_BTN,
+    VA_MOUSE_JOY,
     VA_JOY_PORT,
 };
 

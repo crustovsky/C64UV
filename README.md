@@ -29,6 +29,20 @@ cable.
 - **Gamepad** - plug in a controller and it is a C64 joystick (firmware
   1.2.0 or newer): d-pad or left stick for directions, A = fire, B = up for
   jumping, Ctrl+J or the pad's Back button swaps between ports 2 and 1.
+- **Mouse joystick** - **Ctrl+G** grabs the pointer and drives the same C64
+  joystick, for the GEOS `JOYSTICK` driver: move the mouse and the pointer
+  steps in that direction, left/right/middle button = fire/fire2/fire3.
+  `--mouse` starts it enabled; the direction is held while the mouse moves
+  and released `--mouse-hold` ms after it stops (default 50), so one gesture
+  costs two REST calls rather than one per pixel. GEOS's `JOYSTICK` driver
+  reads control **port 1** (JS1), so the first Ctrl+G moves the joystick
+  there; `--mouse` also starts on port 1 unless `--joy-port` says otherwise.
+  Ctrl+J still swaps. The pointer's speed is GEOS's own mouse-speed setting
+  (Control Panel -> Mouse), not the mouse's DPI: lower it there for finer
+  control; `--mouse-hold` only changes how long the pointer keeps moving
+  after the mouse stops. GEOS accelerates while a direction is held, so a
+  long hold speeds the pointer up. This is a joystick, not a 1351 -
+  POT-reading software ignores it.
 - **Ultimate menu** - press **F9** to flip to the Ultimate's own menu (file
   browser, disk mounting, configuration) rendered via its telnet remote
   screen; F9 again returns to the C64.
@@ -108,6 +122,7 @@ refuses to start a stream toward an address missing from its ARP table.
 | Esc | RUN/STOP |
 | F1–F8, cursors, Home, Del/Ins | the corresponding C64 keys |
 | gamepad | C64 joystick on port 2: d-pad / left stick, A = fire, B = up, X / Y = second and third fire button (needs firmware 1.2.0+) |
+| Ctrl+G | grab / release the mouse as the C64 joystick (GEOS `JOYSTICK` driver reads port 1; press Ctrl+J first; `--mouse-hold` tunes the release delay) |
 | Ctrl+J, pad Back button | move the joystick to the other control port |
 | **F9** | toggle the Ultimate menu view |
 | **F10** | in-window key reference (same table as `--help`) |
@@ -221,6 +236,15 @@ rather than a terminal.
   "Joystick Swapper" setting on "Swapped", ports 1 and 2 trade places. If a
   game does not react, press Ctrl+J (or Back on the pad) to try the other
   port.
+- The mouse joystick is a joystick, not a 1351. A direction is held while
+  the mouse moves and released `--mouse-hold` ms after it stops, so the
+  pointer travels at GEOS's fixed joystick rate - a short flick still moves
+  it further than the mouse did, and precise positioning takes small
+  nudges. It works with GEOS's built-in `JOYSTICK` driver and other
+  joystick-as-pointer software, not with `COMM 1351`, paint programs, or
+  anything reading the SID POT registers. Firmware 3.15a's `machine:input`
+  has no `mouse` event at all; if a later firmware adds one, forwarding real
+  deltas would be strictly better.
 - The Ultimate's menu overlay is not part of the VIC stream - that's what the
   F9 telnet view is for. The on-screen menu (Ctrl+M) cannot be driven from
   the viewer on firmware older than 1.2.0: every remote keystroke is a DMA write into

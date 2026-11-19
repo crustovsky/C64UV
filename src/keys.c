@@ -146,6 +146,12 @@ unsigned pad_stick_joy(int x, int y)
            (y < -dead ? JOY_UP : 0) | (y > dead ? JOY_DOWN : 0);
 }
 
+unsigned mouse_joy_dir(float dx, float dy, float dz)
+{
+    return (dx <= -dz ? JOY_LEFT : 0) | (dx >= dz ? JOY_RIGHT : 0) |
+           (dy <= -dz ? JOY_UP : 0) | (dy >= dz ? JOY_DOWN : 0);
+}
+
 static const char *const joy_names[] = {"up", "down", "left", "right",
                                         "fire", "fire2", "fire3"};
 #define JOY_NAMES ((int)(sizeof joy_names / sizeof joy_names[0]))
@@ -212,6 +218,9 @@ const struct viewer_binding viewer_bindings[] = {
      .action = VA_INFO, .gap = true},
     {.label = "gamepad", .desc = "C64 joystick: A fire, B up",
      .action = VA_INFO},
+    {.key = SDLK_G, .mod = SDL_KMOD_CTRL, .label = "Ctrl+G",
+     .desc = "grab mouse as C64 joystick",
+     .action = VA_MOUSE_JOY},
     {.key = SDLK_J, .mod = SDL_KMOD_CTRL, .label = "Ctrl+J",
      .desc = "swap joystick port (pad: Back)",
      .action = VA_JOY_PORT, .gap = true},

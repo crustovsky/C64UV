@@ -325,3 +325,24 @@ Follow-ups now that 1.2.x ships `machine:input`: a REST menu view from
 could replace the telnet view and fix the Ctrl+M eviction), mouse
 forwarding (`kind: mouse` events), and re-checking the matrix-keyboard
 mapping in a matrix-scanning game with the stream running.
+
+Mouse-as-joystick is implemented on the joystick path instead (Ctrl+G,
+`--mouse`, `--mouse-hold`): 3.15a's `machine:input` has no `kind: mouse`
+and the 1351 POT registers are read-only, so `mousejoy_tick` in main.c
+holds a direction while the mouse moves and releases it `--mouse-hold` ms
+after motion stops (two POSTs per gesture; the REST server does not survive
+one per pixel - a 40 ms pulse rate tripped the three-failure fallback).
+`mouse_joy_dir` in keys.c is unit-tested. It shares `minput_joy`, the
+`--joy-port` selection and Ctrl+J with the gamepad; a real `kind: mouse`
+event, if a firmware ships one, should become the preferred path and leave
+level-holding as the fallback. Verified on real hardware 2026-11-19 (U64-II,
+3.15a, GEOS deskTop): GEOS's built-in JOYSTICK driver reads API control
+port 1 (pointer $3A-$3C moved 53,33 -> 90,80 with right/down held; port 2
+did nothing, $8506 stayed $FF). GEOS calls it JS1. The first Ctrl+G (or
+`--mouse` without an explicit `--joy-port`) switches the joystick to port
+1; later toggles keep whatever Ctrl+J selected, so a deliberate port 2
+choice survives. GEOS's joystick driver accelerates while a direction is
+held ($8507 ramped $1E -> $3A in 800 ms, ~150 px), so a long hold speeds the
+pointer up. A pulse/duty-cycle mode was tried and dropped (2026-11-19):
+100-200 ms release gaps only partly reset $8507 and it felt steppy, so the
+honest speed control is GEOS's Control Panel mouse speed.
